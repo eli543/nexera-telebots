@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for the claude-telegram-fleet watchdog.
+
+  The installer substitutes __FLEET_HOME__ with the absolute FLEET_HOME path and
+  writes the result to ~/Library/LaunchAgents/com.claude-fleet.watchdog.plist,
+  then: launchctl bootstrap gui/$(id -u) <that file>.
+
+  KeepAlive + RunAtLoad (never StartInterval): a StartInterval timer can silently
+  stop firing after a system sleep. KeepAlive relaunches watchdog-loop.sh whenever
+  it exits, and the loop itself paces one health pass every 60s.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude-fleet.watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__FLEET_HOME__/bin/watchdog-loop.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>FLEET_HOME</key>
+        <string>__FLEET_HOME__</string>
+    </dict>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__FLEET_HOME__/logs/watchdog-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__FLEET_HOME__/logs/watchdog-launchd.log</string>
+</dict>
+</plist>

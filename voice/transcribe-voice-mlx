@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Transcribe an audio file to text with mlx-whisper (Apple Silicon, ~1-2s warm).
+# Usage: transcribe-voice-mlx <audio-path> [language]
+# Prints ONLY the transcript to stdout; all diagnostics go to stderr.
+# Requires: mlx_whisper (uv tool install mlx-whisper) and ffmpeg on PATH.
+# Env overrides: TRANSCRIBE_MODEL (default mlx-community/whisper-large-v3-turbo).
+set -euo pipefail
+
+if [ $# -lt 1 ]; then
+  echo "usage: transcribe-voice-mlx <audio-path> [language]" >&2
+  exit 2
+fi
+
+AUDIO="$1"
+LANG="${2:-en}"
+MODEL="${TRANSCRIBE_MODEL:-mlx-community/whisper-large-v3-turbo}"
+
+if [ ! -f "$AUDIO" ]; then
+  echo "transcribe-voice-mlx: file not found: $AUDIO" >&2
+  exit 1
+fi
+
+# Common install locations for the uv tool bin and Homebrew ffmpeg.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
+
+if ! command -v mlx_whisper >/dev/null 2>&1; then
+  echo "transcribe-voice-mlx: mlx_whisper not found." >&2
+  echo "Install it on Apple Silicon with: uv tool install mlx-whisper" >&2
+  exit 127
+fi
+
+OUT_DIR="$(mktemp -d)"
+trap 'rm -rf "$OUT_DIR"' EXIT
+
+mlx_whisper "$AUDIO" \
+  --model "$MODEL" \
+  --language "$LANG" \
+  --output-dir "$OUT_DIR" \
+  --output-format txt \
+  >/dev/null 2>&1
+
+# mlx_whisper writes <basename>.txt into OUT_DIR.
+TXT="$OUT_DIR/$(basename "${AUDIO%.*}").txt"
+if [ ! -f "$TXT" ]; then
+  echo "transcribe-voice-mlx: no output produced for $AUDIO" >&2
+  exit 1
+fi
+
+# Trim leading/trailing whitespace.
+sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$TXT"

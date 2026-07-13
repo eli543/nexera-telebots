@@ -1,0 +1,43 @@
+# Secrets and runtime state - never commit
+.env
+.env.*
+*.env
+permission-stance
+fleet.json
+/fleet.json
+
+# Per-bot state directories and their contents
+channels/
+state/
+inbox/
+stream/
+access.json
+model-state
+*.heartbeat
+last-inbound
+resume-list.json
+resume-labels.json
+snapshot.tsv
+snapshot.tsv.*
+
+# Logs
+logs/
+*.log
+
+# Patch backups produced by apply-patches.sh
+server.ts.stock-backup
+*.bak
+*.bak-*
+
+# Python and Node build artifacts
+__pycache__/
+*.pyc
+*.pyo
+node_modules/
+
+# macOS
+.DS_Store
+
+# Editor cruft
+*.swp
+*~

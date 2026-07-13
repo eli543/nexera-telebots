@@ -1,0 +1,229 @@
+#!/bin/bash
+# fleet-doctor - one-shot health + config check for the fleet. Read-only by
+# default: it inspects versions, the installed plugin, fleet.json, and each bot's
+# state dir + liveness, then prints a green/red table. Exit 1 if anything is red.
+#
+# Usage:
+#   fleet-doctor          check and report (no messages sent)
+#   fleet-doctor --ping   also send one test message to each bot's own chat
+#
+# Checks: claude >= 2.1.80, bun present, official telegram plugin installed,
+# fleet.json valid, and per bot: state dir exists, .env is chmod 600, access.json
+# is on an allowlist policy, the session + poller are alive, and the poller
+# heartbeat is fresh. macOS (ps / stat -f / lsof).
+
+set -uo pipefail
+
+case "${1:-}" in -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+
+PING=0
+[ "${1:-}" = "--ping" ] && PING=1
+
+FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+resolve_bin() {
+  if [ -x "$FLEET_HOME/bin/$1" ]; then printf '%s\n' "$FLEET_HOME/bin/$1"; return; fi
+  if [ -x "$SELF_DIR/$1" ]; then printf '%s\n' "$SELF_DIR/$1"; return; fi
+  printf '%s\n' "$1"
+}
+FC_BIN="$(resolve_bin fleet-config)"
+fc() { "$FC_BIN" "$@"; }
+
+MIN_CLAUDE="2.1.80"
+HEARTBEAT_MAX_AGE=180
+RED_COUNT=0
+
+# colors only on a tty
+if [ -t 1 ]; then C_G=$'\033[32m'; C_R=$'\033[31m'; C_Y=$'\033[33m'; C_0=$'\033[0m'
+else C_G=""; C_R=""; C_Y=""; C_0=""; fi
+
+row() {  # $1=status(ok|red|warn) $2=label $3=detail
+  local mark
+  case "$1" in
+    ok)   mark="${C_G}[ ok ]${C_0}" ;;
+    warn) mark="${C_Y}[warn]${C_0}" ;;
+    red)  mark="${C_R}[fail]${C_0}"; RED_COUNT=$((RED_COUNT+1)) ;;
+  esac
+  printf '%b  %-26s %s\n' "$mark" "$2" "$3"
+}
+
+# a >= b for dotted numeric versions
+ver_ge() {
+  awk -v a="$1" -v b="$2" 'BEGIN{
+    na=split(a,x,"."); nb=split(b,y,".");
+    n=(na>nb)?na:nb;
+    for(i=1;i<=n;i++){xi=(i<=na)?x[i]+0:0; yi=(i<=nb)?y[i]+0:0;
+      if(xi>yi){print"1";exit} if(xi<yi){print"0";exit}}
+    print"1"}'
+}
+
+token_of_state() {
+  [ -f "$1/.env" ] || return 0
+  grep -E '^TELEGRAM_BOT_TOKEN=' "$1/.env" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]'
+}
+chat_id_of_state() {
+  python3 - "$1" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1] + "/access.json"))
+    a = d.get("allowFrom") or []
+    print(str(a[0]) if a else "")
+except Exception:
+    print("")
+PY
+}
+policy_of_state() {
+  python3 - "$1" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1] + "/access.json"))
+    print(d.get("dmPolicy", ""))
+except Exception:
+    print("")
+PY
+}
+state_of_pid() {
+  ps eww -p "$1" 2>/dev/null | tr ' ' '\n' | grep -m1 '^TELEGRAM_STATE_DIR=' | cut -d= -f2-
+}
+first_pid_matching() {  # $1=grep-signature $2=state-dir
+  local sig="$1" want="$2" pid
+  # ps -axo + grep, deliberately not pgrep (macOS pgrep omits the caller's ancestor).
+  # shellcheck disable=SC2009
+  for pid in $(ps -axo pid=,command= | grep -F -- "$sig" | grep -v grep | awk '{print $1}'); do
+    [ -z "$pid" ] && continue
+    [ "$(state_of_pid "$pid")" = "$want" ] && { echo "$pid"; return; }
+  done
+}
+
+echo "fleet-doctor  ($(date '+%F %T'))"
+echo "FLEET_HOME: $FLEET_HOME"
+echo "config:     $(fc path 2>/dev/null || echo '?')"
+echo "--- environment ---------------------------------------------"
+
+# claude version
+if command -v claude >/dev/null 2>&1; then
+  cver=$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  if [ -n "$cver" ] && [ "$(ver_ge "$cver" "$MIN_CLAUDE")" = "1" ]; then
+    row ok "claude CLI" "$cver (>= $MIN_CLAUDE)"
+  else
+    row red "claude CLI" "${cver:-unknown} (need >= $MIN_CLAUDE, channels preview)"
+  fi
+else
+  row red "claude CLI" "not found on PATH"
+fi
+
+# bun
+if command -v bun >/dev/null 2>&1 || [ -x "$HOME/.bun/bin/bun" ]; then
+  bver=$( (bun --version 2>/dev/null || "$HOME/.bun/bin/bun" --version 2>/dev/null) | head -1)
+  row ok "bun" "${bver:-present}"
+else
+  row red "bun" "not found (the plugin's MCP server runs on bun)"
+fi
+
+# official plugin cache
+# fixed-shape path under the plugin cache; a plain glob is safe here.
+# shellcheck disable=SC2012
+plugcache=$(ls -d "$HOME"/.claude/plugins/cache/claude-plugins-official/telegram/*/server.ts 2>/dev/null | tail -1)
+if [ -n "$plugcache" ]; then
+  pver=$(basename "$(dirname "$plugcache")")
+  row ok "telegram plugin" "installed (v$pver)"
+else
+  row red "telegram plugin" "not installed (claude plugin install telegram@claude-plugins-official)"
+fi
+
+# config validity
+if fc validate 2>/dev/null; then
+  row ok "fleet.json" "valid ($(fc bots 2>/dev/null | grep -c . ) bot(s))"
+else
+  row red "fleet.json" "invalid or missing (see: $FLEET_CONFIG validate)"
+fi
+
+# watchdog daemon present?
+if launchctl list 2>/dev/null | grep -q 'com.claude-fleet.watchdog'; then
+  row ok "watchdog daemon" "loaded (com.claude-fleet.watchdog)"
+else
+  row warn "watchdog daemon" "not loaded (optional; /fleet-install-daemon)"
+fi
+
+now=$(date +%s)
+keys=$(fc bots 2>/dev/null || true)
+if [ -z "$keys" ]; then
+  echo "--- bots ----------------------------------------------------"
+  row red "bots" "none configured"
+else
+  for key in $keys; do
+    echo "--- bot: $key ----------------------------------------------"
+    sdir=$(fc bot "$key" state_dir 2>/dev/null || true)
+    if [ -z "$sdir" ] || [ ! -d "$sdir" ]; then
+      row red "$key state dir" "${sdir:-?} missing"
+      continue
+    fi
+    row ok "$key state dir" "$sdir"
+
+    # .env perms
+    if [ -f "$sdir/.env" ]; then
+      perms=$(stat -f '%Lp' "$sdir/.env" 2>/dev/null)
+      if [ "$perms" = "600" ]; then
+        row ok "$key .env perms" "600"
+      else
+        row red "$key .env perms" "${perms:-?} (must be 600: chmod 600 $sdir/.env)"
+      fi
+    else
+      row red "$key .env" "missing (no bot token)"
+    fi
+
+    # access policy
+    pol=$(policy_of_state "$sdir")
+    if [ "$pol" = "allowlist" ]; then
+      row ok "$key access policy" "allowlist"
+    else
+      row warn "$key access policy" "${pol:-none} (recommend: allowlist)"
+    fi
+
+    # liveness
+    spid=$(first_pid_matching "--channels plugin:telegram@claude-plugins-official" "$sdir")
+    wpid=$(first_pid_matching "server.ts" "$sdir")
+    if [ -n "$spid" ] && [ -n "$wpid" ]; then
+      row ok "$key session+poller" "session=$spid poller=$wpid"
+      # heartbeat freshness
+      if [ -f "$sdir/poller.heartbeat" ]; then
+        hb=$(head -1 "$sdir/poller.heartbeat" 2>/dev/null | tr -cd '0-9')
+        if [ -n "$hb" ]; then
+          age=$(( now - hb ))
+          if [ "$age" -le "$HEARTBEAT_MAX_AGE" ]; then
+            row ok "$key heartbeat" "${age}s ago"
+          else
+            row red "$key heartbeat" "${age}s ago (> ${HEARTBEAT_MAX_AGE}s: poller may be stuck)"
+          fi
+        fi
+      else
+        row warn "$key heartbeat" "no heartbeat file (liveness patch not applied?)"
+      fi
+    else
+      row red "$key session+poller" "session=${spid:-DOWN} poller=${wpid:-DOWN}"
+    fi
+
+    if [ $PING -eq 1 ]; then
+      tok=$(token_of_state "$sdir"); cid=$(chat_id_of_state "$sdir")
+      if [ -n "$tok" ] && [ -n "$cid" ]; then
+        if curl -s -m 8 -o /dev/null -X POST "https://api.telegram.org/bot${tok}/sendMessage" \
+             --data-urlencode "chat_id=${cid}" --data-urlencode "text=fleet-doctor test ping"; then
+          row ok "$key test ping" "sent to chat $cid"
+        else
+          row red "$key test ping" "send failed"
+        fi
+      else
+        row warn "$key test ping" "no token/chat to ping"
+      fi
+    fi
+  done
+fi
+
+echo "-------------------------------------------------------------"
+if [ $RED_COUNT -eq 0 ]; then
+  echo "${C_G}All green.${C_0}"
+  exit 0
+else
+  echo "${C_R}${RED_COUNT} red item(s).${C_0} Fix the [fail] rows above."
+  exit 1
+fi

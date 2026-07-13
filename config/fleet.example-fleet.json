@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "bots": [
+    {
+      "name": "Main",
+      "key": "main",
+      "workdir": "~/claude-fleet/main",
+      "state_dir": "~/.claude/channels/fleet-main",
+      "emoji": "🤖"
+    },
+    {
+      "name": "Research",
+      "key": "research",
+      "workdir": "~/claude-fleet/research",
+      "state_dir": "~/.claude/channels/fleet-research",
+      "emoji": "🔬"
+    },
+    {
+      "name": "Ops",
+      "key": "ops",
+      "workdir": "~/claude-fleet/ops",
+      "state_dir": "~/.claude/channels/fleet-ops",
+      "emoji": "🛠"
+    }
+  ],
+  "options": {
+    "watchdog": true,
+    "voice": "auto",
+    "tldr_judge": false,
+    "grid": false,
+    "alert_bot": "main"
+  }
+}

@@ -1,0 +1,237 @@
+#!/bin/bash
+# fleet-model - switch a running bot's Claude model and/or effort from Telegram
+# without losing the conversation. Writes the desired model+effort to the bot's
+# per-bot model-state file, then restarts-with-resume so fleet-launch picks the
+# new model up on the way back. Single source of truth for /model: called by both
+# the poller intercept (mid-task) and the idle-path hook.
+#
+# Args:
+#   $1  workdir: a workdir known to fleet.json
+#   $2  chat_id: the Telegram chat to reply into
+#   $3  raw arg string: whatever followed "/model" (may be empty = report)
+#   $4  session uuid (optional): the exact session to resume, from the hook's
+#       authoritative session_id. Absent = resolve by process start time.
+#
+# Models: opus | sonnet | fable | haiku  -> stored as the plain CLASS ALIAS (no
+# forced [1m]); a literal claude-* id is also accepted and passed through. Effort:
+# low | medium | high | xhigh | max. A model with no effort keeps the current
+# effort; nothing set = your Claude Code default (no flag forced).
+#
+# Exit code is always 0 - this must never block a turn. On any problem it replies
+# with a plain message and leaves the session untouched. Env: FLEET_HOME;
+# CC_MODEL_CURL / CC_MODEL_DRYRUN override the sender / suppress the real restart
+# for tests.
+
+set -u
+
+usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; }
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+
+FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+resolve_bin() {
+  if [ -x "$FLEET_HOME/bin/$1" ]; then printf '%s\n' "$FLEET_HOME/bin/$1"; return; fi
+  if [ -x "$SELF_DIR/$1" ]; then printf '%s\n' "$SELF_DIR/$1"; return; fi
+  printf '%s\n' "$1"
+}
+FC_BIN="$(resolve_bin fleet-config)"
+RESTART_SCRIPT="$(resolve_bin fleet-fresh)"
+fc() { "$FC_BIN" "$@"; }
+
+CWD="${1:-}"
+CHAT_ID="${2:-}"
+RAW="${3:-}"
+EXPLICIT_UUID="${4:-}"
+LOG="$FLEET_HOME/logs/model.log"
+mkdir -p "$FLEET_HOME/logs" 2>/dev/null || true
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null || true; }
+
+# Resolve the bot from its workdir (replaces the live case block).
+KEY="$(fc bot-by-workdir "$CWD" key 2>/dev/null || true)"
+if [ -z "$KEY" ]; then log "REFUSE unknown workdir: $CWD"; exit 0; fi
+STATE_DIR="$(fc bot-by-workdir "$CWD" state_dir 2>/dev/null || true)"
+PROJ_DIR="$(fc project-dir "$KEY" 2>/dev/null || true)"
+STATE_FILE="$STATE_DIR/model-state"
+
+# This bot's token, for replies back into the chat (read at runtime; never logged).
+BOT_TOKEN=""
+if [ -f "$STATE_DIR/.env" ]; then
+  BOT_TOKEN="$(grep -E '^TELEGRAM_BOT_TOKEN=' "$STATE_DIR/.env" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]')"
+fi
+
+CURL="${CC_MODEL_CURL:-/usr/bin/curl}"
+tg_send() {
+  { [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; } && { log "tg_send skipped (no token/chat)"; return 0; }
+  "$CURL" -s -m 8 -o /dev/null -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+    --data-urlencode "chat_id=$CHAT_ID" \
+    --data-urlencode "text=$1" >> "$LOG" 2>&1 || log "WARN telegram send failed"
+}
+
+model_label() {
+  case "$1" in
+    opus)     echo "Opus" ;;
+    sonnet)   echo "Sonnet" ;;
+    fable)    echo "Fable" ;;
+    haiku)    echo "Haiku" ;;
+    "")       echo "your default model" ;;
+    *)        echo "$1" ;;
+  esac
+}
+
+# --- current state (empty = your Claude Code default) -----------------------
+CUR_MODEL=""; CUR_EFFORT=""
+if [ -f "$STATE_FILE" ]; then
+  _m="$(grep -E '^MODEL='  "$STATE_FILE" | head -1 | cut -d= -f2- | tr -d '[:space:]')"
+  _e="$(grep -E '^EFFORT=' "$STATE_FILE" | head -1 | cut -d= -f2- | tr -d '[:space:]')"
+  case "$_m" in opus|sonnet|fable|haiku) CUR_MODEL="$_m" ;; claude-*) CUR_MODEL="$_m" ;; esac
+  case "$_e" in low|medium|high|xhigh|max) CUR_EFFORT="$_e" ;; esac
+fi
+
+# --- bare "/model": report current, change nothing --------------------------
+# Handled before the parse loop so the loop only runs on real input (also keeps
+# the token array non-empty, sidestepping the bash 3.2 empty-array set -u crash).
+if [ -z "$(printf '%s' "$RAW" | tr -d '[:space:]')" ]; then
+  tg_send "This chat is on $(model_label "$CUR_MODEL") at ${CUR_EFFORT:-default} effort.
+
+Switch with: /model opus | sonnet | fable | haiku (add low/medium/high/xhigh/max to set effort). /fresh resets to your default."
+  log "REPORT cwd=$CWD model=${CUR_MODEL:-default} effort=${CUR_EFFORT:-default}"
+  exit 0
+fi
+
+# --- parse args into an optional model + optional effort --------------------
+NEW_MODEL=""; NEW_EFFORT=""; BAD=""
+read -ra _toks <<< "$(printf '%s' "$RAW" | tr '[:upper:]' '[:lower:]')"
+for tok in ${_toks[@]+"${_toks[@]}"}; do
+  case "$tok" in
+    opus)                      NEW_MODEL="opus" ;;
+    sonnet)                    NEW_MODEL="sonnet" ;;
+    fable)                     NEW_MODEL="fable" ;;
+    haiku)                     NEW_MODEL="haiku" ;;
+    claude-*)                  NEW_MODEL="$tok" ;;
+    low|medium|high|xhigh|max) NEW_EFFORT="$tok" ;;
+    *) BAD="$tok"; break ;;
+  esac
+done
+
+if [ -n "$BAD" ]; then
+  tg_send "Didn't recognize \"$BAD\". Models: opus, sonnet, fable, haiku. Effort: low, medium, high, xhigh, max (optional, e.g. /model opus low)."
+  log "REJECT bad token '$BAD' raw='$RAW' cwd=$CWD"
+  exit 0
+fi
+
+# Resolve the final target. A model with no effort keeps the current effort; an
+# effort with no model keeps the current model.
+if [ -n "$NEW_MODEL" ]; then
+  TARGET_MODEL="$NEW_MODEL"
+  TARGET_EFFORT="${NEW_EFFORT:-$CUR_EFFORT}"
+else
+  TARGET_MODEL="$CUR_MODEL"
+  TARGET_EFFORT="$NEW_EFFORT"
+fi
+
+# --- no-op if already there -------------------------------------------------
+if [ "$TARGET_MODEL" = "$CUR_MODEL" ] && [ "$TARGET_EFFORT" = "$CUR_EFFORT" ]; then
+  tg_send "Already on $(model_label "$TARGET_MODEL") at ${TARGET_EFFORT:-default} effort - nothing to change."
+  log "NOOP already model=${TARGET_MODEL:-default} effort=${TARGET_EFFORT:-default} cwd=$CWD"
+  exit 0
+fi
+
+# --- switch lock: refuse a second switch while one is in flight -------------
+# Two rapid different /model commands would otherwise both resolve the same old
+# pid and leave two sessions fighting over the token. mkdir is atomic; the lock
+# self-expires by age (30s) so a failed switch can never wedge the command.
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+LOCK_DIR="$STATE_DIR/model-switch.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  lock_mt="$(stat -f %m "$LOCK_DIR" 2>/dev/null || echo 0)"
+  lock_age=$(( $(date +%s) - lock_mt ))
+  if [ "$lock_age" -lt 30 ]; then
+    tg_send "Already mid-switch - give it ~20 seconds, then send that again."
+    log "LOCKED refuse (age=${lock_age}s) raw='$RAW' cwd=$CWD"
+    exit 0
+  fi
+  touch "$LOCK_DIR" 2>/dev/null || true
+  log "stale lock (age=${lock_age}s) taken over cwd=$CWD"
+fi
+
+# --- write the validated state file -----------------------------------------
+if ! printf 'MODEL=%s\nEFFORT=%s\n' "$TARGET_MODEL" "$TARGET_EFFORT" > "$STATE_FILE" 2>>"$LOG"; then
+  tg_send "Couldn't save the model setting - nothing was changed. Try again in a moment."
+  log "ERROR state write failed cwd=$CWD file=$STATE_FILE"
+  exit 0
+fi
+log "SET model=${TARGET_MODEL:-default} effort=${TARGET_EFFORT:-default} (was ${CUR_MODEL:-default}/${CUR_EFFORT:-default}) cwd=$CWD"
+
+# --- find the live claude pid for THIS workdir (ps + lsof, never pgrep -f) ---
+CUR_PID=""
+# ps -axo + grep, deliberately not pgrep (macOS pgrep omits the caller's ancestor).
+# shellcheck disable=SC2009
+while read -r p _rest; do
+  [ -z "$p" ] && continue
+  pcwd="$(lsof -a -p "$p" -d cwd 2>/dev/null | awk 'NR>1 {print $NF}')"
+  if [ "$pcwd" = "$CWD" ]; then CUR_PID="$p"; break; fi
+done < <(ps -axo pid=,command= 2>/dev/null | grep -F -- "--channels plugin:telegram@claude-plugins-official" | grep -v grep)
+[ -z "$CUR_PID" ] && CUR_PID="999999"
+
+# --- resolve what to resume -------------------------------------------------
+# Must be the CURRENT session, never just the newest transcript on disk (right
+# after /fresh the empty new session has not written a newer transcript). Order:
+#   1. EXPLICIT_UUID from the hook (authoritative), else
+#   2. newest transcript written at/after this session's process start, else
+#   3. "fresh-keep": empty session on the new model (state we just wrote is kept
+#      by the launcher, unlike a bare /fresh which resets it).
+RESUME_TARGET="fresh-keep"
+if [ -n "$EXPLICIT_UUID" ] && [ -f "$PROJ_DIR/$EXPLICIT_UUID.jsonl" ]; then
+  RESUME_TARGET="$EXPLICIT_UUID"
+  log "resume via explicit session_id=$EXPLICIT_UUID"
+else
+  start_epoch=""
+  if [ "$CUR_PID" != "999999" ]; then
+    _lstart="$(ps -o lstart= -p "$CUR_PID" 2>/dev/null)"
+    [ -n "$_lstart" ] && start_epoch="$(date -j -f "%a %b %e %H:%M:%S %Y" "$_lstart" +%s 2>/dev/null)"
+  fi
+  if [ -n "$start_epoch" ]; then
+    # transcript files are named by uuid (.jsonl) - no spaces/globs; -t needs ls.
+    # shellcheck disable=SC2045
+    for f in $(ls -t "$PROJ_DIR"/*.jsonl 2>/dev/null); do
+      mt="$(stat -f %m "$f" 2>/dev/null)"
+      [ -z "$mt" ] && continue
+      if [ "$mt" -ge "$start_epoch" ]; then
+        u="$(basename "$f" .jsonl)"
+        case "$u" in [0-9a-fA-F]*-*-*-*-*) RESUME_TARGET="$u"; log "resume via process-time match uuid=$u"; break ;; esac
+      fi
+    done
+  fi
+  [ "$RESUME_TARGET" = "fresh-keep" ] && log "no current-session transcript -> fresh-keep"
+fi
+
+log "RESTART cwd=$CWD pid=$CUR_PID resume=$RESUME_TARGET -> $(model_label "$TARGET_MODEL")/${TARGET_EFFORT:-default}"
+
+# Ack BEFORE the kill so it lands even though this session is about to die.
+if [ -z "$NEW_MODEL" ]; then
+  tg_send "Setting effort to $TARGET_EFFORT... back in ~10s with this conversation intact. (Anything I'm doing right now stops - send \"continue\" after to pick it back up.)"
+elif [ "$RESUME_TARGET" = "fresh-keep" ]; then
+  tg_send "Switching to $(model_label "$TARGET_MODEL") at ${TARGET_EFFORT:-default} effort... back in ~10s. (This chat was empty, so it comes up clean on the new model.)"
+else
+  tg_send "Switching to $(model_label "$TARGET_MODEL") at ${TARGET_EFFORT:-default} effort... back in ~10s with this conversation intact. (Anything I'm doing right now stops - send \"continue\" after if you want it picked back up.)"
+fi
+
+# Dry-run: show the plan, touch no process, release the lock (leave no residue).
+if [ "${CC_MODEL_DRYRUN:-}" = "1" ]; then
+  echo "DRYRUN would: $RESTART_SCRIPT $CUR_PID $CWD $RESUME_TARGET   (model=${TARGET_MODEL:-default} effort=${TARGET_EFFORT:-default}, state written to $STATE_FILE)"
+  log "DRYRUN restart suppressed"
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+  exit 0
+fi
+
+# Restart-with-resume via the same detached pipeline /fresh and /resume use.
+if [ -x "$RESTART_SCRIPT" ] || command -v "$RESTART_SCRIPT" >/dev/null 2>&1; then
+  /usr/bin/nohup "$RESTART_SCRIPT" "$CUR_PID" "$CWD" "$RESUME_TARGET" </dev/null >>"$LOG" 2>&1 &
+  disown 2>/dev/null || true
+  log "restart spawned cwd=$CWD (bg pid=$!)"
+else
+  tg_send "Switch failed: restart script missing. Flag this to your operator."
+  log "ERROR restart script missing: $RESTART_SCRIPT"
+fi
+
+exit 0

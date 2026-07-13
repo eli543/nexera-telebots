@@ -1,0 +1,131 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -n \"$TELEGRAM_STATE_DIR\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-stream.py\" pre; fi; true",
+            "timeout": 20
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__plugin_telegram_telegram__reply",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tldr-nudge.py\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -n \"$TELEGRAM_STATE_DIR\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-stream.py\" post; fi; true",
+            "timeout": 20
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-deliver-nudge.py\" 2>/dev/null || true",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__plugin_telegram_telegram__reply",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-reply-guard.py\" reply",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -n \"$TELEGRAM_STATE_DIR\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-stream.py\" stop; fi; true",
+            "timeout": 20
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-reply-guard.py\" stop",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -n \"$TELEGRAM_STATE_DIR\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/telegram-ack.py\"; fi; true",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/telegram-fresh.sh\""
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/telegram-resume.sh\""
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/telegram-model.sh\""
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -n \"$TELEGRAM_STATE_DIR\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-stream.py\" prompt; fi; true",
+            "timeout": 20
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-reply-guard.py\" prompt",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

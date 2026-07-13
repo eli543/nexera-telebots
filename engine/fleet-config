@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+# fleet-config - the one config helper every fleet script calls.
+#
+# Reads the fleet's single config file (fleet.json) and answers small, plain-text
+# questions about it: which bots exist, a bot's field, which bot owns a state dir
+# or workdir, an option value, and the Claude Code project-dir for a bot. Every
+# other engine/daemon/hook script resolves per-bot facts through here, so there is
+# ONE place that knows the bot list and ZERO hardcoded bot/worktree/token data.
+#
+# Config path resolution (first that is set wins):
+#   $FLEET_CONFIG            explicit file override
+#   $FLEET_HOME/fleet.json   the installed home (default ~/.claude/telegram-fleet)
+#   ~/.claude/telegram-fleet/fleet.json
+#
+# Subcommands (all print newline-terminated plain text on stdout; on a missing
+# lookup they exit 1 with a one-line message on stderr):
+#   bots                              one bot key per line
+#   bot <key> <field>                 a bot field value (workdir/state_dir ~-expanded)
+#   bot-by-state <dir> [field]        key (or field) of the bot whose state_dir matches
+#   bot-by-workdir <dir> [field]      key (or field) of the bot whose workdir matches
+#   option <name>                     an options.<name> value (true/false/string)
+#   project-dir <key>                 full path to the bot's Claude Code project dir
+#   path                              the resolved config file path
+#   validate                          exit 0 if the config is well-formed, else 1
+#
+# Python 3.9+, standard library only. No secrets are ever read or printed here;
+# tokens live only in each bot's state-dir .env and are never referenced.
+
+import json
+import os
+import re
+import sys
+
+FIELDS = ("name", "key", "workdir", "state_dir", "emoji")
+PATH_FIELDS = ("workdir", "state_dir")
+KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+
+# Defaults applied when an option is absent from the config, so callers always
+# get a predictable value to compare against.
+OPTION_DEFAULTS = {
+    "watchdog": "true",
+    "voice": "auto",
+    "tldr_judge": "false",
+    "grid": "false",
+    "alert_bot": "",
+}
+
+
+def die(msg, code=1):
+    sys.stderr.write("fleet-config: " + msg + "\n")
+    sys.exit(code)
+
+
+def config_path():
+    p = os.environ.get("FLEET_CONFIG")
+    if p:
+        return os.path.expanduser(p)
+    home = os.environ.get("FLEET_HOME")
+    if home:
+        return os.path.join(os.path.expanduser(home), "fleet.json")
+    return os.path.expanduser("~/.claude/telegram-fleet/fleet.json")
+
+
+def load():
+    path = config_path()
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        die("config not found: " + path)
+    except (ValueError, OSError) as exc:
+        die("cannot read config " + path + ": " + str(exc))
+    if not isinstance(data, dict):
+        die("config root is not an object: " + path)
+    return data
+
+
+def bots(data):
+    b = data.get("bots")
+    if not isinstance(b, list):
+        die("config has no 'bots' array")
+    return b
+
+
+def expand(value):
+    return os.path.expanduser(value) if isinstance(value, str) else value
+
+
+def norm_dir(value):
+    # Compare directories tolerant of ~ and a trailing slash, without requiring
+    # the path to exist (state dirs may not be created yet).
+    v = os.path.expanduser(str(value))
+    if len(v) > 1:
+        v = v.rstrip("/")
+    return v
+
+
+def get_field(bot, field):
+    val = bot.get(field, "")
+    if field in PATH_FIELDS:
+        return expand(val)
+    return val
+
+
+def project_dir_for(workdir):
+    # Claude Code names a project dir after its absolute path with every "/"
+    # turned into "-" (e.g. /Users/x/claude-fleet/main -> -Users-x-claude-fleet-main).
+    abs_wd = os.path.expanduser(str(workdir))
+    name = abs_wd.replace("/", "-")
+    return os.path.join(os.path.expanduser("~/.claude/projects"), name)
+
+
+def option_value(data, name):
+    opts = data.get("options")
+    opts = opts if isinstance(opts, dict) else {}
+    # Case-insensitive match so ALERT_BOT / alert_bot both resolve.
+    for k, v in opts.items():
+        if k.lower() == name.lower():
+            if isinstance(v, bool):
+                return "true" if v else "false"
+            return str(v)
+    return OPTION_DEFAULTS.get(name.lower(), "")
+
+
+def validate(data):
+    problems = []
+    if data.get("version") != 1:
+        problems.append("version must be 1")
+    bl = data.get("bots")
+    if not isinstance(bl, list) or not bl:
+        problems.append("bots must be a non-empty array")
+        return problems
+    seen = set()
+    for i, bot in enumerate(bl):
+        if not isinstance(bot, dict):
+            problems.append("bot #%d is not an object" % (i + 1))
+            continue
+        key = bot.get("key", "")
+        if not KEY_RE.match(str(key)):
+            problems.append("bot #%d has an invalid key %r" % (i + 1, key))
+        elif key in seen:
+            problems.append("duplicate bot key %r" % key)
+        else:
+            seen.add(key)
+        for req in ("workdir", "state_dir"):
+            if not bot.get(req):
+                problems.append("bot %r missing %s" % (key, req))
+    return problems
+
+
+def find_bot(data, key):
+    for bot in bots(data):
+        if bot.get("key") == key:
+            return bot
+    return None
+
+
+def find_by_dir(data, field, wanted):
+    target = norm_dir(wanted)
+    for bot in bots(data):
+        if norm_dir(bot.get(field, "")) == target:
+            return bot
+    return None
+
+
+def emit_bot(bot, field):
+    if field and field not in FIELDS:
+        die("unknown field: " + field + " (valid: " + ", ".join(FIELDS) + ")")
+    print(get_field(bot, field or "key"))
+
+
+def main(argv):
+    if not argv:
+        die("usage: fleet-config bots|bot|bot-by-state|bot-by-workdir|option|project-dir|path|validate ...", 2)
+    cmd = argv[0]
+
+    if cmd == "path":
+        print(config_path())
+        return 0
+
+    data = load()
+
+    if cmd == "bots":
+        for bot in bots(data):
+            k = bot.get("key")
+            if k:
+                print(k)
+        return 0
+
+    if cmd == "validate":
+        problems = validate(data)
+        if problems:
+            for p in problems:
+                sys.stderr.write("fleet-config: " + p + "\n")
+            return 1
+        return 0
+
+    if cmd == "bot":
+        if len(argv) < 3:
+            die("usage: fleet-config bot <key> <field>", 2)
+        bot = find_bot(data, argv[1])
+        if bot is None:
+            die("no such bot key: " + argv[1])
+        emit_bot(bot, argv[2])
+        return 0
+
+    if cmd == "bot-by-state":
+        if len(argv) < 2:
+            die("usage: fleet-config bot-by-state <state-dir> [field]", 2)
+        bot = find_by_dir(data, "state_dir", argv[1])
+        if bot is None:
+            die("no bot with state_dir: " + argv[1])
+        emit_bot(bot, argv[2] if len(argv) > 2 else "")
+        return 0
+
+    if cmd == "bot-by-workdir":
+        if len(argv) < 2:
+            die("usage: fleet-config bot-by-workdir <workdir> [field]", 2)
+        bot = find_by_dir(data, "workdir", argv[1])
+        if bot is None:
+            die("no bot with workdir: " + argv[1])
+        emit_bot(bot, argv[2] if len(argv) > 2 else "")
+        return 0
+
+    if cmd == "option":
+        if len(argv) < 2:
+            die("usage: fleet-config option <name>", 2)
+        print(option_value(data, argv[1]))
+        return 0
+
+    if cmd == "project-dir":
+        if len(argv) < 2:
+            die("usage: fleet-config project-dir <key>", 2)
+        bot = find_bot(data, argv[1])
+        if bot is None:
+            die("no such bot key: " + argv[1])
+        print(project_dir_for(bot.get("workdir", "")))
+        return 0
+
+    die("unknown subcommand: " + cmd, 2)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

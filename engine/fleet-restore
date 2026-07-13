@@ -1,0 +1,146 @@
+#!/bin/bash
+# fleet-restore - POST-RESTART restore. Reads the snapshot written by
+# fleet-snapshot and brings every bot back RESUMED into its exact pre-restart
+# conversation via fleet-launch, then un-parks the watchdog.
+#
+# Usage:
+#   fleet-restore            real restore (opens the bot windows)
+#   fleet-restore --dry-run  print what it WOULD launch; touch nothing
+#
+# Run this AFTER you log back in, from a plain terminal - never from inside one
+# of the bots (it relaunches all of them). Config driven; no hardcoded bot list.
+# macOS (osascript / Terminal.app).
+
+set -uo pipefail
+
+case "${1:-}" in -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+
+FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+resolve_bin() {
+  if [ -x "$FLEET_HOME/bin/$1" ]; then printf '%s\n' "$FLEET_HOME/bin/$1"; return; fi
+  if [ -x "$SELF_DIR/$1" ]; then printf '%s\n' "$SELF_DIR/$1"; return; fi
+  printf '%s\n' "$1"
+}
+LAUNCHER="$(resolve_bin fleet-launch)"
+
+DRY_RUN=0
+[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+
+WD_STATE="$FLEET_HOME/watchdog-state"
+RESTART_STATE="$FLEET_HOME/restart-state"
+
+SNAP="$RESTART_STATE/snapshot.tsv"
+if [ $DRY_RUN -eq 1 ] && [ -f "$RESTART_STATE/snapshot.dryrun.tsv" ]; then
+  SNAP="$RESTART_STATE/snapshot.dryrun.tsv"
+fi
+
+if [ ! -f "$SNAP" ]; then
+  echo "No snapshot found at $SNAP." >&2
+  echo "Run fleet-snapshot BEFORE restarting so there's something to restore." >&2
+  exit 1
+fi
+if [ ! -x "$LAUNCHER" ] && ! command -v "$LAUNCHER" >/dev/null 2>&1; then
+  echo "Launcher missing: $LAUNCHER" >&2
+  exit 1
+fi
+
+session_pid_for() {
+  local want="$1" pid s
+  # ps -axo + grep, deliberately not pgrep (macOS pgrep omits the caller's ancestor).
+  # shellcheck disable=SC2009
+  for pid in $(ps -axo pid=,command= | grep 'channels plugin:telegram' | grep -v grep | awk '{print $1}'); do
+    [ -z "$pid" ] && continue
+    s=$(ps eww -p "$pid" 2>/dev/null | tr ' ' '\n' | grep -m1 '^TELEGRAM_STATE_DIR=' | cut -d= -f2-)
+    if [ "$s" = "$want" ]; then echo "$pid"; return; fi
+  done
+}
+
+launched=0; skipped=0
+to_unpark=()
+
+# ---- pass 1: launch (or skip) each bot ------------------------------------
+# Parse tab-separated fields WITHOUT collapsing empties: `IFS=$'\t' read` treats
+# tab as whitespace and would swallow an empty session_id, shifting every later
+# column. Convert tabs to the unit-separator (a non-whitespace delimiter) so an
+# empty field is preserved. `set -f` disables globbing on the split.
+while IFS= read -r line; do
+  case "$line" in \#*|"") continue ;; esac
+  set -f
+  oldIFS=$IFS; IFS=$'\037'
+  # intentional field split on the unit-separator (globbing disabled above).
+  # shellcheck disable=SC2046
+  set -- $(printf '%s' "$line" | tr '\t' '\037')
+  IFS=$oldIFS
+  set +f
+  # TSV columns: 1 key  2 cwd  3 state_dir  4 proj_dir  5 session_id
+  #              6 was_running  7 already_disabled  8 we_parked  9 mtime
+  key="${1:-}"; cwd="${2:-}"; sdir="${3:-}"; sid="${5:-}"
+  already_disabled="${7:-}"; we_parked="${8:-}"
+  [ -z "$key" ] && continue
+
+  if [ "$already_disabled" = "1" ]; then
+    echo "$key: was manually disabled before the snapshot -> leaving DOWN (respecting your kill switch)"
+    continue
+  fi
+  [ "$we_parked" = "1" ] && to_unpark+=("$key")
+
+  existing=$(session_pid_for "$sdir")
+  if [ -n "$existing" ]; then
+    echo "$key: already running (pid=$existing) -> skip launch, no duplicate"
+    skipped=$((skipped+1))
+    continue
+  fi
+
+  if [ -z "$sid" ]; then
+    echo "$key: no saved session id -> start FRESH"
+    cmd="$LAUNCHER $cwd"
+  else
+    echo "$key: resume session $sid"
+    cmd="$LAUNCHER $cwd $sid"
+  fi
+
+  if [ $DRY_RUN -eq 1 ]; then
+    echo "   DRY RUN would open Terminal -> do script: $cmd"
+  else
+    /usr/bin/osascript >/dev/null 2>&1 <<OSA
+tell application "Terminal"
+  activate
+  do script "$cmd"
+end tell
+OSA
+    launched=$((launched+1))
+    sleep 3   # stagger so windows come up one at a time
+  fi
+done < "$SNAP"
+
+# ---- pass 2: hand control back to the watchdog ----------------------------
+if [ $DRY_RUN -eq 1 ]; then
+  for key in ${to_unpark[@]+"${to_unpark[@]}"}; do
+    [ -z "$key" ] && continue
+    echo "   DRY RUN would un-park: rm -f $WD_STATE/$key.disabled"
+  done
+  echo
+  echo "DRY RUN complete. Nothing launched, nothing un-parked."
+  exit 0
+fi
+
+if [ $launched -gt 0 ]; then
+  echo
+  echo "Waiting ~25s for the bots to reconnect before re-enabling the watchdog..."
+  sleep 25
+fi
+
+unparked=0
+for key in ${to_unpark[@]+"${to_unpark[@]}"}; do
+  [ -z "$key" ] && continue
+  rm -f "$WD_STATE/$key.disabled" && unparked=$((unparked+1))
+done
+
+# Snapshot consumed - archive it so a stale snapshot can't be reused by accident.
+mv "$SNAP" "$SNAP.used.$(date +%s)" 2>/dev/null || true
+
+echo
+echo "Restore complete: $launched launched, $skipped already-up, watchdog re-enabled for $unparked bots."
+echo "Give the bots up to a minute to finish reconnecting Telegram."
+echo "If a bot was mid-task when you restarted, send it 'continue' to pick up where it left off."

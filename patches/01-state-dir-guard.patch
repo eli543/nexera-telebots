@@ -1,0 +1,22 @@
+--- a/server.ts
++++ b/server.ts
+@@ -23,6 +23,19 @@
+ import { homedir } from 'os'
+ import { join, extname, sep } from 'path'
+ 
++// Only run as a bot when a state dir is EXPLICITLY set. Every fleet bot is
++// launched with TELEGRAM_STATE_DIR set (fleet-launch exports it). A session that
++// merely has this plugin enabled (e.g. a Claude desktop / "agent mode" session)
++// loads server.ts WITHOUT the env; it would fall back to the default `telegram`
++// state dir, adopt whichever token lives there, start a second poller, and
++// stale-kill the real bot that owns that token. Exiting here for unconfigured
++// loads stops that at the source. Configured bots are unaffected - they always
++// set the env, and fleet bots use their own fleet-<key> state dirs, never the
++// stock default.
++if (!process.env.TELEGRAM_STATE_DIR) {
++  process.stderr.write('telegram channel: TELEGRAM_STATE_DIR not set - not a configured bot, exiting (stray plugin load)\n')
++  process.exit(0)
++}
+ const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
+ const ACCESS_FILE = join(STATE_DIR, 'access.json')
+ const APPROVED_DIR = join(STATE_DIR, 'approved')

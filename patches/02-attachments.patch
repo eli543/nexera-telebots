@@ -1,0 +1,15 @@
+--- a/server.ts
++++ b/server.ts
+@@ -498,6 +498,12 @@
+       },
+     },
+     {
++      // [telegram-fleet] Voice notes and file attachments rely on this tool plus
++      // the document / voice / audio / video / video_note / sticker handlers and
++      // the attachment_* meta below, all shipped by this upstream plugin
++      // (telegram@claude-plugins-official 0.0.6). The fleet's voice-notes skill
++      // depends on them; no behavioral patch is needed on this version. Marker
++      // comment only - see patches/README.md (feature-to-patch map: voice -> 02).
+       name: 'download_attachment',
+       description: 'Download a file attachment from a Telegram message to the local inbox. Use when the inbound <channel> meta shows attachment_file_id. Returns the local file path ready to Read. Telegram caps bot downloads at 20MB.',
+       inputSchema: {

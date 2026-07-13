@@ -1,0 +1,110 @@
+#!/bin/bash
+# fleet-snapshot - PRE-RESTART snapshot for a planned macOS restart / update.
+#
+# Records each bot's current Claude session id so it can be RESUMED (not started
+# fresh) after login, and parks the watchdog so it cannot spawn blank sessions
+# during the boot window. Pairs with fleet-restore (the post-login half).
+#
+# Why: the watchdog only auto-resumes a session touched in the last ~30 min;
+# anything idle longer comes back blank. For a planned restart we want EVERY bot
+# resumed, so we record the precise session ids to disk up front (disk survives a
+# reboot; processes do not).
+#
+# Usage:
+#   fleet-snapshot            capture + park the watchdog (real run)
+#   fleet-snapshot --dry-run  capture to a .dryrun file + print only; park nothing
+#
+# Read-only except for (a) the snapshot file and (b) touching the watchdog's own
+# per-bot kill switches. It never kills or launches anything. Config driven; no
+# hardcoded bot list. macOS (ps eww / stat -f).
+
+set -uo pipefail
+
+case "${1:-}" in -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+
+FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+resolve_bin() {
+  if [ -x "$FLEET_HOME/bin/$1" ]; then printf '%s\n' "$FLEET_HOME/bin/$1"; return; fi
+  if [ -x "$SELF_DIR/$1" ]; then printf '%s\n' "$SELF_DIR/$1"; return; fi
+  printf '%s\n' "$1"
+}
+FC_BIN="$(resolve_bin fleet-config)"
+fc() { "$FC_BIN" "$@"; }
+
+DRY_RUN=0
+[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+
+WD_STATE="$FLEET_HOME/watchdog-state"
+RESTART_STATE="$FLEET_HOME/restart-state"
+SNAP="$RESTART_STATE/snapshot.tsv"
+[ $DRY_RUN -eq 1 ] && SNAP="$RESTART_STATE/snapshot.dryrun.tsv"
+mkdir -p "$RESTART_STATE" "$WD_STATE"
+
+# pid of the live session whose TELEGRAM_STATE_DIR matches $1 (env match, exactly
+# like the watchdog, so one bot's pids are never confused with another's).
+session_pid_for() {
+  local want="$1" pid s
+  # ps -axo + grep, deliberately not pgrep (macOS pgrep omits the caller's ancestor).
+  # shellcheck disable=SC2009
+  for pid in $(ps -axo pid=,command= | grep 'channels plugin:telegram' | grep -v grep | awk '{print $1}'); do
+    [ -z "$pid" ] && continue
+    s=$(ps eww -p "$pid" 2>/dev/null | tr ' ' '\n' | grep -m1 '^TELEGRAM_STATE_DIR=' | cut -d= -f2-)
+    if [ "$s" = "$want" ]; then echo "$pid"; return; fi
+  done
+}
+
+now=$(date +%s)
+{
+  echo "# claude-telegram-fleet snapshot  $(date '+%F %T')  dry_run=$DRY_RUN"
+  printf '# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' key cwd state_dir proj_dir session_id was_running already_disabled we_parked session_mtime_epoch
+} > "$SNAP"
+
+printf '%-12s %-8s %-9s %-7s %s\n' "BOT" "RUNNING" "DISABLED" "PARKED" "SESSION (transcript age)"
+for key in $(fc bots); do
+  sdir=$(fc bot "$key" state_dir)
+  proj=$(fc project-dir "$key")
+  cwd=$(fc bot "$key" workdir)
+
+  sid=""; smtime=0; age_str="(no session)"
+  # transcript files are named by uuid (.jsonl) - no spaces; -t needs ls.
+  # shellcheck disable=SC2012
+  latest=$(ls -t "$proj"/*.jsonl 2>/dev/null | head -1)
+  if [ -n "$latest" ]; then
+    b=$(basename "$latest"); sid="${b%.jsonl}"
+    smtime=$(stat -f %m "$latest" 2>/dev/null || echo 0)
+    age_str="${sid} ($(( now - smtime ))s ago)"
+  fi
+
+  pid=$(session_pid_for "$sdir")
+  was_running=0; [ -n "$pid" ] && was_running=1
+  already_disabled=0; [ -f "$WD_STATE/$key.disabled" ] && already_disabled=1
+
+  # Park every bot that isn't already manually disabled so the watchdog can't
+  # race the restore and start a blank session during boot.
+  we_parked=0
+  if [ $already_disabled -eq 0 ]; then
+    if [ $DRY_RUN -eq 0 ]; then
+      touch "$WD_STATE/$key.disabled" && we_parked=1
+    else
+      we_parked=1
+    fi
+  fi
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$key" "$cwd" "$sdir" "$proj" "$sid" "$was_running" "$already_disabled" "$we_parked" "$smtime" >> "$SNAP"
+  printf '%-12s %-8s %-9s %-7s %s\n' "$key" \
+    "$([ $was_running -eq 1 ] && echo yes || echo no)" \
+    "$([ $already_disabled -eq 1 ] && echo yes || echo no)" \
+    "$([ $we_parked -eq 1 ] && echo yes || echo no)" \
+    "$age_str"
+done
+
+echo
+echo "Snapshot written: $SNAP"
+if [ $DRY_RUN -eq 1 ]; then
+  echo "DRY RUN: watchdog NOT parked. Nothing changed except this .dryrun file."
+else
+  echo "Watchdog parked for the bots marked PARKED=yes - it will not start them during boot."
+  echo "You're clear to restart. After you log back in, run:  fleet-restore"
+fi

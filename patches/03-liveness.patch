@@ -1,0 +1,144 @@
+--- a/server.ts
++++ b/server.ts
+@@ -71,11 +71,29 @@
+ // survive as an orphan and hold the slot forever, so every new session sees
+ // 409 Conflict. Kill any stale holder before we start polling.
+ mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
++// Diagnostic startup log: record this poller's start and its parent-process
++// chain, and flag when it stale-kills a previous poller (a source of otherwise
++// unexplained SIGTERM drops). Per-bot under the state dir; additive and fully
++// wrapped in try/catch so logging can never break startup.
++const POLLER_LOG_DIR = join(STATE_DIR, 'logs')
++try { mkdirSync(POLLER_LOG_DIR, { recursive: true, mode: 0o700 }) } catch {}
++const POLLER_STARTS_LOG = join(POLLER_LOG_DIR, 'poller-starts.log')
++const POLLER_DEATHS_LOG = join(POLLER_LOG_DIR, 'poller-deaths.log')
++let _chain = ''
++try {
++  _chain = Bun.spawnSync(["sh","-c",`P=${process.ppid}; for i in 1 2 3 4 5; do ps -o pid=,command= -p $P 2>/dev/null; P=$(ps -o ppid= -p $P 2>/dev/null | tr -d ' '); [ -z "$P" ] && break; [ "$P" = "1" ] && break; done`]).stdout.toString().replace(/\s+/g,' ').trim()
++} catch {}
+ try {
++  writeFileSync(POLLER_STARTS_LOG,
++    `${new Date().toISOString()} state=${STATE_DIR} START pid=${process.pid} ppid=${process.ppid} chain=[${_chain}]\n`, { flag: 'a' })
++} catch {}
++try {
+   const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
+   if (stale > 1 && stale !== process.pid) {
+     process.kill(stale, 0)
+     process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
++    try { writeFileSync(POLLER_STARTS_LOG,
++      `${new Date().toISOString()} state=${STATE_DIR} STALE-KILL new pid=${process.pid} SIGTERMs old pid=${stale} | spawned-by chain=[${_chain}]\n`, { flag: 'a' }) } catch {}
+     process.kill(stale, 'SIGTERM')
+   }
+ } catch {}
+@@ -665,11 +683,18 @@
+ // the bot keeps polling forever as a zombie, holding the token and blocking
+ // the next session with 409 Conflict.
+ let shuttingDown = false
+-function shutdown(): void {
++function shutdown(reason: string = 'unknown'): void {
+   if (shuttingDown) return
+   shuttingDown = true
+-  process.stderr.write('telegram channel: shutting down\n')
++  // Diagnostic: record the exact shutdown trigger to a persistent per-bot log so
++  // an unexpected death (stdin EOF, a signal, orphan detection) can be traced.
+   try {
++    writeFileSync(POLLER_DEATHS_LOG,
++      `${new Date().toISOString()} state=${STATE_DIR} pid=${process.pid} ppid=${process.ppid} reason=${reason}\n`,
++      { flag: 'a' })
++  } catch {}
++  process.stderr.write(`telegram channel: shutting down (${reason})\n`)
++  try {
+     if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
+   } catch {}
+   // bot.stop() signals the poll loop to end; the current getUpdates request
+@@ -677,22 +702,22 @@
+   setTimeout(() => process.exit(0), 2000)
+   void Promise.resolve(bot.stop()).finally(() => process.exit(0))
+ }
+-process.stdin.on('end', shutdown)
+-process.stdin.on('close', shutdown)
+-process.on('SIGTERM', shutdown)
+-process.on('SIGINT', shutdown)
+-process.on('SIGHUP', shutdown)
++process.stdin.on('end', () => shutdown('stdin-end'))
++process.stdin.on('close', () => shutdown('stdin-close'))
++process.on('SIGTERM', () => shutdown('signal-SIGTERM'))
++process.on('SIGINT', () => shutdown('signal-SIGINT'))
++process.on('SIGHUP', () => shutdown('signal-SIGHUP'))
+ 
+ // Orphan watchdog: stdin events above don't reliably fire when the parent
+ // chain (`bun run` wrapper → shell → us) is severed by a crash. Poll for
+ // reparenting (POSIX) or a dead stdin pipe and self-terminate.
+ const bootPpid = process.ppid
+ setInterval(() => {
+-  const orphaned =
+-    (process.platform !== 'win32' && process.ppid !== bootPpid) ||
+-    process.stdin.destroyed ||
+-    process.stdin.readableEnded
+-  if (orphaned) shutdown()
++  let reason = ''
++  if (process.platform !== 'win32' && process.ppid !== bootPpid) reason = `orphan-ppid(${bootPpid}->${process.ppid})`
++  else if (process.stdin.destroyed) reason = 'orphan-stdin-destroyed'
++  else if (process.stdin.readableEnded) reason = 'orphan-stdin-ended'
++  if (reason) shutdown(reason)
+ }, 5000).unref()
+ 
+ // Commands are DM-only. Responding in groups would: (1) leak pairing codes via
+@@ -1015,6 +1040,31 @@
+ // returned, and polling stopped permanently while the process stayed alive
+ // (MCP stdin keeps it running). Outbound tools kept working but the bot was
+ // deaf to inbound messages until a full restart.
++
++// --- watchdog liveness signals (additive; watchdog treats absence as legacy) ---
++// heartbeat: touched on every successful getUpdates cycle -> "polling is live".
++// last-inbound: touched when a getUpdates batch carries a message -> "the
++// session was handed something and may owe a reply". writeFileSync/join are
++// already imported above; STATE_DIR is this bot's resolved state dir.
++const WD_HEARTBEAT = join(STATE_DIR, 'poller.heartbeat')
++const WD_LAST_INBOUND = join(STATE_DIR, 'last-inbound')
++const wdWrite = (file: string, ts: number = Math.floor(Date.now() / 1000)) => {
++  try { writeFileSync(file, String(ts) + '\n') } catch {}  // never let liveness I/O break polling
++}
++wdWrite(WD_HEARTBEAT)  // fresh file at process start, before the first poll completes
++
++bot.api.config.use(async (prev, method, payload, signal) => {
++  const res = await prev(method, payload, signal)
++  if (method === 'getUpdates' && (res as any).ok) {
++    wdWrite(WD_HEARTBEAT)
++    const updates = (res as any).result
++    if (Array.isArray(updates) && updates.some((u: any) => 'message' in u)) {
++      wdWrite(WD_LAST_INBOUND)
++    }
++  }
++  return res
++})
++// --- end watchdog liveness signals ---
+ void (async () => {
+   for (let attempt = 1; ; attempt++) {
+     try {
+@@ -1022,6 +1072,7 @@
+         onStart: info => {
+           attempt = 0
+           botUsername = info.username
++          wdWrite(WD_HEARTBEAT)
+           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
+           void bot.api.setMyCommands(
+             [
+@@ -1033,6 +1084,9 @@
+           ).catch(() => {})
+         },
+       })
++      // bot.stop() was called - clean exit, but MCP stdin keeps the PROCESS
++      // alive with polling dead. Zero the heartbeat so the watchdog sees it now.
++      if (!shuttingDown) wdWrite(WD_HEARTBEAT, 0)
+       return // bot.stop() was called — clean exit from the loop
+     } catch (err) {
+       if (shuttingDown) return
+@@ -1044,6 +1098,7 @@
+           `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
+           `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
+         )
++        wdWrite(WD_HEARTBEAT, 0)  // polling permanently dead, process stays alive
+         return
+       }
+       const delay = Math.min(1000 * attempt, 15000)

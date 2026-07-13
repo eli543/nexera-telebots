@@ -1,0 +1,148 @@
+#!/bin/bash
+# fleet-launch - start (or resume) one fleet bot's Claude session with its
+# Telegram env wired up. This is the canonical launcher: fleet-fresh, the
+# watchdog, and fleet-restore all reach a bot through here, so launch behavior
+# lives in exactly one place.
+#
+# Args:
+#   $1  bot key OR workdir (either is accepted; resolved via fleet-config)
+#   $2  resume id (optional):
+#         (empty)     fresh session; resets per-bot model-state to your default
+#         continue    resume the most recent conversation in this workdir
+#         fresh-keep  empty session but KEEP the model-state /model wrote
+#         <uuid>      resume that specific session (context preserving)
+#
+# What it does: exports TELEGRAM_STATE_DIR + TELEGRAM_BOT_TOKEN (from the bot's
+# state-dir .env) + CLAUDE_CODE_NO_FLICKER=1, applies the sticky per-bot model /
+# effort if set (absent = your Claude Code default, no flags forced), applies the
+# fleet permission stance, optionally asks the window-grid extra to tile, then
+# exec's claude with the official telegram channel plugin.
+#
+# Env: FLEET_HOME (default ~/.claude/telegram-fleet); CC_LAUNCH_DRYRUN=1 prints
+# the planned command and exits without launching or touching any window.
+#
+# macOS is the supported platform (Terminal.app window handling by the caller).
+
+set -uo pipefail
+
+usage() {
+  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+}
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+resolve_bin() {
+  if [ -x "$FLEET_HOME/bin/$1" ]; then printf '%s\n' "$FLEET_HOME/bin/$1"; return; fi
+  if [ -x "$SELF_DIR/$1" ]; then printf '%s\n' "$SELF_DIR/$1"; return; fi
+  printf '%s\n' "$1"
+}
+FC_BIN="$(resolve_bin fleet-config)"
+fc() { "$FC_BIN" "$@"; }
+
+ARG="${1:-}"
+RESUME_ID="${2:-}"
+
+if [ -z "$ARG" ]; then
+  echo "fleet-launch: need a bot key or workdir (try --help)" >&2
+  exit 1
+fi
+
+# Accept a key or a workdir. Resolve to the canonical key first.
+KEY="$(fc bot "$ARG" key 2>/dev/null || true)"
+if [ -z "$KEY" ]; then
+  KEY="$(fc bot-by-workdir "$ARG" key 2>/dev/null || true)"
+fi
+if [ -z "$KEY" ]; then
+  echo "fleet-launch: '$ARG' is not a known bot key or workdir in fleet.json" >&2
+  exit 1
+fi
+
+CWD="$(fc bot "$KEY" workdir)"
+STATE_DIR="$(fc bot "$KEY" state_dir)"
+
+if [ ! -d "$CWD" ]; then
+  echo "fleet-launch: workdir missing: $CWD" >&2
+  exit 1
+fi
+
+# --- env wiring -------------------------------------------------------------
+if [ -f "$STATE_DIR/.env" ]; then
+  bot_token=$(grep -E '^TELEGRAM_BOT_TOKEN=' "$STATE_DIR/.env" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]')
+  [ -n "$bot_token" ] && export TELEGRAM_BOT_TOKEN="$bot_token"
+fi
+export TELEGRAM_STATE_DIR="$STATE_DIR"
+# Flicker-free renderer, scoped to this bot session only.
+export CLAUDE_CODE_NO_FLICKER=1
+
+# --- sticky per-bot model + effort ------------------------------------------
+# MODEL is stored as a CLASS ALIAS (opus/sonnet/fable/haiku) or a literal
+# claude-* id - never a pinned version - so an alias always resolves to the
+# newest model in that class. Absent or invalid state = no flags = your Claude
+# Code default (this tool never forces a model on you). A bare fresh launch
+# resets to that default by removing the state file.
+MODEL_STATE_FILE="$STATE_DIR/model-state"
+if [ -z "$RESUME_ID" ]; then
+  rm -f "$MODEL_STATE_FILE" 2>/dev/null || true
+fi
+BOT_MODEL=""; BOT_EFFORT=""
+if [ -f "$MODEL_STATE_FILE" ]; then
+  _m=$(grep -E '^MODEL='  "$MODEL_STATE_FILE" | head -1 | cut -d= -f2- | tr -d '[:space:]')
+  _e=$(grep -E '^EFFORT=' "$MODEL_STATE_FILE" | head -1 | cut -d= -f2- | tr -d '[:space:]')
+  case "$_m" in opus|sonnet|fable|haiku) BOT_MODEL="$_m" ;; claude-*) BOT_MODEL="$_m" ;; esac
+  case "$_e" in low|medium|high|xhigh|max) BOT_EFFORT="$_e" ;; esac
+fi
+
+# --- permission stance ------------------------------------------------------
+# $FLEET_HOME/permission-stance holds one of: safe | scoped | full.
+#   safe   (default) no permission flag - Claude Code asks as usual
+#   scoped --permission-mode auto
+#   full   --dangerously-skip-permissions   (only if you explicitly chose it)
+STANCE="safe"
+if [ -f "$FLEET_HOME/permission-stance" ]; then
+  _s=$(head -1 "$FLEET_HOME/permission-stance" | tr -d '[:space:]')
+  case "$_s" in safe|scoped|full) STANCE="$_s" ;; esac
+fi
+
+# --- build the claude command ----------------------------------------------
+ARGS=(--channels plugin:telegram@claude-plugins-official)
+case "$RESUME_ID" in
+  "")          RESUME_DESC="fresh" ;;
+  continue)    ARGS+=(--continue); RESUME_DESC="continue" ;;
+  fresh-keep)  RESUME_DESC="fresh-keep" ;;
+  *)           ARGS+=(--resume "$RESUME_ID"); RESUME_DESC="resume $RESUME_ID" ;;
+esac
+[ -n "$BOT_MODEL" ]  && ARGS+=(--model "$BOT_MODEL")
+[ -n "$BOT_EFFORT" ] && ARGS+=(--effort "$BOT_EFFORT")
+case "$STANCE" in
+  full)   ARGS+=(--dangerously-skip-permissions) ;;
+  scoped) ARGS+=(--permission-mode auto) ;;
+  safe)   : ;;
+esac
+
+echo "launching $KEY in $CWD (state: $STATE_DIR, model: ${BOT_MODEL:-default} effort: ${BOT_EFFORT:-default} stance: $STANCE $RESUME_DESC)"
+
+if [ "${CC_LAUNCH_DRYRUN:-}" = "1" ]; then
+  echo "DRYRUN key=$KEY cwd=$CWD argv: claude ${ARGS[*]}"
+  exit 0
+fi
+
+cd "$CWD" || { echo "fleet-launch: cannot cd to $CWD" >&2; exit 1; }
+
+# Optional: ask the window-grid extra to tile all bot windows. Off by default;
+# only when the grid option is on AND the extra is installed. Detached with a
+# short delay so this window is a live claude session by the time it runs.
+if [ "$(fc option grid 2>/dev/null || echo false)" = "true" ]; then
+  GRID="$(resolve_bin fleet-grid)"
+  if [ -x "$GRID" ]; then
+    # $GRID must expand inside the child sh (passed via env), not out here.
+    # shellcheck disable=SC2016
+    GRID="$GRID" nohup sh -c 'sleep 3; exec "$GRID"' >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+  fi
+fi
+
+exec claude "${ARGS[@]}"

@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Collect shell scripts
+        id: shells
+        run: |
+          set -eu
+          # All *.sh files plus any file with a bash/sh shebang (voice scripts
+          # have no extension).
+          { find . -path ./.git -prune -o -name '*.sh' -type f -print
+            grep -rIlE '^#!.*(bash|/sh)( |$)' . --exclude-dir=.git 2>/dev/null || true
+          } | sort -u > /tmp/shell-files.txt
+          echo "Shell files:"
+          cat /tmp/shell-files.txt
+
+      - name: bash -n (syntax) and shellcheck
+        run: |
+          set -eu
+          rc=0
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            bash -n "$f" || rc=1
+            # Hard-fail on real errors; report style and warnings non-blocking.
+            shellcheck -S error "$f" || rc=1
+            shellcheck -S style "$f" || true
+          done < /tmp/shell-files.txt
+          exit "$rc"
+
+      - name: Collect python files
+        run: |
+          set -eu
+          { find . -path ./.git -prune -o -name '*.py' -type f -print
+            grep -rIlE '^#!.*python' . --exclude-dir=.git 2>/dev/null || true
+          } | sort -u > /tmp/py-files.txt
+          echo "Python files:"
+          cat /tmp/py-files.txt
+
+      - name: python3 -m py_compile
+        run: |
+          set -eu
+          rc=0
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            python3 -m py_compile "$f" || rc=1
+          done < /tmp/py-files.txt
+          exit "$rc"
+
+      - name: Validate JSON
+        run: |
+          set -eu
+          for f in .claude-plugin/marketplace.json \
+                   plugin/.claude-plugin/plugin.json \
+                   config/fleet.example.json \
+                   config/fleet.example-fleet.json; do
+            [ -f "$f" ] || continue
+            python3 -m json.tool "$f" > /dev/null
+          done
+
+      - name: Run offline test harness
+        run: |
+          set -eu
+          if [ -f tests/run.sh ]; then
+            bash tests/run.sh
+          else
+            echo "tests/run.sh not present; skipping."
+          fi
+
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,219 @@
+#!/bin/bash
+# fleet-fresh - detached kill + relaunch of one fleet bot's Claude session.
+#
+# The single restart primitive. /fresh, /resume, /model, and the watchdog all
+# funnel through here so kill+relaunch behaves identically everywhere. Config
+# driven: the bot is identified by its workdir via fleet-config, so there is no
+# hardcoded worktree list.
+#
+# Args:
+#   $1  PID of the claude session to replace (999999 or a dead pid = just spawn)
+#   $2  workdir of the bot (must be a workdir known to fleet.json)
+#   $3  resume id (optional): a session uuid | continue | fresh-keep | "" (fresh)
+#   $4  "quiet" (optional): suppress the back-online ping (the caller notifies)
+#
+# Safety, preserved from the live restart script:
+#   - refuses unless the workdir is a known fleet bot (exit 2)
+#   - refuses unless the PID is a claude process whose lsof cwd == that workdir,
+#     so a sibling bot is never killed by mistake (exit 3 / exit 4)
+#   - SIGTERM, wait up to 8s, then SIGKILL only if it lingers
+#   - closes the old window strictly by the killed session's own tty
+#   - process discovery is ps -axo + lsof cwd match, never pgrep -f / pkill
+#
+# macOS only (osascript / Terminal.app / lsof / ps -o tty). Logs to
+# $FLEET_HOME/logs/fresh.log.
+
+set -uo pipefail
+
+usage() {
+  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+}
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+resolve_bin() {  # $1 = tool name -> absolute path or bare name (PATH)
+  if [ -x "$FLEET_HOME/bin/$1" ]; then printf '%s\n' "$FLEET_HOME/bin/$1"; return; fi
+  if [ -x "$SELF_DIR/$1" ]; then printf '%s\n' "$SELF_DIR/$1"; return; fi
+  printf '%s\n' "$1"
+}
+FC_BIN="$(resolve_bin fleet-config)"
+LAUNCHER="$(resolve_bin fleet-launch)"
+fc() { "$FC_BIN" "$@"; }
+
+TARGET_PID="${1:-}"
+TARGET_CWD="${2:-}"
+RESUME_ID="${3:-}"
+QUIET="${4:-}"
+LOG_DIR="$FLEET_HOME/logs"
+LOG="$LOG_DIR/fresh.log"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+OLD_TTY=""
+
+# token from a bot's state-dir .env (never inlined, never logged)
+token_of_state() {
+  [ -f "$1/.env" ] || return 0
+  grep -E '^TELEGRAM_BOT_TOKEN=' "$1/.env" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]'
+}
+
+# first allowlisted chat id from a bot's access.json (the bot's own chat)
+chat_id_of_state() {
+  python3 - "$1" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1] + "/access.json"))
+    a = d.get("allowFrom") or []
+    print(str(a[0]) if a else "")
+except Exception:
+    print("")
+PY
+}
+
+{
+  echo ""
+  echo "=== $(date '+%F %T') restart pid=$TARGET_PID cwd=$TARGET_CWD ==="
+
+  if [ -z "$TARGET_PID" ] || [ -z "$TARGET_CWD" ]; then
+    echo "ERROR missing args (need: pid, workdir)"
+    exit 1
+  fi
+
+  # Gate: the workdir must belong to a known fleet bot. Replaces the live six
+  # worktree whitelist with a config lookup.
+  BOT_KEY="$(fc bot-by-workdir "$TARGET_CWD" key 2>/dev/null || true)"
+  if [ -z "$BOT_KEY" ]; then
+    echo "REFUSE unknown workdir (not in fleet.json): $TARGET_CWD"
+    exit 2
+  fi
+  STATE_DIR="$(fc bot-by-workdir "$TARGET_CWD" state_dir 2>/dev/null || true)"
+
+  if [ ! -x "$LAUNCHER" ] && ! command -v "$LAUNCHER" >/dev/null 2>&1; then
+    echo "ERROR launcher not found: $LAUNCHER"
+    exit 5
+  fi
+
+  if kill -0 "$TARGET_PID" 2>/dev/null; then
+    cmd=$(ps -p "$TARGET_PID" -o comm= 2>/dev/null | tr -d '[:space:]')
+    cwd=$(lsof -a -p "$TARGET_PID" -d cwd 2>/dev/null | awk 'NR>1 {print $NF}')
+    OLD_TTY=$(ps -p "$TARGET_PID" -o tty= 2>/dev/null | tr -d '[:space:]')
+    echo "target check: pid=$TARGET_PID comm=$cmd cwd=$cwd tty=$OLD_TTY"
+    case "$cmd" in
+      *claude*) : ;;
+      *) echo "REFUSE target is not claude (comm=$cmd)"; exit 3 ;;
+    esac
+    if [ "$cwd" != "$TARGET_CWD" ]; then
+      echo "REFUSE target cwd '$cwd' != expected '$TARGET_CWD' (protecting sibling bot)"
+      exit 4
+    fi
+  else
+    echo "WARN target $TARGET_PID not running; will still spawn a fresh one in $TARGET_CWD"
+  fi
+
+  # Let the calling hook exit cleanly before its parent dies.
+  sleep 2
+
+  if kill -0 "$TARGET_PID" 2>/dev/null; then
+    echo "$(date '+%F %T') SIGTERM -> $TARGET_PID"
+    kill -TERM "$TARGET_PID" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8; do
+      sleep 1
+      if ! kill -0 "$TARGET_PID" 2>/dev/null; then
+        echo "$(date '+%F %T') target exited"
+        break
+      fi
+    done
+    if kill -0 "$TARGET_PID" 2>/dev/null; then
+      echo "$(date '+%F %T') SIGKILL -> $TARGET_PID (graceful timeout)"
+      kill -KILL "$TARGET_PID" 2>/dev/null || true
+      sleep 1
+    fi
+  fi
+
+  echo "$(date '+%F %T') opening Terminal -> $LAUNCHER $TARGET_CWD ${RESUME_ID:+resume=$RESUME_ID}"
+
+  /usr/bin/osascript <<OSA
+tell application "Terminal"
+  activate
+  do script "$LAUNCHER $TARGET_CWD $RESUME_ID"
+end tell
+OSA
+  rc=$?
+  echo "$(date '+%F %T') osascript exit=$rc"
+
+  # Wait for the freshly launched session to actually come up, then confirm it is
+  # back. The new session carries the '--channels plugin:telegram' signature; match
+  # on that + its cwd via lsof and exclude the just-killed pid. ps -axo (never
+  # pgrep -f, which on macOS omits the caller's own ancestor and could false-miss).
+  NEW_PID=""
+  for _ in $(seq 1 45); do
+    sleep 1
+    # ps -axo + grep, deliberately not pgrep: macOS pgrep omits the caller's own
+    # ancestor, which would false-miss the session we just launched.
+    # shellcheck disable=SC2009
+    while read -r p _rest; do
+      [ -z "$p" ] && continue
+      [ "$p" = "$TARGET_PID" ] && continue
+      pcwd=$(lsof -a -p "$p" -d cwd 2>/dev/null | awk 'NR>1 {print $NF}')
+      if [ "$pcwd" = "$TARGET_CWD" ]; then NEW_PID="$p"; break; fi
+    done < <(ps -axo pid=,command= 2>/dev/null | grep -F -- "--channels plugin:telegram@claude-plugins-official" | grep -v grep)
+    [ -n "$NEW_PID" ] && break
+  done
+
+  if [ -n "$NEW_PID" ]; then
+    echo "$(date '+%F %T') new session up (pid=$NEW_PID)"
+    if [ "$QUIET" = "quiet" ]; then
+      echo "$(date '+%F %T') back-online ping suppressed (quiet mode; caller will notify)"
+    else
+      sleep 4   # small buffer for the plugin to finish connecting
+      BOT_TOKEN="$(token_of_state "$STATE_DIR")"
+      CHAT_ID="$(chat_id_of_state "$STATE_DIR")"
+      if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ]; then
+        curl -s -o /dev/null -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+          --data-urlencode "chat_id=${CHAT_ID}" \
+          --data-urlencode "text=Back and ready." \
+          && echo "$(date '+%F %T') back-online ping sent" \
+          || echo "$(date '+%F %T') back-online ping curl failed"
+      else
+        echo "$(date '+%F %T') back-online ping skipped: no token/chat for $BOT_KEY"
+      fi
+    fi
+  else
+    echo "$(date '+%F %T') new session not detected within timeout; back-online ping skipped"
+  fi
+
+  # Close the old, now-dead window strictly by its old controlling tty so a
+  # sibling bot window is never closed.
+  case "$OLD_TTY" in
+    ttys[0-9]*)
+      sleep 2
+      echo "$(date '+%F %T') closing old window tty=/dev/$OLD_TTY"
+      /usr/bin/osascript <<OSA 2>>"$LOG" || true
+tell application "Terminal"
+  set toClose to {}
+  repeat with w in windows
+    repeat with t in tabs of w
+      try
+        if tty of t is "/dev/$OLD_TTY" then
+          set end of toClose to w
+        end if
+      end try
+    end repeat
+  end repeat
+  repeat with w in toClose
+    try
+      close w saving no
+    end try
+  end repeat
+end tell
+OSA
+      ;;
+    *)
+      echo "$(date '+%F %T') skip old-window close: implausible tty '$OLD_TTY'"
+      ;;
+  esac
+
+  echo "=== done ==="
+} >> "$LOG" 2>&1

@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "bots": [
+    {
+      "name": "Main",
+      "key": "main",
+      "workdir": "~/claude-fleet/main",
+      "state_dir": "~/.claude/channels/fleet-main",
+      "emoji": "🤖"
+    }
+  ],
+  "options": {
+    "watchdog": true,
+    "voice": "auto",
+    "tldr_judge": false,
+    "grid": false
+  }
+}
