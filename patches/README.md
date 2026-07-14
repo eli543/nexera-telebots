@@ -40,7 +40,7 @@ The patches were generated against `telegram@claude-plugins-official` version
 `apply-patches.sh` verifies both the version and this hash before touching
 anything, and refuses a mismatch unless you pass `--force`. The fully-patched
 (genericized) result has sha256
-`3e0f01874185660b0345930110b4baf69ed9fdc8c7688057a9045b289b3ec168`.
+`1f677f91bb2e528d7942731b7e9151d9a2119f063a3172b969d0bb9f4c39f0e4`.
 
 ## Fragility: a plugin update wipes these
 
@@ -180,22 +180,29 @@ conversation kept via restart-with-resume. No new engine and no new consts.
 ### 08-context-usage.patch  (feature: /context and /usage reports)
 
 Change: adds handling for `/context` (this session's live context-window usage:
-used tokens vs cap, with a bar) and `/usage` (fleet-wide token burn: today plus
-the trailing 7 days, per bot, with a model split). Each resolves the workdir with
-`resolveWorkdir()` and spawns `$FLEET_HOME/bin/fleet-context` or
-`$FLEET_HOME/bin/fleet-usage` detached. The engines read the session transcripts
-and send the report themselves with the bot's own token, entirely outside the
-model - they work mid-task and cost the session zero context.
+used tokens vs cap, with a bar) and `/usage` (your plan limits - how much of
+each session/weekly limit is left and when it resets - plus fleet-wide token
+burn: today and the trailing 7 days, per bot, with a model split). Each resolves
+the workdir with `resolveWorkdir()` and spawns `$FLEET_HOME/bin/fleet-context`
+or `$FLEET_HOME/bin/fleet-usage` detached. The engines compute and send the
+report themselves with the bot's own token, entirely outside the model - they
+work mid-task and cost the session zero context.
 
-Stated honestly in both reports: the terminal `/context` per-category table and
-the terminal `/usage` plan-limit meters are internal to the terminal app and not
-recoverable from outside. What these report is the true measured state from the
-session records.
+Where the numbers come from, honestly: burn is measured from the local session
+transcripts. Plan limits come from the same source the terminal `/usage` screen
+uses - the `api.anthropic.com/api/oauth/usage` endpoint, called with your own
+Claude Code OAuth token read at call time from the macOS Keychain (service
+`Claude Code-credentials`, the generic name Claude Code itself writes). That
+endpoint is UNDOCUMENTED and can change shape without warning; the engine fails
+soft to a one-line "plan limits unavailable" notice (burn still reports), and
+the token is never logged or stored. The terminal `/context` per-category table
+remains internal to the terminal app and is not recoverable from outside.
 
 Genericization: same as patch 06 - the upstream fleet's engines carried a
 hardcoded six-bot map and a personal chat id gate; `fleet-context` and
-`fleet-usage` resolve every bot, name, and project directory from `fleet.json`
-and take the chat id as an argument.
+`fleet-usage` resolve every bot, name, and project directory from `fleet.json`,
+take the chat id as an argument, and use the machine's local timezone instead
+of a hardcoded one.
 
 ### 09-command-menu.patch  (feature: real Telegram "/" command menu)
 
@@ -247,7 +254,7 @@ curl -s -X POST "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setMyCommands" \
     {"command":"fable","description":"Switch this chat to Fable (conversation kept)"},
     {"command":"model","description":"Show or switch model + effort (e.g. /model fable high)"},
     {"command":"context","description":"Show context usage - how full this chat is"},
-    {"command":"usage","description":"Fleet token burn - today + last 7 days, per bot"},
+    {"command":"usage","description":"Plan limits left + fleet token burn (today / 7 days)"},
     {"command":"resume","description":"List recent chats across all bots / reopen one"}
   ]}'
 ```

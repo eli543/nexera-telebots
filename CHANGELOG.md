@@ -23,13 +23,18 @@ zero-patch core changed behavior.
   carry arguments, so the two common switches are commands of their own,
   routing into the existing `/model` machinery with the conversation kept.
 - `/context` live context meter (patch 08 + `engine/fleet-context`): used
-  tokens vs the window cap with a bar, read from the session transcript's
-  newest usage record, computed and sent entirely outside the model - works
-  mid-task and costs the session zero context.
-- `/usage` fleet token-burn report (patch 08 + `engine/fleet-usage`): today
-  plus the trailing 7 days across every bot in `fleet.json`, per-bot and
-  per-model split, same outside-the-model pattern. Both reports state their
-  limits honestly (the terminal-only per-category table and plan-limit meters).
+  tokens vs the window cap with a two-tone bar, read from the session
+  transcript's newest usage record, computed and sent entirely outside the
+  model - works mid-task and costs the session zero context.
+- `/usage` plan limits + fleet burn (patch 08 + `engine/fleet-usage`): your
+  real plan limits first - session and weekly percentages with local-time
+  resets, fetched from the same endpoint the terminal `/usage` screen uses,
+  with your own Claude Code OAuth token read from the Keychain at call time
+  (never logged or stored; the undocumented endpoint fails soft to a one-line
+  notice) - then measured token burn for today plus the trailing 7 days across
+  every bot in `fleet.json`, per-bot and per-model split. Both meters use the
+  orange/black emoji bar style, the machine's local timezone, and state their
+  remaining limits honestly (the per-category context table is terminal-only).
 - Real Telegram "/" command menu (patch 09): replaces the stock dead
   `/start` `/help` `/status` entries with the fleet's actual commands (`esc`,
   `fresh`, `opus`, `fable`, `model`, `context`, `usage`, `resume`),

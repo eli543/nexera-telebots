@@ -1,14 +1,23 @@
 #!/bin/bash
-# fleet-usage - report real token burn across the whole fleet, measured from the
-# bots' session transcripts: today and the trailing 7 days, fleet totals plus a
-# per-bot and per-model split. Runs entirely OUTSIDE the model - works mid-task
-# and costs the session zero context. The bot list comes from fleet.json, so a
-# bot added to the config is counted with no script edits.
+# fleet-usage - report the user's PLAN LIMITS (how much is left) plus real token
+# burn across the whole fleet, measured from the bots' session transcripts:
+# today and the trailing 7 days, fleet totals plus a per-bot and per-model
+# split. Runs entirely OUTSIDE the model - works mid-task and costs the session
+# zero context. The bot list comes from fleet.json, so a bot added to the
+# config is counted with no script edits.
 #
-# Honest limitation (stated in the report): Anthropic does not expose the
-# plan-limit meters (the terminal /usage percentages) outside the terminal app.
-# This is the measured burn from the local session records - real, but not the
-# plan-limit view. "Today" uses this machine's local timezone.
+# Plan limits come from the same source the terminal /usage screen uses: the
+# api.anthropic.com/api/oauth/usage endpoint, called with the user's own Claude
+# Code OAuth token, read at call time from the macOS Keychain (service
+# "Claude Code-credentials" - the generic name Claude Code itself writes, so
+# this works for any account with no configuration). The token lives in one
+# shell variable for the duration of the fetch: never logged, never stored,
+# never echoed. FAIL SOFT by design: no token, a non-200, or a parse failure
+# degrades the limits section to a one-line notice and the burn section still
+# reports. NOTE: that endpoint is undocumented and can change shape without
+# warning - if it does, the parser degrades to the notice, never a crash.
+#
+# "Today" and all reset times use this machine's local timezone.
 #
 # Args:
 #   $1  workdir of the CALLING bot (must be known to fleet.json; supplies the
@@ -24,7 +33,7 @@
 
 set -uo pipefail
 
-usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; }
 case "${1:-}" in -h|--help) usage; exit 0 ;; esac
 
 FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
@@ -76,9 +85,24 @@ mkdir -p "$LOG_DIR" 2>/dev/null || true
     exit 3
   fi
 
-  MSG=$(FLEET_BOTS="$FLEET_BOTS" /usr/bin/python3 <<'PY'
+  # Fetch plan limits with the user's own Claude Code OAuth token (Keychain).
+  # The token stays in this variable only - never logged, never echoed, never
+  # written anywhere. Any failure -> empty JSON -> soft-degrade in the report.
+  OAUTH_TOK=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null | /usr/bin/python3 -c "import json,sys; print(json.load(sys.stdin).get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null)
+  LIMITS_JSON=""
+  if [ -n "$OAUTH_TOK" ]; then
+    LIMITS_JSON=$(curl -s -m 15 "https://api.anthropic.com/api/oauth/usage" \
+      -H "Authorization: Bearer $OAUTH_TOK" \
+      -H "anthropic-beta: oauth-2025-04-20" \
+      -H "Content-Type: application/json" 2>/dev/null || true)
+    echo "limits fetch: $([ -n "$LIMITS_JSON" ] && echo "got $(printf %s "$LIMITS_JSON" | wc -c | tr -d ' ') bytes" || echo "EMPTY")"
+  else
+    echo "limits fetch: no OAuth token available"
+  fi
+
+  MSG=$(LIMITS_JSON="$LIMITS_JSON" FLEET_BOTS="$FLEET_BOTS" /usr/bin/python3 <<'PY'
 import json, os, glob, time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 BOTS = []
 for line in os.environ["FLEET_BOTS"].splitlines():
@@ -86,7 +110,7 @@ for line in os.environ["FLEET_BOTS"].splitlines():
         name, proj = line.split("\t", 1)
         BOTS.append((name, proj))
 
-# "Today" in this machine's local timezone.
+# "Today" (and every reset time below) in this machine's local timezone.
 now = datetime.now().astimezone()
 today = now.date()
 week_cutoff_ts = time.time() - 7 * 86400
@@ -145,18 +169,68 @@ def k(n):
     if n >= 1_000:     return f"{n/1_000:.0f}k"
     return str(n)
 
-lines = [f"Fleet usage - {now.strftime('%A, %B %d').replace(' 0', ' ')}", ""]
-lines.append(f"Today: {k(fleet['today_out'])} tokens generated across {fleet['today_turns']} responses ({k(fleet['today_in'])} fresh in)")
+# -- Plan limits (same source as the terminal /usage screen) ------------------
+# Meter style: orange = used, black = left, each limit in its own labeled
+# block. Emoji squares are the only "color" Telegram text has.
+def bar(pct, segs=10):
+    filled = max(0, min(segs, round(pct / 100 * segs)))
+    return "🟧" * filled + "⬛" * (segs - filled)
+
+def fmt_reset(iso):
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+        if dt.date() == today:
+            day = "today"
+        elif dt.date() == today + timedelta(days=1):
+            day = "tomorrow"
+        else:
+            day = dt.strftime("%A")
+        return f"{day} {dt.strftime('%-I:%M%p').lower()} {dt.strftime('%Z')}"
+    except Exception:
+        return "?"
+
+limit_blocks = []
+try:
+    lj = json.loads(os.environ.get("LIMITS_JSON", "") or "{}")
+    meta = {"session": ("⏳", "SESSION (5h)"), "weekly_all": ("🗓", "WEEK - ALL MODELS")}
+    for lim in lj.get("limits", []):
+        pct = lim.get("percent")
+        if pct is None:
+            continue
+        kind = lim.get("kind", "")
+        icon, label = meta.get(kind, (None, None))
+        if label is None:
+            scope = ((lim.get("scope") or {}).get("model") or {}).get("display_name")
+            if not scope:
+                continue
+            icon, label = "✴️", f"WEEK - {scope.upper()}"
+        limit_blocks.append(
+            f"{icon} {label}\n{bar(pct)}\n🟧 {pct}% used   ⬛ {100 - pct}% left · resets {fmt_reset(lim.get('resets_at', ''))}"
+        )
+except Exception:
+    limit_blocks = []
+
+lines = [f"📈 Usage - {now.strftime('%A, %B %-d')}", ""]
+if limit_blocks:
+    lines.append("YOUR PLAN LIMITS")
+    lines.append("")
+    lines.append("\n\n".join(limit_blocks))
+else:
+    lines.append("(Plan limits unavailable right now - couldn't reach Anthropic's usage endpoint. Burn numbers below are still live.)")
+lines.append("")
+lines.append("――――――――――――")
+lines.append("")
+lines.append(f"FLEET BURN TODAY: {k(fleet['today_out'])} tokens across {fleet['today_turns']} responses ({k(fleet['today_in'])} fresh in)")
 if per_bot_today:
     for bot, (o, t) in sorted(per_bot_today.items(), key=lambda x: -x[1][0]):
-        lines.append(f"  - {bot}: {k(o)} out / {t} responses")
+        lines.append(f"  ▪️ {bot}: {k(o)} out / {t} responses")
 lines.append("")
-lines.append(f"Last 7 days: {k(fleet['week_out'])} tokens generated across {fleet['week_turns']} responses ({k(fleet['week_in'])} fresh in)")
+lines.append(f"LAST 7 DAYS: {k(fleet['week_out'])} tokens across {fleet['week_turns']} responses ({k(fleet['week_in'])} fresh in)")
 top = [(m, v) for m, v in sorted(models_week.items(), key=lambda x: -x[1]) if v > 0 and not m.startswith("<")][:3]
 if top:
-    lines.append("By model (7d out): " + ", ".join(f"{m} {k(v)}" for m, v in top))
+    lines.append("  ▪️ by model: " + ", ".join(f"{m} {k(v)}" for m, v in top))
 lines.append("")
-lines.append("(Measured from the bots' session records - subagents included. Anthropic doesn't expose the plan-limit meters outside the terminal; for those, run /usage in the terminal app.)")
+lines.append("(Limits come from your Claude plan - the same numbers as the terminal /usage screen. Burn is measured from the bots' session records, subagents included.)")
 print("\n".join(lines))
 PY
 )

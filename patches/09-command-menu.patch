@@ -24,7 +24,7 @@
 +              { command: 'fable', description: 'Switch this chat to Fable (conversation kept)' },
 +              { command: 'model', description: 'Show or switch model + effort (e.g. /model fable high)' },
 +              { command: 'context', description: 'Show context usage - how full this chat is' },
-+              { command: 'usage', description: 'Fleet token burn - today + last 7 days, per bot' },
++              { command: 'usage', description: 'Plan limits left + fleet token burn (today / 7 days)' },
 +              { command: 'resume', description: 'List recent chats across all bots / reopen one' },
              ],
              { scope: { type: 'all_private_chats' } },

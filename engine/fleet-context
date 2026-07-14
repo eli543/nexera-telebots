@@ -127,9 +127,11 @@ else:
     cap = 1_000_000 if "[1m]" in ms else 200_000
 
 pct = used / cap * 100
-segs = 20
+# Meter style matches /usage: orange = used, black = free, 10 segments.
+# Emoji squares are the only "color" Telegram text has.
+segs = 10
 filled = min(segs, round(pct / 100 * segs))
-bar = "▓" * filled + "░" * (segs - filled)
+bar = "🟧" * filled + "⬛" * (segs - filled)
 
 def k(n):
     if n >= 1_000_000: return f"{n/1_000_000:.2f}M"
@@ -139,13 +141,13 @@ def k(n):
 capstr = "1M" if cap == 1_000_000 else "200k"
 model_short = model or (model_state.replace("MODEL=", "").split("\n")[0] if model_state else "?")
 
-print(f"""{bot} context
+print(f"""📊 {bot} context
 
 {bar}
-{k(used)} / {capstr} tokens ({pct:.0f}% full, {k(cap - used)} free)
+🟧 {pct:.0f}% full ({k(used)} used)   ⬛ {k(cap - used)} free of {capstr}
 
-Model: {model_short}
-Latest turn: {k(cread)} cached + {k(ccre)} newly cached + {k(fresh)} fresh in, {k(out)} out
+▪️ Model: {model_short}
+▪️ Latest turn: {k(cread)} cached + {k(ccre)} newly cached + {k(fresh)} fresh in, {k(out)} out
 
 (Total is live from the session transcript. The per-category table - system prompt vs tools vs skills - only exists inside the terminal UI.)""")
 PY

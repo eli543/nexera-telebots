@@ -4,7 +4,8 @@ The always-on upgrade for Claude Code's official Telegram channel: live progress
 streaming, voice notes transcribed locally, replies that arrive structured
 instead of as walls of text, `/fresh` `/resume` `/model` plus an `/esc`
 interrupt, one-tap `/opus` and `/fable` switches, live `/context` and `/usage`
-meters, a real Telegram "/" command menu, a self-healing watchdog, snapshot and
+meters (your plan limits included), a real Telegram "/" command menu, a
+self-healing watchdog, snapshot and
 restore that survive a Mac reboot, and a fleet of identical bots sharing one
 brain.
 
@@ -159,7 +160,7 @@ which does message round-trip, pairing and allowlist access control, and the
 | `/fresh` `/resume` `/model` from Telegram | No | Yes, including a cross-bot resume picker |
 | Interrupt a busy session from your phone | No | Yes, `/esc` sends a real Escape to the right window |
 | One-tap model switches | No | Yes, `/opus` and `/fable`, conversation kept |
-| Live context and token-burn meters | No | Yes, `/context` and `/usage`, computed outside the model |
+| Live meters: plan limits left, context fill, token burn | No | Yes, `/usage` and `/context`, computed outside the model |
 | A real "/" command menu | Dead `/start` `/help` `/status` boilerplate | The actual command list, re-registered on every poller start |
 | Keeps bots alive with a watchdog | No. "Events only arrive while the session is open" | Yes, launchd plus auto-resume into the same conversation |
 | Survives a reboot with exact conversations | No | Yes, snapshot and restore |
@@ -307,7 +308,7 @@ From your Telegram chat with a bot:
 | `/opus`, `/fable` | One-tap switch to that model class, history intact | Yes (07) |
 | `/esc` | Interrupt the current turn so your newest message is read now | Yes (06) |
 | `/context` | This chat's context-window usage: used vs cap, with a bar | Yes (08) |
-| `/usage` | Fleet-wide token burn: today plus the trailing 7 days, per bot | Yes (08) |
+| `/usage` | Your plan limits left (session and weekly, with reset times) plus fleet-wide token burn: today and the trailing 7 days, per bot | Yes (08) |
 
 Inside a Claude Code session:
 

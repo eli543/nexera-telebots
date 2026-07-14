@@ -72,6 +72,14 @@ selects `full` for you.
 - The optional reply judge's Anthropic API key lives in the macOS Keychain under
   a dedicated service (`claude-telegram-fleet-judge`), isolated so its spend is
   separate from your other keys. It is read at runtime and never stored on disk.
+- The `/usage` plan-limits section (optional patch 08) reads your Claude Code
+  OAuth access token from the Keychain service Claude Code itself maintains
+  (`Claude Code-credentials`) and sends it to exactly one place: Anthropic's
+  own `api.anthropic.com/api/oauth/usage` endpoint, over HTTPS, to read the
+  same limit percentages the terminal `/usage` screen shows. The token is held
+  in a shell variable for the one request, never logged, never stored, never
+  echoed. If the token or the (undocumented) endpoint is unavailable, the
+  report degrades to a one-line notice.
 - The repository ships no tokens and no chat IDs. Its CI runs a secret scan on
   every push. The `.gitignore` excludes `.env` files, state directories, and
   logs.

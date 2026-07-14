@@ -75,6 +75,10 @@ exactly the "alive but silent" case the heartbeat catches.
 - `/esc`, `/opus`, `/fable`, `/context`, and `/usage` are patch-only. Without
   the patches they reach the model as ordinary chat text and you get a
   conversational reply instead of the action.
+- `/usage` says "plan limits unavailable": the Claude Code OAuth token was not
+  readable from the Keychain, or Anthropic's (undocumented) usage endpoint did
+  not answer. That section fails soft on purpose - the burn numbers underneath
+  are still live, and the limits usually return on the next try.
 - `/esc` specifically needs macOS Automation and Accessibility consent (it
   presses a real key). If the interrupt reports it could not land, check
   System Settings -> Privacy & Security -> Accessibility and Automation, and

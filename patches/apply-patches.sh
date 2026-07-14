@@ -31,7 +31,7 @@ CACHE_ROOT="$HOME_DIR/.claude/plugins/cache/claude-plugins-official/telegram"
 # These patches were generated against this exact upstream file.
 EXPECT_VERSION="0.0.6"
 STOCK_SHA="20087f27c81be642cbb0f0254626092330052a5c31b5abde8dec2569889a11e4"
-PATCHED_SHA="3e0f01874185660b0345930110b4baf69ed9fdc8c7688057a9045b289b3ec168"
+PATCHED_SHA="1f677f91bb2e528d7942731b7e9151d9a2119f063a3172b969d0bb9f4c39f0e4"
 PATCHES="01-state-dir-guard 02-attachments 03-liveness 04-fresh-midtask 05-model-midtask 06-esc-midtask 07-model-shortcuts 08-context-usage 09-command-menu"
 
 FORCE=0
