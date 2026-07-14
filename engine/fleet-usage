@@ -205,7 +205,7 @@ try:
                 continue
             icon, label = "✴️", f"WEEK - {scope.upper()}"
         limit_blocks.append(
-            f"{icon} {label}\n{bar(pct)}\n🟧 {pct}% used   ⬛ {100 - pct}% left · resets {fmt_reset(lim.get('resets_at', ''))}"
+            f"{icon} {label}\n{bar(pct)}\n↳ {pct}% used · {100 - pct}% left · resets {fmt_reset(lim.get('resets_at', ''))}"
         )
 except Exception:
     limit_blocks = []

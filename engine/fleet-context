@@ -144,7 +144,7 @@ model_short = model or (model_state.replace("MODEL=", "").split("\n")[0] if mode
 print(f"""📊 {bot} context
 
 {bar}
-🟧 {pct:.0f}% full ({k(used)} used)   ⬛ {k(cap - used)} free of {capstr}
+↳ {pct:.0f}% full · {k(used)} used · {k(cap - used)} free of {capstr}
 
 ▪️ Model: {model_short}
 ▪️ Latest turn: {k(cread)} cached + {k(ccre)} newly cached + {k(fresh)} fresh in, {k(out)} out
