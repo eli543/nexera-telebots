@@ -76,15 +76,17 @@ starting point for an issue.
 
 ## Does a plugin update overwrite the optional patches?
 
-Yes. The mid-task `/fresh` and `/model` interceptors are patches on the official
-plugin's `server.ts`, which sits in a version-pinned cache directory. When the
-plugin updates, Claude Code writes a new cache directory and the patches do not
-carry over. This is expected, and it is why the patches are optional and
-quarantined rather than part of the core.
+Yes. The poller-side interceptors (mid-task `/fresh` and `/model`, plus `/esc`,
+`/opus`, `/fable`, `/context`, `/usage`, and the "/" command menu) are patches
+on the official plugin's `server.ts`, which sits in a version-pinned cache
+directory. When the plugin updates, Claude Code writes a new cache directory and
+the patches do not carry over. This is expected, and it is why the patches are
+optional and quarantined rather than part of the core.
 
 - The idle-path `/fresh`, `/resume`, and `/model` work with no patches at all.
-- To restore mid-task interception after an update, rerun
-  `patches/apply-patches.sh`.
+- To restore the interceptors after an update, rerun
+  `patches/apply-patches.sh`. The command menu re-registers when each patched
+  poller restarts.
 
 ## Do I have to run a fleet?
 

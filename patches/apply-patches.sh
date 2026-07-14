@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# apply-patches.sh - apply the telegram-fleet server.ts patch set (01..05) onto the
+# apply-patches.sh - apply the telegram-fleet server.ts patch set (01..09) onto the
 # installed upstream Telegram plugin, in order, with version + hash verification and
 # a pristine backup. Idempotent-safe: it refuses to run against anything that is not
 # the exact known-stock server.ts unless you pass --force.
@@ -10,7 +10,7 @@
 #      claude-plugins-official/telegram/*/server.ts
 #   2. Verifies the plugin version is 0.0.6 (the version these patches target).
 #   3. Verifies server.ts sha256 == the known stock hash (skipped with --force).
-#   4. Applies 01..05 to a temp copy, each with `patch -p1 --dry-run` then for real.
+#   4. Applies 01..09 to a temp copy, each with `patch -p1 --dry-run` then for real.
 #   5. Backs up the pristine stock to server.ts.stock-backup (once), installs result.
 #
 # These patches modify a LOCAL copy of Anthropic's Apache-2.0 licensed plugin. See
@@ -31,8 +31,8 @@ CACHE_ROOT="$HOME_DIR/.claude/plugins/cache/claude-plugins-official/telegram"
 # These patches were generated against this exact upstream file.
 EXPECT_VERSION="0.0.6"
 STOCK_SHA="20087f27c81be642cbb0f0254626092330052a5c31b5abde8dec2569889a11e4"
-PATCHED_SHA="9d641451b927a635052f59ece69c86d07a0b34776e3cf2240509945289281440"
-PATCHES="01-state-dir-guard 02-attachments 03-liveness 04-fresh-midtask 05-model-midtask"
+PATCHED_SHA="3e0f01874185660b0345930110b4baf69ed9fdc8c7688057a9045b289b3ec168"
+PATCHES="01-state-dir-guard 02-attachments 03-liveness 04-fresh-midtask 05-model-midtask 06-esc-midtask 07-model-shortcuts 08-context-usage 09-command-menu"
 
 FORCE=0
 for a in "$@"; do
@@ -140,5 +140,7 @@ else
 fi
 cp "$WORK/server.ts" "$SERVER"
 say ""
-say "Done. All 5 patches applied to $SERVER"
+say "Done. All 9 patches applied to $SERVER"
 say "Restart your fleet bots (or run /fresh) for the changes to take effect."
+say "The Telegram '/' command menu re-registers when each poller restarts; for"
+say "instant effect see 'Command menu registration' in patches/README.md."

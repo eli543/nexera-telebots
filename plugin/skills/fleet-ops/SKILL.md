@@ -39,8 +39,28 @@ defaults to `~/.claude/telegram-fleet`. State directories are at
 ## Read the logs
 
 - Watchdog: `$FLEET_HOME/logs/watchdog.log` (restarts, health decisions).
+- Command engines: `$FLEET_HOME/logs/fresh.log`, `model.log`, `esc.log`,
+  `context.log`, `usage.log` - one per engine, every request and refusal.
 - To see what the watchdog would do without acting:
   `$FLEET_HOME/bin/watchdog.sh --dry-run`.
+
+## The Telegram "/" command menu
+
+With the optional patches applied, each poller re-registers the real command
+menu (`esc`, `fresh`, `opus`, `fable`, `model`, `context`, `usage`, `resume`)
+every time it starts - the poller-start list in patch 09 is the source of
+truth. If the menu looks stale or boilerplate: confirm the patches are applied
+(`patches/verify-patches.sh`), restart the bot (`/fresh` is enough), and give
+the Telegram client a minute to refresh its cache. For instant effect there is
+a one-off `setMyCommands` curl in `patches/README.md`.
+
+## If /esc reports it could not land
+
+`fleet-esc` presses a real key, so macOS must allow it: grant Automation and
+Accessibility consent when prompted (System Settings -> Privacy & Security).
+A locked screen also blocks window fronting. Every attempt and its outcome is
+in `$FLEET_HOME/logs/esc.log`, and the bot reports a miss honestly in the chat
+rather than letting silence read as success.
 
 ## Park or re-enable a bot
 

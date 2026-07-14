@@ -1,0 +1,248 @@
+#!/bin/bash
+# fleet-esc - interrupt one fleet bot's CURRENT turn by sending a real Escape
+# keystroke to its Terminal window - the same key you would press by hand - so a
+# message queued while the bot was working gets read immediately. Does NOT
+# restart the session and does NOT lose context (unlike fleet-fresh and
+# fleet-model). Sends exactly ONE Esc: two in quick succession would open Claude
+# Code's Esc-Esc rewind menu instead of interrupting.
+#
+# The design constraint that shapes this whole script: macOS delivers keystrokes
+# to the frontmost APPLICATION, not to a window. Fronting the right Terminal
+# window is not enough - if another app holds focus, the Esc silently lands
+# there. So the engine activates Terminal, fronts the tty-matched window, then
+# VERIFIES (frontmost app is Terminal AND the selected tab's tty is the target)
+# immediately before firing key code 53 - all inside ONE atomic osascript. Do
+# not simplify the activate-and-verify away. On any delivery failure it tells
+# the user honestly via the bot's own token, because the poller's ack fires
+# BEFORE delivery and a silent miss would otherwise read as success.
+#
+# Args:
+#   $1  PID of the claude session to interrupt
+#   $2  workdir of the bot (must be a workdir known to fleet.json)
+#   $3  chat_id to send failure feedback to (optional; falls back to the bot's
+#       first allowlisted user, and a missing id only costs the message)
+#
+# Safety, same posture as fleet-fresh:
+#   - refuses unless the workdir is a known fleet bot (exit 2)
+#   - refuses unless the PID is a claude process whose lsof cwd == that workdir,
+#     so a sibling bot's window is never touched (exit 3/4/5/6)
+#   - per-tty 3s debounce (a double-tap cannot become Esc-Esc), plus one global
+#     keystroke lock serializing concurrent /esc across bots - two engines
+#     activating different windows at once could cross-deliver. Both live in
+#     /tmp on purpose: keyboard focus is a machine-global resource
+#   - saves and restores the previously frontmost app, names passed via argv
+#     (never interpolated into AppleScript source)
+#
+# macOS only (osascript / Terminal.app / System Events). Sending a keystroke via
+# System Events needs Automation + Accessibility consent; macOS prompts on first
+# use, and until granted the engine reports the miss instead of pretending.
+# Env: CC_ESC_DRYRUN=1 resolves and prints the intended action, sends nothing.
+# Logs to $FLEET_HOME/logs/esc.log.
+
+set -uo pipefail
+
+usage() { sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'; }
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+
+FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+resolve_bin() {
+  if [ -x "$FLEET_HOME/bin/$1" ]; then printf '%s\n' "$FLEET_HOME/bin/$1"; return; fi
+  if [ -x "$SELF_DIR/$1" ]; then printf '%s\n' "$SELF_DIR/$1"; return; fi
+  printf '%s\n' "$1"
+}
+FC_BIN="$(resolve_bin fleet-config)"
+fc() { "$FC_BIN" "$@"; }
+
+TARGET_PID="${1:-}"
+TARGET_CWD="${2:-}"
+CHAT_ID="${3:-}"
+LOG_DIR="$FLEET_HOME/logs"
+LOG="$LOG_DIR/esc.log"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+
+# first allowlisted chat id from a bot's access.json (the bot's own chat)
+chat_id_of_state() {
+  python3 - "$1" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1] + "/access.json"))
+    a = d.get("allowFrom") or []
+    print(str(a[0]) if a else "")
+except Exception:
+    print("")
+PY
+}
+
+{
+  echo ""
+  echo "=== $(date '+%F %T') esc pid=$TARGET_PID cwd=$TARGET_CWD dryrun=${CC_ESC_DRYRUN:-0} ==="
+
+  if [ -z "$TARGET_PID" ] || [ -z "$TARGET_CWD" ]; then
+    echo "ERROR missing args (need: pid, workdir)"
+    exit 1
+  fi
+
+  # Gate: the workdir must belong to a known fleet bot. The state dir supplies
+  # the bot token for honest failure feedback.
+  BOT_KEY="$(fc bot-by-workdir "$TARGET_CWD" key 2>/dev/null || true)"
+  if [ -z "$BOT_KEY" ]; then
+    echo "REFUSE unknown workdir (not in fleet.json): $TARGET_CWD"
+    exit 2
+  fi
+  STATE_DIR="$(fc bot-by-workdir "$TARGET_CWD" state_dir 2>/dev/null || true)"
+  [ -n "$CHAT_ID" ] || CHAT_ID="$(chat_id_of_state "$STATE_DIR")"
+
+  # Truthful failure feedback: the poller's ack fires BEFORE delivery, so on a
+  # miss we must correct the record in the chat. Best-effort - a missing token
+  # or chat id only costs the message. Token read at runtime, never logged.
+  tg_fail() {
+    local msg="$1" token=""
+    if [ -f "$STATE_DIR/.env" ]; then
+      token="$(grep -E '^TELEGRAM_BOT_TOKEN=' "$STATE_DIR/.env" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]')"
+    fi
+    if [ -n "$token" ] && [ -n "$CHAT_ID" ]; then
+      curl -s -m 8 -o /dev/null -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+        --data-urlencode "chat_id=${CHAT_ID}" \
+        --data-urlencode "text=${msg}" || true
+    fi
+  }
+
+  # Validate the pid is a live claude whose cwd matches the target workdir
+  # (protect sibling bots), and capture its controlling tty for window targeting.
+  if ! kill -0 "$TARGET_PID" 2>/dev/null; then
+    echo "REFUSE target pid $TARGET_PID not running"
+    exit 3
+  fi
+  cmd=$(ps -p "$TARGET_PID" -o comm= 2>/dev/null | tr -d '[:space:]')
+  cwd=$(lsof -a -p "$TARGET_PID" -d cwd 2>/dev/null | awk 'NR>1 {print $NF}')
+  TTY=$(ps -p "$TARGET_PID" -o tty= 2>/dev/null | tr -d '[:space:]')
+  echo "target: pid=$TARGET_PID comm=$cmd cwd=$cwd tty=$TTY"
+  if [[ "$cmd" != *"claude"* ]]; then
+    echo "REFUSE target is not claude (comm=$cmd)"
+    exit 4
+  fi
+  if [ "$cwd" != "$TARGET_CWD" ]; then
+    echo "REFUSE target cwd '$cwd' != expected '$TARGET_CWD' (protecting sibling bot)"
+    exit 5
+  fi
+  if [[ ! "$TTY" =~ ^ttys[0-9]+$ ]]; then
+    echo "REFUSE implausible tty '$TTY'"
+    exit 6
+  fi
+  DEVTTY="/dev/$TTY"
+
+  if [ "${CC_ESC_DRYRUN:-0}" = "1" ]; then
+    echo "DRYRUN would: serialize on global lock, activate Terminal, front+verify window on $DEVTTY, send key code 53 (Esc) once, restore focus"
+    echo "=== dryrun done ==="
+    exit 0
+  fi
+
+  # Per-tty debounce (true 3s window): a rapid double /esc to the SAME bot could
+  # land two Escapes close together and open Claude Code's Esc-Esc rewind menu.
+  STAMP="/tmp/fleet-esc-${TTY}.last"
+  now=$(date +%s)
+  last=$(cat "$STAMP" 2>/dev/null || echo 0)
+  if [ $((now - last)) -lt 3 ]; then
+    echo "DEBOUNCE: /esc for $DEVTTY fired $((now - last))s ago - skipping"
+    exit 0
+  fi
+  echo "$now" > "$STAMP"
+
+  # Global keystroke lock: serialize concurrent /esc across DIFFERENT bots (two
+  # engines activating different windows at once could deliver into the wrong
+  # one). Held only for the ~2s keystroke section; stale takeover after 10s
+  # covers a crashed holder.
+  GLOCK="/tmp/fleet-esc-global.lock"
+  waited=0
+  while ! mkdir "$GLOCK" 2>/dev/null; do
+    lockage=$(( $(date +%s) - $(stat -f %m "$GLOCK" 2>/dev/null || echo 0) ))
+    if [ "$lockage" -ge 10 ]; then
+      echo "stale global lock (${lockage}s) - taking over"
+      rmdir "$GLOCK" 2>/dev/null || true
+      continue
+    fi
+    if [ "$waited" -ge 8 ]; then
+      echo "REFUSE: global lock busy ${waited}s - giving up"
+      tg_fail "Interrupt didn't fire - another interrupt was mid-flight. Send /esc again."
+      exit 7
+    fi
+    sleep 1; waited=$((waited + 1))
+  done
+  trap 'rmdir "$GLOCK" 2>/dev/null || true' EXIT
+
+  # Save the currently-frontmost app so we can hand focus back afterward.
+  FRONT=$(/usr/bin/osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true' 2>/dev/null)
+  echo "frontmost before: $FRONT"
+
+  # Atomic activate + front + VERIFY + keystroke. The verification (frontmost app
+  # is Terminal AND the selected tab of the front window is our target tty) runs
+  # immediately before the key event, so the Esc can only ever land in the right
+  # window. Returns a status token.
+  RESULT=$(/usr/bin/osascript - "$DEVTTY" <<'OSA' 2>/dev/null
+on run argv
+  set targetTty to item 1 of argv
+  set found to false
+  tell application "Terminal"
+    activate
+    repeat with w in windows
+      repeat with tb in tabs of w
+        try
+          if tty of tb is targetTty then
+            set frontmost of w to true
+            set selected tab of w to tb
+            set found to true
+          end if
+        end try
+      end repeat
+    end repeat
+  end tell
+  if not found then return "NOWINDOW"
+  delay 0.35
+  tell application "System Events"
+    set frontApp to name of first application process whose frontmost is true
+  end tell
+  if frontApp is not "Terminal" then return "NOTFRONT:" & frontApp
+  set seltty to ""
+  tell application "Terminal"
+    try
+      set seltty to tty of selected tab of front window
+    end try
+  end tell
+  if seltty is not targetTty then return "WRONGTAB:" & seltty
+  tell application "System Events" to key code 53
+  return "OK"
+end run
+OSA
+)
+  echo "$(date '+%F %T') keystroke result: ${RESULT:-OSAERROR}"
+
+  # Restore focus to whatever was frontmost before (app name via argv - never
+  # interpolated into the AppleScript source).
+  if [ -n "${FRONT:-}" ] && [ "$FRONT" != "Terminal" ]; then
+    /usr/bin/osascript -e 'on run argv' -e 'tell application "System Events" to set frontmost of process (item 1 of argv) to true' -e 'end run' -- "$FRONT" 2>/dev/null || true
+    echo "restored focus to: $FRONT"
+  fi
+
+  case "${RESULT:-OSAERROR}" in
+    OK)
+      echo "=== done (sent Esc to $DEVTTY) ==="
+      exit 0
+      ;;
+    NOWINDOW)
+      tg_fail "The interrupt didn't land - couldn't find this bot's Terminal window. Your message will still be read when the current task finishes."
+      echo "=== done (NOWINDOW) ==="
+      exit 8
+      ;;
+    NOTFRONT:*)
+      tg_fail "The interrupt didn't land - the Mac wouldn't bring the bot's window forward (screen may be locked, or Automation consent is missing). Your message will be read when the current task finishes."
+      echo "=== done (${RESULT}) ==="
+      exit 9
+      ;;
+    *)
+      tg_fail "The interrupt didn't land (window targeting failed). Your message will be read when the current task finishes."
+      echo "=== done (${RESULT:-OSAERROR}) ==="
+      exit 10
+      ;;
+  esac
+} >> "$LOG" 2>&1

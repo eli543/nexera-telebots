@@ -1,0 +1,179 @@
+#!/bin/bash
+# fleet-context - report one fleet bot's CURRENT session context usage into its
+# chat: the phone counterpart of the terminal /context. Reads the live session
+# transcript's newest non-sidechain usage record (input + cache_read +
+# cache_creation = tokens occupying the context window), works out the window
+# cap from the bot's model-state, and sends a formatted report with a visual bar
+# via the bot's own token. Runs entirely OUTSIDE the model - works mid-task and
+# costs the session zero context.
+#
+# Honest limitation (stated in the report): the terminal /context's per-category
+# table (system prompt vs tools vs skills vs messages) is internal to the TUI
+# and not recoverable from outside. This reports the true TOTAL plus the
+# cached/fresh/output composition of the latest turn.
+#
+# Args:
+#   $1  workdir of the bot (must be a workdir known to fleet.json)
+#   $2  chat_id to send the report to
+#
+# Auth posture: the poller's access gate() is the auth layer - only allowlisted
+# senders' /context ever reaches the spawn. Locally this script trusts its args,
+# like every other engine here, and only ever SENDS a report (never acts).
+#
+# Env: CC_CTX_DRYRUN=1 prints the report to the log instead of sending it.
+# Python 3.9+, stdlib only. Logs to $FLEET_HOME/logs/context.log.
+
+set -uo pipefail
+
+usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; }
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+
+FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+resolve_bin() {
+  if [ -x "$FLEET_HOME/bin/$1" ]; then printf '%s\n' "$FLEET_HOME/bin/$1"; return; fi
+  if [ -x "$SELF_DIR/$1" ]; then printf '%s\n' "$SELF_DIR/$1"; return; fi
+  printf '%s\n' "$1"
+}
+FC_BIN="$(resolve_bin fleet-config)"
+fc() { "$FC_BIN" "$@"; }
+
+TARGET_CWD="${1:-}"
+CHAT_ID="${2:-}"
+LOG_DIR="$FLEET_HOME/logs"
+LOG="$LOG_DIR/context.log"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+
+{
+  echo ""
+  echo "=== $(date '+%F %T') context cwd=$TARGET_CWD chat=$CHAT_ID dryrun=${CC_CTX_DRYRUN:-0} ==="
+
+  if [ -z "$TARGET_CWD" ] || [ -z "$CHAT_ID" ]; then
+    echo "ERROR missing args (need: workdir, chat_id)"
+    exit 1
+  fi
+
+  # Gate: the workdir must belong to a known fleet bot.
+  BOT_KEY="$(fc bot-by-workdir "$TARGET_CWD" key 2>/dev/null || true)"
+  if [ -z "$BOT_KEY" ]; then
+    echo "REFUSE unknown workdir (not in fleet.json): $TARGET_CWD"
+    exit 2
+  fi
+  STATE_DIR="$(fc bot-by-workdir "$TARGET_CWD" state_dir 2>/dev/null || true)"
+  PROJ="$(fc project-dir "$BOT_KEY" 2>/dev/null || true)"
+  BOT_NAME="$(fc bot "$BOT_KEY" name 2>/dev/null || true)"
+  [ -n "$BOT_NAME" ] || BOT_NAME="$BOT_KEY"
+
+  # Newest transcript in the project dir = the live session (the same rule
+  # fleet-snapshot relies on).
+  TR=$(ls -t "$PROJ"/*.jsonl 2>/dev/null | head -1)
+  if [ -z "$TR" ]; then
+    echo "ERROR no transcript found in $PROJ"
+    MSG="Couldn't read context - no session transcript found for $BOT_NAME."
+  else
+    echo "transcript: $TR ($(du -h "$TR" | cut -f1 | tr -d ' '))"
+    MODEL_STATE=$(cat "$STATE_DIR/model-state" 2>/dev/null || echo "")
+    MSG=$(TRANSCRIPT="$TR" BOT_NAME="$BOT_NAME" MODEL_STATE="$MODEL_STATE" /usr/bin/python3 <<'PY'
+import json, os, sys
+
+tr = os.environ["TRANSCRIPT"]
+bot = os.environ["BOT_NAME"]
+model_state = os.environ.get("MODEL_STATE", "")
+
+# Read the tail (usage records are frequent; a 5MB tail is plenty even in a
+# heavy session).
+size = os.path.getsize(tr)
+with open(tr, "rb") as f:
+    if size > 5_000_000:
+        f.seek(-5_000_000, 2)
+        f.readline()  # drop the partial first line
+    lines = f.read().decode("utf-8", "replace").splitlines()
+
+usage = None; model = ""; ts = ""
+for line in reversed(lines):
+    try:
+        o = json.loads(line)
+    except Exception:
+        continue
+    if o.get("isSidechain") is True:      # subagent contexts are separate windows - skip
+        continue
+    if o.get("type") != "assistant":
+        continue
+    m = o.get("message") or {}
+    u = m.get("usage") or {}
+    if "input_tokens" in u:
+        usage = u; model = m.get("model", ""); ts = o.get("timestamp", "")
+        break
+
+if usage is None:
+    print(f"Couldn't read context for {bot} - no usage records in the current session yet (fresh chat?).")
+    sys.exit(0)
+
+fresh = usage.get("input_tokens", 0)
+cread = usage.get("cache_read_input_tokens", 0)
+ccre  = usage.get("cache_creation_input_tokens", 0)
+out   = usage.get("output_tokens", 0)
+used = fresh + cread + ccre
+
+# Window cap: 1M for the [1m]-suffixed aliases and the fable class; 200k
+# otherwise (haiku, plain opus/sonnet). Adjust here if the model lineup changes.
+ms = model_state.lower()
+ml = model.lower()
+if "[1m]" in ms or "fable" in ms or "fable" in ml:
+    cap = 1_000_000
+elif "haiku" in ms or "haiku" in ml:
+    cap = 200_000
+else:
+    cap = 1_000_000 if "[1m]" in ms else 200_000
+
+pct = used / cap * 100
+segs = 20
+filled = min(segs, round(pct / 100 * segs))
+bar = "▓" * filled + "░" * (segs - filled)
+
+def k(n):
+    if n >= 1_000_000: return f"{n/1_000_000:.2f}M"
+    if n >= 1_000:     return f"{n/1_000:.1f}k"
+    return str(n)
+
+capstr = "1M" if cap == 1_000_000 else "200k"
+model_short = model or (model_state.replace("MODEL=", "").split("\n")[0] if model_state else "?")
+
+print(f"""{bot} context
+
+{bar}
+{k(used)} / {capstr} tokens ({pct:.0f}% full, {k(cap - used)} free)
+
+Model: {model_short}
+Latest turn: {k(cread)} cached + {k(ccre)} newly cached + {k(fresh)} fresh in, {k(out)} out
+
+(Total is live from the session transcript. The per-category table - system prompt vs tools vs skills - only exists inside the terminal UI.)""")
+PY
+)
+  fi
+
+  echo "--- report ---"
+  echo "$MSG"
+  echo "--------------"
+
+  if [ "${CC_CTX_DRYRUN:-0}" = "1" ]; then
+    echo "=== dryrun done (not sent) ==="
+    exit 0
+  fi
+
+  # Bot token from the state-dir .env (read at runtime, never logged).
+  TOKEN=""
+  if [ -f "$STATE_DIR/.env" ]; then
+    TOKEN="$(grep -E '^TELEGRAM_BOT_TOKEN=' "$STATE_DIR/.env" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]')"
+  fi
+  if [ -z "$TOKEN" ]; then
+    echo "ERROR no bot token for $STATE_DIR"
+    exit 4
+  fi
+  curl -s -m 10 -o /dev/null -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${CHAT_ID}" \
+    --data-urlencode "text=${MSG}" \
+    && echo "sent" || echo "send FAILED"
+
+  echo "=== done ==="
+} >> "$LOG" 2>&1

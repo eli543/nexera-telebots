@@ -250,10 +250,11 @@ fi
 
 # ---- optional patches -------------------------------------------------------
 
-step "Optional server.ts patches (mid-task /fresh and /model)"
+step "Optional server.ts patches (mid-task /fresh + /model, /esc, /opus /fable, /context /usage, command menu)"
 if [ -f "$REPO_DIR/patches/apply-patches.sh" ]; then
   note "These modify your local copy of the official plugin and are wiped by a"
-  note "plugin update. The idle-path commands work without them."
+  note "plugin update. Idle-path /fresh /resume /model work without them; /esc,"
+  note "/opus, /fable, /context, /usage, and the '/' menu exist only with them."
   if confirm "Apply the optional patches now?" N; then
     run bash "$REPO_DIR/patches/apply-patches.sh"
   else

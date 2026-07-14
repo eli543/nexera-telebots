@@ -1,0 +1,108 @@
+--- a/server.ts
++++ b/server.ts
+@@ -1163,7 +1163,82 @@
+       .catch(() => {})
+   }
+ }
++
++
++// The /context command handler: report this session's live context usage (used
++// tokens vs the window cap, with a bar) into the chat. The fleet-context engine
++// reads the newest usage record in this bot's session transcript and sends the
++// report itself with the bot's own token, entirely OUTSIDE the model - so it
++// works mid-task and costs the session zero context. This only resolves the
++// workdir, spawns detached, and logs.
++const CONTEXT_SCRIPT = join(FLEET_HOME, 'bin', 'fleet-context')
++const CONTEXT_LOG = join(STATE_DIR, 'logs', 'context.log')
++
++async function handleContext(chat_id: string): Promise<void> {
++  const cwd = resolveWorkdir()
++  freshLog(`SERVER-CONTEXT state=${STATE_DIR} cwd=${cwd ?? '?'} chat=${chat_id}`)
+ 
++  if (!cwd) {
++    await bot.api
++      .sendMessage(
++        chat_id,
++        'Fleet config missing or this bot is not listed in it - could not read context. Check from the terminal.',
++      )
++      .catch(() => {})
++    return
++  }
++
++  try {
++    Bun.spawn(
++      ['/bin/sh', '-c', `nohup ${shq(CONTEXT_SCRIPT)} ${shq(cwd)} ${shq(chat_id)} </dev/null >>${shq(CONTEXT_LOG)} 2>&1 & disown`],
++      { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' },
++    ).unref()
++    freshLog(`SERVER-CONTEXT spawned engine cwd-arg=${cwd}`)
++  } catch (err) {
++    process.stderr.write(`telegram channel: /context engine spawn failed: ${err}\n`)
++    freshLog(`SERVER-CONTEXT spawn FAILED: ${err}`)
++    await bot.api
++      .sendMessage(chat_id, 'Context report failed to launch - check from the terminal.')
++      .catch(() => {})
++  }
++}
++
++// The /usage command handler: fleet-wide token burn measured from every bot's
++// session transcripts (today plus the trailing 7 days, per bot, with a model
++// split). Same outside-the-model pattern as /context: the fleet-usage engine
++// computes the numbers and sends the report itself.
++const USAGE_SCRIPT = join(FLEET_HOME, 'bin', 'fleet-usage')
++const USAGE_LOG = join(STATE_DIR, 'logs', 'usage.log')
++
++async function handleUsage(chat_id: string): Promise<void> {
++  const cwd = resolveWorkdir()
++  freshLog(`SERVER-USAGE state=${STATE_DIR} cwd=${cwd ?? '?'} chat=${chat_id}`)
++
++  if (!cwd) {
++    await bot.api
++      .sendMessage(
++        chat_id,
++        'Fleet config missing or this bot is not listed in it - could not read usage. Check from the terminal.',
++      )
++      .catch(() => {})
++    return
++  }
++
++  try {
++    Bun.spawn(
++      ['/bin/sh', '-c', `nohup ${shq(USAGE_SCRIPT)} ${shq(cwd)} ${shq(chat_id)} </dev/null >>${shq(USAGE_LOG)} 2>&1 & disown`],
++      { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' },
++    ).unref()
++    freshLog(`SERVER-USAGE spawned engine cwd-arg=${cwd}`)
++  } catch (err) {
++    process.stderr.write(`telegram channel: /usage engine spawn failed: ${err}\n`)
++    freshLog(`SERVER-USAGE spawn FAILED: ${err}`)
++    await bot.api
++      .sendMessage(chat_id, 'Usage report failed to launch - check from the terminal.')
++      .catch(() => {})
++  }
++}
++
+ async function handleInbound(
+   ctx: Context,
+   text: string,
+@@ -1228,6 +1303,22 @@
+     }
+   }
+ 
++  // /context and /usage: live reports computed and sent entirely outside the
++  // model, so they work mid-task and cost the session nothing. /context is this
++  // bot's context-window fill; /usage is fleet-wide token burn. DM-only; already
++  // gate()-approved above. Never forwarded to the model as chat.
++  {
++    const report = text.trim().toLowerCase()
++    if (ctx.chat?.type === 'private' && report === '/context') {
++      void handleContext(chat_id)
++      return
++    }
++    if (ctx.chat?.type === 'private' && report === '/usage') {
++      void handleUsage(chat_id)
++      return
++    }
++  }
++
+   // /esc intercept: interrupt this session's current turn even mid-task, so a
+   // message queued while the bot was working gets read now. The mid-task case is
+   // the entire point here - an idle-path hook could never interrupt a running

@@ -1,0 +1,78 @@
+--- a/server.ts
++++ b/server.ts
+@@ -1114,7 +1114,56 @@
+       .catch(() => {})
+   }
+ }
++
++
++// The /esc command handler: interrupt this session's CURRENT turn by sending a
++// real Escape keystroke to its terminal window - the exact key you would press
++// by hand - so a message queued while the bot was working gets read immediately.
++// Unlike /fresh and /model this does NOT restart the session and does NOT lose
++// any context. The fleet-esc engine owns delivery, and it is deliberately
++// paranoid because macOS delivers keystrokes to the frontmost APPLICATION, not
++// to a window: it re-validates the pid and workdir, activates the terminal app,
++// fronts the tty-matched window, VERIFIES focus actually landed there, fires
++// exactly ONE Escape (two would open Claude Code's Esc-Esc rewind menu instead),
++// restores focus, and on any miss corrects the record in the chat - the ack
++// below is sent before delivery, so a silent miss would otherwise read as
++// success. Do not simplify the activate-and-verify away.
++const ESC_SCRIPT = join(FLEET_HOME, 'bin', 'fleet-esc')
++const ESC_LOG = join(STATE_DIR, 'logs', 'esc.log')
+ 
++async function handleEsc(chat_id: string): Promise<void> {
++  const cwd = resolveWorkdir()
++  const claudePid = findOwningClaudePid()
++  freshLog(`SERVER-ESC state=${STATE_DIR} cwd=${cwd ?? '?'} claudePid=${claudePid ?? '?'} chat=${chat_id}`)
++
++  if (!cwd || !claudePid) {
++    await bot.api
++      .sendMessage(
++        chat_id,
++        cwd
++          ? 'Could not find this session to interrupt - press Esc in the terminal.'
++          : 'Fleet config missing or this bot is not listed in it - could not interrupt automatically. Press Esc in the terminal.',
++      )
++      .catch(() => {})
++    return
++  }
++
++  await bot.api.sendMessage(chat_id, 'Escape sent - jumping to your latest message.').catch(() => {})
++  try {
++    Bun.spawn(
++      ['/bin/sh', '-c', `nohup ${shq(ESC_SCRIPT)} ${claudePid} ${shq(cwd)} ${shq(chat_id)} </dev/null >>${shq(ESC_LOG)} 2>&1 & disown`],
++      { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' },
++    ).unref()
++    freshLog(`SERVER-ESC spawned engine pid-arg=${claudePid} cwd-arg=${cwd}`)
++  } catch (err) {
++    process.stderr.write(`telegram channel: /esc engine spawn failed: ${err}\n`)
++    freshLog(`SERVER-ESC spawn FAILED: ${err}`)
++    await bot.api
++      .sendMessage(chat_id, 'Interrupt failed to launch - press Esc in the terminal.')
++      .catch(() => {})
++  }
++}
++
+ async function handleInbound(
+   ctx: Context,
+   text: string,
+@@ -1165,6 +1214,18 @@
+     }
+   }
+ 
++  // /esc intercept: interrupt this session's current turn even mid-task, so a
++  // message queued while the bot was working gets read now. The mid-task case is
++  // the entire point here - an idle-path hook could never interrupt a running
++  // turn - and the server sees the message before Claude Code's idle-vs-busy
++  // split. Case-insensitive (phones auto-capitalize). DM-only; already
++  // gate()-approved above. We return without forwarding so /esc never reaches
++  // the model as chat.
++  if (ctx.chat?.type === 'private' && text.trim().toLowerCase() === '/esc') {
++    void handleEsc(chat_id)
++    return
++  }
++
+   // Permission-reply intercept: if this looks like "yes xxxxx" for a
+   // pending permission request, emit the structured event instead of
+   // relaying as chat. The sender is already gate()-approved at this point

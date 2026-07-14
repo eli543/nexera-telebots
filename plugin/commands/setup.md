@@ -63,7 +63,9 @@ Offer each, one at a time, and act only on a yes:
 
 - Watchdog daemon: run `/telegram-fleet:install-daemon` (show the exact
   launchctl commands first).
-- Optional patches for mid-task `/fresh` and `/model`: `bash patches/apply-patches.sh`.
+- Optional patches for mid-task `/fresh` and `/model`, plus `/esc`, `/opus`,
+  `/fable`, `/context`, `/usage`, and the Telegram "/" command menu:
+  `bash patches/apply-patches.sh`.
   Tell the user a plugin update wipes them and the idle-path commands work
   without them.
 - Voice: on Apple Silicon, `uv tool install mlx-whisper` and `brew install ffmpeg`.

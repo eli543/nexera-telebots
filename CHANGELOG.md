@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims
 to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-07-14
+
+The phone-control release: interrupt a busy bot, switch models in one tap, read
+live meters, and get a real "/" menu. All four features ship as optional
+`server.ts` patches (06-09) plus three new config-driven engines; nothing in the
+zero-patch core changed behavior.
+
+### Added
+
+- `/esc` interrupt (patch 06 + `engine/fleet-esc`): press a real, verified
+  Escape in the requesting bot's Terminal window so the current turn stops and
+  a queued message is read immediately. No restart, no context loss. Atomic
+  activate-front-verify before the single keystroke (macOS delivers keys to the
+  frontmost application), per-tty debounce, a global keystroke lock, focus
+  restore, and honest in-chat failure reporting.
+- `/opus` and `/fable` one-tap model shortcuts (patch 07): menu taps cannot
+  carry arguments, so the two common switches are commands of their own,
+  routing into the existing `/model` machinery with the conversation kept.
+- `/context` live context meter (patch 08 + `engine/fleet-context`): used
+  tokens vs the window cap with a bar, read from the session transcript's
+  newest usage record, computed and sent entirely outside the model - works
+  mid-task and costs the session zero context.
+- `/usage` fleet token-burn report (patch 08 + `engine/fleet-usage`): today
+  plus the trailing 7 days across every bot in `fleet.json`, per-bot and
+  per-model split, same outside-the-model pattern. Both reports state their
+  limits honestly (the terminal-only per-category table and plan-limit meters).
+- Real Telegram "/" command menu (patch 09): replaces the stock dead
+  `/start` `/help` `/status` entries with the fleet's actual commands (`esc`,
+  `fresh`, `opus`, `fable`, `model`, `context`, `usage`, `resume`),
+  re-registered on every poller start, plus a documented one-off curl for
+  instant effect.
+
+### Changed
+
+- README restructured: a complete Setup section now sits at the top - the
+  one-bot-one-session-one-window design rationale, bot creation and pairing,
+  the restart family, and the command menu.
+- Patch tooling now applies and verifies all nine patches with an updated
+  fully-patched reference hash; `verify-patches.sh` reports the four new
+  patches individually.
+- SECURITY.md documents exactly what `/esc` can and cannot press and the macOS
+  Automation/Accessibility consent it sits behind. TROUBLESHOOTING, FAQ,
+  ARCHITECTURE, and the fleet-ops skill cover the new commands.
+
 ## [0.1.0] - 2026-07-12
 
 First public release. Built on Anthropic's official Telegram channel plugin
@@ -37,4 +81,5 @@ path.
 - Offline test harnesses for the hooks and a CI workflow (shellcheck, bash -n,
   py_compile, and a secret scan).
 
+[0.2.0]: https://github.com/eli543/claude-telegram-fleet/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/eli543/claude-telegram-fleet/releases/tag/v0.1.0

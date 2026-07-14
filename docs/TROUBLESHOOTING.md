@@ -64,22 +64,33 @@ exactly the "alive but silent" case the heartbeat catches.
 - To see what the watchdog would do without it acting, run
   `~/.claude/telegram-fleet/bin/watchdog.sh --dry-run`.
 
-## /fresh, /model, or /resume typed in Telegram did nothing
+## /fresh, /model, /resume, or another command typed in Telegram did nothing
 
 - `/resume` is idle-only. Typed while the bot is mid-task, it folds into the
-  running turn and does nothing. Wait for the bot to finish, then resend.
+  running turn and does nothing. Wait for the bot to finish, then resend (or
+  `/esc` first, with the patches applied).
 - `/fresh` and `/model` work mid-task only if the optional patches are applied.
   Without them, both still work when the bot is idle. See
   [../patches/README.md](../patches/README.md).
+- `/esc`, `/opus`, `/fable`, `/context`, and `/usage` are patch-only. Without
+  the patches they reach the model as ordinary chat text and you get a
+  conversational reply instead of the action.
+- `/esc` specifically needs macOS Automation and Accessibility consent (it
+  presses a real key). If the interrupt reports it could not land, check
+  System Settings -> Privacy & Security -> Accessibility and Automation, and
+  whether the screen was locked. The engine's log is
+  `~/.claude/telegram-fleet/logs/esc.log`.
 - Check the command spelling. `/model` takes a class (`opus`, `sonnet`, `fable`,
   `haiku`) and an optional effort (`low`, `medium`, `high`, `xhigh`, `max`). An
   unknown token is rejected and nothing changes.
 
 ## After a Claude Code or plugin update, the optional patches are gone
 
-Expected. The mid-task `/fresh` and `/model` interceptors are patches on the
-official plugin's `server.ts`, which lives in a version-pinned cache directory. A
-plugin update writes a new cache directory and your patches do not carry over.
+Expected. The poller-side interceptors (mid-task `/fresh` and `/model`, plus
+`/esc`, `/opus`, `/fable`, `/context`, `/usage`, and the "/" command menu) are
+patches on the official plugin's `server.ts`, which lives in a version-pinned
+cache directory. A plugin update writes a new cache directory and your patches
+do not carry over.
 
 - The idle-path commands keep working with no patches, so the core is unaffected.
 - To restore mid-task interception, rerun `patches/apply-patches.sh`. It checks

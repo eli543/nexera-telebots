@@ -13,7 +13,7 @@ set -euo pipefail
 HOME_DIR="${HOME:?HOME must be set}"
 CACHE_ROOT="$HOME_DIR/.claude/plugins/cache/claude-plugins-official/telegram"
 STOCK_SHA="20087f27c81be642cbb0f0254626092330052a5c31b5abde8dec2569889a11e4"
-PATCHED_SHA="9d641451b927a635052f59ece69c86d07a0b34776e3cf2240509945289281440"
+PATCHED_SHA="3e0f01874185660b0345930110b4baf69ed9fdc8c7688057a9045b289b3ec168"
 
 case "${1:-}" in
   -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -41,7 +41,7 @@ echo "server.ts: $SERVER"
 CUR_SHA="$(sha256_of "$SERVER")"
 echo "sha256:    $CUR_SHA"
 if   [ "$CUR_SHA" = "$STOCK_SHA" ];   then echo "           == pristine stock (no patches applied)"
-elif [ "$CUR_SHA" = "$PATCHED_SHA" ]; then echo "           == fully patched (all 5, genericized)"
+elif [ "$CUR_SHA" = "$PATCHED_SHA" ]; then echo "           == fully patched (all 9, genericized)"
 else echo "           (custom / partially patched / different version)"; fi
 echo ""
 
@@ -54,5 +54,9 @@ check "02 attachments       (voice notes marker)" "[telegram-fleet] Voice notes 
 check "03 liveness          (watchdog heartbeat)" "--- watchdog liveness signals"
 check "04 fresh-midtask     (/fresh + fleet.json)" "async function handleFresh("
 check "05 model-midtask     (/model)"             "async function handleModel("
+check "06 esc-midtask       (/esc interrupt)"     "async function handleEsc("
+check "07 model-shortcuts   (/opus /fable)"       "one-tap model shortcuts"
+check "08 context-usage     (/context /usage)"    "async function handleContext("
+check "09 command-menu      (Telegram / menu)"    "command: 'esc'"
 echo ""
 echo "[x] present  [ ] absent. Run ./apply-patches.sh to (re)apply, ./restore-stock.sh to reset."

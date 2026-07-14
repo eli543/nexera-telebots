@@ -1,0 +1,188 @@
+#!/bin/bash
+# fleet-usage - report real token burn across the whole fleet, measured from the
+# bots' session transcripts: today and the trailing 7 days, fleet totals plus a
+# per-bot and per-model split. Runs entirely OUTSIDE the model - works mid-task
+# and costs the session zero context. The bot list comes from fleet.json, so a
+# bot added to the config is counted with no script edits.
+#
+# Honest limitation (stated in the report): Anthropic does not expose the
+# plan-limit meters (the terminal /usage percentages) outside the terminal app.
+# This is the measured burn from the local session records - real, but not the
+# plan-limit view. "Today" uses this machine's local timezone.
+#
+# Args:
+#   $1  workdir of the CALLING bot (must be known to fleet.json; supplies the
+#       token the report is sent with)
+#   $2  chat_id to send the report to
+#
+# Auth posture: the poller's access gate() is the auth layer - only allowlisted
+# senders' /usage ever reaches the spawn. Locally this script trusts its args,
+# like every other engine here, and only ever SENDS a report (never acts).
+#
+# Env: CC_USAGE_DRYRUN=1 prints the report to the log instead of sending it.
+# Python 3.9+, stdlib only. Logs to $FLEET_HOME/logs/usage.log.
+
+set -uo pipefail
+
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; }
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+
+FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+resolve_bin() {
+  if [ -x "$FLEET_HOME/bin/$1" ]; then printf '%s\n' "$FLEET_HOME/bin/$1"; return; fi
+  if [ -x "$SELF_DIR/$1" ]; then printf '%s\n' "$SELF_DIR/$1"; return; fi
+  printf '%s\n' "$1"
+}
+FC_BIN="$(resolve_bin fleet-config)"
+fc() { "$FC_BIN" "$@"; }
+
+TARGET_CWD="${1:-}"
+CHAT_ID="${2:-}"
+LOG_DIR="$FLEET_HOME/logs"
+LOG="$LOG_DIR/usage.log"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+
+{
+  echo ""
+  echo "=== $(date '+%F %T') usage cwd=$TARGET_CWD chat=$CHAT_ID dryrun=${CC_USAGE_DRYRUN:-0} ==="
+
+  if [ -z "$TARGET_CWD" ] || [ -z "$CHAT_ID" ]; then
+    echo "ERROR missing args (need: workdir, chat_id)"
+    exit 1
+  fi
+
+  # Gate: the calling workdir must belong to a known fleet bot.
+  BOT_KEY="$(fc bot-by-workdir "$TARGET_CWD" key 2>/dev/null || true)"
+  if [ -z "$BOT_KEY" ]; then
+    echo "REFUSE unknown workdir (not in fleet.json): $TARGET_CWD"
+    exit 2
+  fi
+  STATE_DIR="$(fc bot-by-workdir "$TARGET_CWD" state_dir 2>/dev/null || true)"
+
+  # Build the bot list (name<TAB>project-dir per line) from fleet.json.
+  FLEET_BOTS=""
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    name="$(fc bot "$key" name 2>/dev/null || true)"
+    [ -n "$name" ] || name="$key"
+    proj="$(fc project-dir "$key" 2>/dev/null || true)"
+    [ -n "$proj" ] || continue
+    FLEET_BOTS="${FLEET_BOTS}${name}	${proj}
+"
+  done < <(fc bots 2>/dev/null)
+  if [ -z "$FLEET_BOTS" ]; then
+    echo "ERROR no bots resolved from fleet.json"
+    exit 3
+  fi
+
+  MSG=$(FLEET_BOTS="$FLEET_BOTS" /usr/bin/python3 <<'PY'
+import json, os, glob, time
+from datetime import datetime
+
+BOTS = []
+for line in os.environ["FLEET_BOTS"].splitlines():
+    if "\t" in line:
+        name, proj = line.split("\t", 1)
+        BOTS.append((name, proj))
+
+# "Today" in this machine's local timezone.
+now = datetime.now().astimezone()
+today = now.date()
+week_cutoff_ts = time.time() - 7 * 86400
+
+per_bot_today = {}
+fleet = {"today_out": 0, "today_in": 0, "week_out": 0, "week_in": 0, "today_turns": 0, "week_turns": 0}
+models_week = {}
+
+for bot, proj in BOTS:
+    t_out = t_turns = 0
+    for f in glob.glob(os.path.join(proj, "*.jsonl")):
+        try:
+            if os.path.getmtime(f) < week_cutoff_ts:
+                continue
+            with open(f, "rb") as fh:
+                for raw in fh:
+                    if b'"usage"' not in raw or b'"assistant"' not in raw:
+                        continue
+                    try:
+                        o = json.loads(raw)
+                    except Exception:
+                        continue
+                    if o.get("type") != "assistant":
+                        continue
+                    m = o.get("message") or {}
+                    u = m.get("usage") or {}
+                    if "output_tokens" not in u:
+                        continue
+                    ts = o.get("timestamp", "")
+                    try:
+                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+                    except Exception:
+                        continue
+                    if dt.timestamp() < week_cutoff_ts:
+                        continue
+                    out = u.get("output_tokens", 0)
+                    fresh = u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
+                    fleet["week_out"] += out
+                    fleet["week_in"] += fresh
+                    fleet["week_turns"] += 1
+                    mdl = (m.get("model") or "?").replace("claude-", "")
+                    models_week[mdl] = models_week.get(mdl, 0) + out
+                    if dt.date() == today:
+                        fleet["today_out"] += out
+                        fleet["today_in"] += fresh
+                        fleet["today_turns"] += 1
+                        t_out += out
+                        t_turns += 1
+        except Exception:
+            continue
+    if t_out or t_turns:
+        per_bot_today[bot] = (t_out, t_turns)
+
+def k(n):
+    if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:     return f"{n/1_000:.0f}k"
+    return str(n)
+
+lines = [f"Fleet usage - {now.strftime('%A, %B %d').replace(' 0', ' ')}", ""]
+lines.append(f"Today: {k(fleet['today_out'])} tokens generated across {fleet['today_turns']} responses ({k(fleet['today_in'])} fresh in)")
+if per_bot_today:
+    for bot, (o, t) in sorted(per_bot_today.items(), key=lambda x: -x[1][0]):
+        lines.append(f"  - {bot}: {k(o)} out / {t} responses")
+lines.append("")
+lines.append(f"Last 7 days: {k(fleet['week_out'])} tokens generated across {fleet['week_turns']} responses ({k(fleet['week_in'])} fresh in)")
+top = [(m, v) for m, v in sorted(models_week.items(), key=lambda x: -x[1]) if v > 0 and not m.startswith("<")][:3]
+if top:
+    lines.append("By model (7d out): " + ", ".join(f"{m} {k(v)}" for m, v in top))
+lines.append("")
+lines.append("(Measured from the bots' session records - subagents included. Anthropic doesn't expose the plan-limit meters outside the terminal; for those, run /usage in the terminal app.)")
+print("\n".join(lines))
+PY
+)
+
+  echo "--- report ---"
+  echo "$MSG"
+  echo "--------------"
+
+  if [ "${CC_USAGE_DRYRUN:-0}" = "1" ]; then
+    echo "=== dryrun done (not sent) ==="
+    exit 0
+  fi
+
+  # Calling bot's token from its state-dir .env (read at runtime, never logged).
+  TOKEN=""
+  if [ -f "$STATE_DIR/.env" ]; then
+    TOKEN="$(grep -E '^TELEGRAM_BOT_TOKEN=' "$STATE_DIR/.env" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]')"
+  fi
+  if [ -z "$TOKEN" ]; then
+    echo "ERROR no bot token for $STATE_DIR"
+    exit 4
+  fi
+  curl -s -m 10 -o /dev/null -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${CHAT_ID}" \
+    --data-urlencode "text=${MSG}" \
+    && echo "sent" || echo "send FAILED"
+
+  echo "=== done ==="
+} >> "$LOG" 2>&1

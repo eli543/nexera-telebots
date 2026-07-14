@@ -99,7 +99,29 @@ a fast model to check a long reply's structure.
 If "this repo sends my messages somewhere" is a concern, leave the judge off. The
 feature degrades to the local checks with no loss of delivery.
 
-## 5. Watchdog safety
+## 5. The /esc keystroke, scoped
+
+With the optional patches, `/esc` interrupts a busy session by pressing a real
+Escape key in that bot's Terminal window. Synthetic keystrokes are a sharp tool,
+so the engine is deliberately narrow about the one it sends:
+
+- It fires exactly one Escape (`key code 53`), and nothing else, ever. There is
+  no general type-into-the-terminal capability anywhere in this repo.
+- macOS delivers keystrokes to the frontmost application, so the engine
+  activates Terminal, fronts the window whose tty belongs to the requesting
+  bot's session, and verifies both facts immediately before the key event, in
+  one atomic osascript. If the verification fails, no key is sent and the bot
+  says so in the chat.
+- A per-tty debounce and a global keystroke lock mean two `/esc` commands can
+  never race into the wrong window or double-fire into the Esc-Esc rewind menu.
+- The target is validated the same way `fleet-fresh` validates a kill: the pid
+  must be a `claude` process whose working directory matches a bot in
+  `fleet.json`.
+- macOS gates the whole mechanism behind Automation and Accessibility consent
+  for the process running the poller; you will be prompted on first use, and
+  nothing is sent until you grant it.
+
+## 6. Watchdog safety
 
 A keepalive that kills or spawns the wrong process is a serious bug class, so the
 watchdog is deliberately narrow.
@@ -113,7 +135,7 @@ watchdog is deliberately narrow.
 - Per-bot kill switches let you park a single bot without stopping the rest.
 - `watchdog.sh --dry-run` reports what it would do without touching a process.
 
-## 6. Where state and private data live
+## 7. Where state and private data live
 
 Nothing here is a hidden copy; it is documented so you can find and remove it.
 

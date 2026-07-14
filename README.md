@@ -2,9 +2,11 @@
 
 The always-on upgrade for Claude Code's official Telegram channel: live progress
 streaming, voice notes transcribed locally, replies that arrive structured
-instead of as walls of text, `/fresh` `/resume` `/model` from your phone, a
-self-healing watchdog, snapshot and restore that survive a Mac reboot, and a
-fleet of identical bots sharing one brain.
+instead of as walls of text, `/fresh` `/resume` `/model` plus an `/esc`
+interrupt, one-tap `/opus` and `/fable` switches, live `/context` and `/usage`
+meters, a real Telegram "/" command menu, a self-healing watchdog, snapshot and
+restore that survive a Mac reboot, and a fleet of identical bots sharing one
+brain.
 
 ![platform: macOS](https://img.shields.io/badge/platform-macOS-black)
 ![license: MIT](https://img.shields.io/badge/license-MIT-black)
@@ -19,6 +21,125 @@ design, and the access-control story is the part you should understand before
 you install anything.
 
 <!-- HERO GIF: send a Telegram message; an emoji reaction lands instantly; the live "Working" box appears with a sliding bar, a climbing timer, and steps checking off one by one; it folds in place into a "What I did - tap to expand" recap; the numbered answer with its TLDR lands underneath. Record at 1280x720. Rotate tokens before recording any terminal. -->
+
+## Setup
+
+Everything from zero to a bot that answers, in order. Deeper detail lives in the
+linked docs; this section alone is enough to stand a bot up.
+
+### The shape of the thing, first
+
+One design idea explains every moving part here: each bot is an individual
+Telegram bot - its own BotFather identity, its own token, its own allowlist -
+driving its own Claude Code session in its own Terminal window, in its own
+working directory. That is deliberate, not an accident of implementation:
+
+- One window per bot means one PID and one tty per bot, so the watchdog can
+  kill and relaunch a wedged bot by exact PID, `/esc` can press Escape in
+  exactly the right window, and no restart can ever take a sibling down.
+- One Telegram bot per session means Telegram's one-poller-per-token rule maps
+  cleanly onto one poller process per bot, instead of a router process
+  multiplexing chats (the failure mode of most multi-bot designs).
+- One working directory per bot gives each session its own transcript history,
+  which is what makes `/resume`, snapshot/restore, and the cross-bot picker
+  possible.
+
+The bots stay identical on purpose - same hooks, same commands, same knowledge
+base - so a fleet is N interchangeable phone lines into one operation, not N
+different personalities. Full topology: [docs/FLEET.md](docs/FLEET.md).
+
+### 1. Install
+
+Three lines inside a Claude Code session:
+
+```
+/plugin marketplace add eli543/claude-telegram-fleet
+/plugin install telegram-fleet@claude-telegram-fleet
+/telegram-fleet:setup
+```
+
+`/telegram-fleet:setup` walks you through the rest: preflight checks, one or
+more bots, tokens (written to a per-bot `.env` with `chmod 600`, never echoed),
+your permission stance, voice, the watchdog, and the pairing walkthrough.
+
+Prefer a bare shell, or not yet in a session? The same underlying steps run
+from the installer:
+
+```
+git clone https://github.com/eli543/claude-telegram-fleet
+cd claude-telegram-fleet
+./install.sh
+```
+
+Both paths install the engine scripts to `~/.claude/telegram-fleet/bin/` and
+write a starter `fleet.json` (the one config file) if you do not have one.
+Requirements are firm and listed [below](#requirements): macOS, Bun, Claude
+Code 2.1.80+ with channels.
+
+### 2. Create a bot and pair it
+
+Once per bot:
+
+1. In Telegram, message [@BotFather](https://t.me/BotFather), send `/newbot`,
+   and copy the token it gives you.
+2. Give the bot a home. Each bot needs a `fleet.json` entry (a `name`, a short
+   `key`, a `workdir` directory the session runs in, and a `state_dir` of
+   `~/.claude/channels/fleet-<key>`) plus its token:
+   ```
+   mkdir -p ~/.claude/channels/fleet-main
+   printf 'TELEGRAM_BOT_TOKEN=%s\n' "<token>" > ~/.claude/channels/fleet-main/.env
+   chmod 600 ~/.claude/channels/fleet-main/.env
+   ```
+   `/telegram-fleet:setup` does this for you, including the `fleet.json` entry.
+3. Launch it: `~/.claude/telegram-fleet/bin/fleet-launch main`. A Terminal
+   window opens running that bot's Claude Code session.
+4. Pair: DM your new bot; it replies with a six-character code; run
+   `/telegram:access pair <code>` in the terminal. Then lock the door:
+   `/telegram:access policy allowlist`.
+
+Send the bot a message. You should get an instant emoji reaction, a live
+"Working" box, and a structured reply. To add a second bot later, repeat this
+section with a new key - one BotFather bot, one `fleet.json` entry, one state
+dir, one launch. [docs/FLEET.md](docs/FLEET.md) covers the shared-brain pattern.
+
+### 3. Know the restart family
+
+Six ways a session starts, stops, or switches, all from your phone, all safe to
+mix. The first three restart the session process; `/esc` does not.
+
+| You send | What happens | Context |
+|---|---|---|
+| `/fresh` | Kill this bot's session, relaunch blank on your default model | Wiped, on purpose |
+| `/model opus` (or `sonnet`, `fable`, `haiku`, plus optional effort) | Restart on the new model, resumed into this same conversation | Kept |
+| `/opus`, `/fable` | One-tap shortcuts for the two switches above - a menu tap cannot carry arguments, so they exist as commands | Kept |
+| `/esc` | Press Escape in this bot's Terminal window, interrupting the current turn so your queued message is read NOW | Kept - nothing restarts |
+| `/resume` | Numbered picker of recent sessions across every bot; `/resume 3` reopens session 3 here | Kept - reopened |
+| (nothing - a bot dies) | The launchd watchdog notices within ~60s and relaunches it resumed into the same conversation | Kept |
+
+Rebooting the Mac: `/telegram-fleet:snapshot` before, `/telegram-fleet:restore`
+after login, and every bot comes back in its exact prior conversation. The
+watchdog also parks itself during a snapshot so it cannot fight the restore.
+
+Honest wiring note: `/fresh`, `/resume`, and `/model` work out of the box via
+idle-path hooks, and gain mid-task handling with the optional patches. `/esc`,
+`/opus`, `/fable`, `/context`, and `/usage` are patch-only - `/esc` exists to
+interrupt a BUSY session, which an idle-path hook can never do. Apply the
+patches with `bash patches/apply-patches.sh` (verified, reversible, wiped by
+plugin updates and safe to re-apply; see [patches/README.md](patches/README.md)).
+
+### 4. Register the "/" command menu
+
+The Telegram "/" menu button is registered by the poller itself on every start
+(optional patch 09), listing the real commands in a sensible order: `esc`,
+`fresh`, `opus`, `fable`, `model`, `context`, `usage`, `resume`. The poller-start
+registration is the source of truth - it re-asserts on every restart, so a
+plugin update that reverts it heals on the next re-patch and restart. To refresh
+the menu instantly without a restart, there is a one-off `setMyCommands` curl in
+[patches/README.md](patches/README.md). Telegram clients cache the menu for a
+minute or so.
+
+That is the whole setup. The rest of this README is what you get, the fleet
+story, requirements, and the security model.
 
 ## What you get over the stock plugin
 
@@ -36,6 +157,10 @@ which does message round-trip, pairing and allowlist access control, and the
 | Documents handed to you as tappable files | No | Yes, a delivery-nudge hook |
 | Voice notes as prompts | No | Yes, local, about 1-2s on Apple Silicon |
 | `/fresh` `/resume` `/model` from Telegram | No | Yes, including a cross-bot resume picker |
+| Interrupt a busy session from your phone | No | Yes, `/esc` sends a real Escape to the right window |
+| One-tap model switches | No | Yes, `/opus` and `/fable`, conversation kept |
+| Live context and token-burn meters | No | Yes, `/context` and `/usage`, computed outside the model |
+| A real "/" command menu | Dead `/start` `/help` `/status` boilerplate | The actual command list, re-registered on every poller start |
 | Keeps bots alive with a watchdog | No. "Events only arrive while the session is open" | Yes, launchd plus auto-resume into the same conversation |
 | Survives a reboot with exact conversations | No | Yes, snapshot and restore |
 | Multi-bot | Manual multi-instance, separate allowlists | Managed fleet, one shared brain |
@@ -46,34 +171,6 @@ not first. The parts that appear to have no shipped public counterpart are the
 verified-reply contract, exact-conversation restore across a reboot, the
 identical-fleet-one-brain topology, the cross-bot resume picker, and the
 reply-delivery guarantee. See [docs/FAQ.md](docs/FAQ.md) for the landscape.
-
-## Quickstart
-
-Three lines inside a Claude Code session:
-
-```
-/plugin marketplace add eli543/claude-telegram-fleet
-/plugin install telegram-fleet@claude-telegram-fleet
-/telegram-fleet:setup
-```
-
-`/telegram-fleet:setup` walks you through the rest: preflight checks, one
-or more bots, tokens (written to a per-bot `.env` with `chmod 600`, never
-echoed), your permission stance, voice, the watchdog, and the pairing walkthrough.
-
-Prefer a bare shell, or not yet in a session? The same underlying steps run from
-the installer:
-
-```
-git clone https://github.com/eli543/claude-telegram-fleet
-cd claude-telegram-fleet
-./install.sh
-```
-
-Then, once per bot, the stock pairing flow: create a bot with
-[@BotFather](https://t.me/BotFather) (`/newbot`), DM your new bot, it replies
-with a six-character code, and you run `/telegram:access pair <code>` in the
-terminal. Setup then offers to lock the policy to `allowlist`.
 
 <!-- VOICE GIF: record a Telegram voice note; about a second later the bot is already working on the transcribed request, with the live box open. -->
 
@@ -157,6 +254,9 @@ on your Mac. So the defaults matter, and this repo keeps them conservative.
 - What the judge sends and where: off by default. When you turn it on, it sends
   your own outbound draft replies to the Anthropic API, capped, using your own
   key. The deterministic checks work with no key and no network.
+- What `/esc` can press: exactly one Escape, in a window it has verified belongs
+  to the requesting bot, under a global keystroke lock. Sending it needs macOS
+  Automation and Accessibility consent, which macOS asks for on first use.
 
 The full threat model, the token-rotation steps, and the kill switches for every
 hook are in [SECURITY.md](SECURITY.md).
@@ -169,6 +269,10 @@ Telegram  ->  official plugin poller (Bun MCP server)  ->  Claude Code session
                                      hooks fire on the turn:  ack, stream, TLDR,
                                      reply-guard, deliver-nudge, and the idle-path
                                      /fresh /resume /model commands
+                                                              |
+              with the optional patches, the poller itself intercepts /fresh,
+              /model, /opus, /fable, /esc, /context, and /usage before the
+              idle-vs-busy split, so they work even mid-task
                                                               |
               a launchd watchdog watches every bot and restarts a dead one
               into the same conversation; snapshot/restore does the same across
@@ -187,18 +291,23 @@ list are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 <!-- IMMORTALITY GIF: kill the Terminal window mid-conversation; the watchdog relaunches it within seconds; ask "where were we?" and it answers from the same conversation. -->
 <!-- REBOOT GIF: run /telegram-fleet:snapshot, reboot the Mac, run /telegram-fleet:restore; the same conversations continue. -->
 <!-- MODEL GIF: send /model fable mid-conversation; the bot restarts on the new model with history intact. -->
+<!-- ESC GIF: the bot is mid-task in the live box; send /esc; the box stops and the bot answers the newest message instead. -->
 
 ## Command reference
 
 From your Telegram chat with a bot:
 
-| Command | Effect |
-|---|---|
-| `/fresh` | Restart this bot with a blank context and default model |
-| `/resume` | Show a numbered picker of recent sessions across all bots |
-| `/resume N` | Reopen session N here, in this bot |
-| `/model` | Report the current model and effort |
-| `/model <class> [effort]` | Switch model class (`opus`, `sonnet`, `fable`, `haiku`) and effort (`low`, `medium`, `high`, `xhigh`, `max`), history intact |
+| Command | Effect | Needs patches? |
+|---|---|---|
+| `/fresh` | Restart this bot with a blank context and default model | No (mid-task handling: patch 04) |
+| `/resume` | Show a numbered picker of recent sessions across all bots | No |
+| `/resume N` | Reopen session N here, in this bot | No |
+| `/model` | Report the current model and effort | No (mid-task handling: patch 05) |
+| `/model <class> [effort]` | Switch model class (`opus`, `sonnet`, `fable`, `haiku`) and effort (`low`, `medium`, `high`, `xhigh`, `max`), history intact | No (mid-task handling: patch 05) |
+| `/opus`, `/fable` | One-tap switch to that model class, history intact | Yes (07) |
+| `/esc` | Interrupt the current turn so your newest message is read now | Yes (06) |
+| `/context` | This chat's context-window usage: used vs cap, with a bar | Yes (08) |
+| `/usage` | Fleet-wide token burn: today plus the trailing 7 days, per bot | Yes (08) |
 
 Inside a Claude Code session:
 

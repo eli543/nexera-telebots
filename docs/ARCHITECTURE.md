@@ -23,7 +23,10 @@ Telegram Bot API (cloud), long-poll getUpdates
 server.ts  =  the poller / Bun MCP worker  (one per bot)
    |  1. access gate: read access.json, drop / pair / deliver
    |  2. write liveness: state_dir/poller.heartbeat and state_dir/last-inbound
-   |  3. intercept /fresh, /model, and permission replies before the model sees them
+   |  3. intercept /fresh, /model, /opus, /fable, /esc, /context, /usage, and
+   |     permission replies before the model sees them (the command intercepts
+   |     are the optional patches; /esc, the shortcuts, and the reports exist
+   |     only there), and register the "/" command menu on every poller start
    |  4. download attachments to state_dir/inbox/, describe them in the message meta
    |  5. emit an MCP notification to the session
    v
@@ -90,6 +93,9 @@ The installer creates `~/.claude/telegram-fleet/` (override with `FLEET_HOME`):
     fleet-launch        launch a bot in its workdir with token and state dir
     fleet-fresh         kill and relaunch a bot, guarded by PID and workdir
     fleet-model         switch model and effort, resume into the same session
+    fleet-esc           press one verified Escape in a bot's window (/esc)
+    fleet-context       report a session's live context usage (/context)
+    fleet-usage         report fleet-wide token burn (/usage)
     fleet-sessions      enumerate sessions across all bots for the resume picker
     fleet-snapshot      record running sessions before a reboot
     fleet-restore       resume the exact conversations after login
