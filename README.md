@@ -1,5 +1,13 @@
 # claude-telegram-fleet
 
+> Setting this up with Claude? If you dropped this repo's link into Claude and
+> said "set this up for me," point Claude at
+> [SETUP-WITH-CLAUDE.md](SETUP-WITH-CLAUDE.md). That file is written as direct
+> instructions to an assisting Claude: it stands up the first bot end to end,
+> verifies each step before the next, and explains every component as it goes,
+> then repeats compactly for any further bots. Setting it up by hand? The
+> [Setup](#setup) section below is the same walkthrough for a person.
+
 The always-on upgrade for Claude Code's official Telegram channel: live progress
 streaming, voice notes transcribed locally, replies that arrive structured
 instead of as walls of text, `/fresh` `/resume` `/model` plus an `/esc`
@@ -72,8 +80,13 @@ cd claude-telegram-fleet
 ./install.sh
 ```
 
-Both paths install the engine scripts to `~/.claude/telegram-fleet/bin/` and
-write a starter `fleet.json` (the one config file) if you do not have one.
+Only the installer copies the engine scripts into
+`~/.claude/telegram-fleet/bin/` and writes a starter `fleet.json` (the one config
+file). The three `/plugin` lines install the Claude-facing surface - hooks,
+skills, and slash commands - but not the engine, so run `./install.sh` as well
+before you launch a bot; `/telegram-fleet:setup` and every `fleet-*` command
+depend on that `bin/` directory. The installer is also the one-command path: it
+lays down both plugins, the engine, and the watchdog in a single pass.
 Requirements are firm and listed [below](#requirements): macOS, Bun, Claude
 Code 2.1.80+ with channels.
 
@@ -216,6 +229,8 @@ Read these before installing. They are firm, not aspirational.
   disables itself. Nothing else depends on it.
 - Bun. The official plugin's MCP server runs on Bun. Without it the channel
   silently fails to connect. Install with `curl -fsSL https://bun.sh/install | bash`.
+- A Telegram account. You create each bot with @BotFather and message it from
+  your own Telegram, so the app and an account are prerequisites.
 - Claude Code 2.1.80 or newer, with channels. Channels are a research preview.
   They require Anthropic authentication through claude.ai or a Console API key,
   and are not available on Amazon Bedrock, Google Cloud's Agent Platform, or

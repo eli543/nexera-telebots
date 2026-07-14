@@ -21,6 +21,11 @@ Run these read-only checks and report a short pass/fail list:
 - Official plugin: check whether `telegram@claude-plugins-official` is installed.
   If not, offer to run `claude plugin marketplace add anthropics/claude-plugins-official`
   then `claude plugin install telegram@claude-plugins-official`.
+- Engine installed: `test -x $FLEET_HOME/bin/fleet-config`. If this fails, the
+  engine is not in place yet - installing the plugin alone does not lay it down.
+  Have the user run the installer first (`./install.sh` from a clone of this
+  repo), then come back. Steps 2 and 6 below call `$FLEET_HOME/bin/fleet-config`
+  and `$FLEET_HOME/bin/fleet-launch`, which exist only after the installer runs.
 
 ## Step 2: Write fleet.json
 
@@ -40,7 +45,9 @@ For each bot:
 - Ask the user to paste that bot's BotFather token. Write it to
   `<state_dir>/.env` as `TELEGRAM_BOT_TOKEN=<token>` and immediately
   `chmod 600 <state_dir>/.env`. Do not echo the token, do not repeat it back, do
-  not put it in any other file.
+  not put it in any other file. Paste it with no surrounding quotes and no
+  trailing space; the value is read literally, so quotes or whitespace break
+  authentication.
 - Seed `<state_dir>/access.json` with `dmPolicy` set to `pairing` and an empty
   `allowFrom`. The user will pair next and then switch to allowlist.
 
