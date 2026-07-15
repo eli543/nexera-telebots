@@ -82,7 +82,7 @@ cd claude-telegram-fleet
 
 Only the installer copies the engine scripts into
 `~/.claude/telegram-fleet/bin/` and writes a starter `fleet.json` (the one config
-file). The three `/plugin` lines install the Claude-facing surface - hooks,
+file). The three-line in-session path installs the Claude-facing surface - hooks,
 skills, and slash commands - but not the engine, so run `./install.sh` as well
 before you launch a bot; `/telegram-fleet:setup` and every `fleet-*` command
 depend on that `bin/` directory. The installer is also the one-command path: it
