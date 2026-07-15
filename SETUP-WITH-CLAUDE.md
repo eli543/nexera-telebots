@@ -66,8 +66,8 @@ directory existing, so run the installer even if you plan to add the plugin from
 a session later.
 
 ```
-git clone https://github.com/eli543/claude-telegram-fleet
-cd claude-telegram-fleet
+git clone https://github.com/eli543/nexera-telebots
+cd nexera-telebots
 ./install.sh --yes
 ```
 

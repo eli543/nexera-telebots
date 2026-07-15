@@ -39,4 +39,4 @@ not replace the Claude Code CLI.
 
 ## Maintained by
 
-Eli Almo at Nexera Intelligence (AI consulting, New York). Repository: https://github.com/eli543/claude-telegram-fleet
+Eli Almo at Nexera Intelligence (AI consulting, New York). Repository: https://github.com/eli543/nexera-telebots

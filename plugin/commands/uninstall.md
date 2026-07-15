@@ -1,9 +1,9 @@
 ---
-description: Full teardown of claude-telegram-fleet. Removes the watchdog, stops bot sessions, uninstalls the plugin, and removes FLEET_HOME, keeping tokens and transcripts unless the user asks to purge. Use when the user wants to remove or uninstall the Telegram fleet.
+description: Full teardown of nexera-telebots. Removes the watchdog, stops bot sessions, uninstalls the plugin, and removes FLEET_HOME, keeping tokens and transcripts unless the user asks to purge. Use when the user wants to remove or uninstall the Telegram fleet.
 allowed-tools: Bash, Read
 ---
 
-Walk the user through removing claude-telegram-fleet. Confirm each destructive
+Walk the user through removing nexera-telebots. Confirm each destructive
 step. The repo ships `uninstall.sh`, which does this end to end; you can run it or
 guide the user through the equivalent commands. `$FLEET_HOME` defaults to
 `~/.claude/telegram-fleet`.
@@ -23,7 +23,7 @@ Tell the user what will happen, then run the steps they approve.
    working directory. Never pattern-kill. If unsure, have the user close the
    bots' Terminal windows instead.
 
-3. The plugin: `claude plugin uninstall telegram-fleet@claude-telegram-fleet`.
+3. The plugin: `claude plugin uninstall telegram-fleet@nexera-telebots`.
    Ask whether to also remove `telegram@claude-plugins-official`; keep it if
    other setups use it.
 

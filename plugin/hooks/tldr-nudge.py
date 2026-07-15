@@ -35,7 +35,7 @@
 #   (1) `fleet-config option tldr_judge` is true (in fleet.json options), and
 #   (2) an API key resolves via this chain, in order:
 #         env ANTHROPIC_API_KEY_TLDR  ->  $TELEGRAM_STATE_DIR/.env line  ->
-#         macOS Keychain service "claude-telegram-fleet-judge" (darwin only).
+#         macOS Keychain service "nexera-telebots-judge" (darwin only).
 # The judge sends the draft reply text to the Anthropic API (the user's own key, their
 # own content). The key is never stored in this file. If the config is off or no key
 # resolves, the judge is silently skipped and only the free structural checks apply.
@@ -52,7 +52,7 @@ _TLDR_NUM = re.compile(r"^\s*(?:\d+[.)]|\(\d+\))\s")
 
 # --- AI-judge config -------------------------------------------------------------
 _JUDGE_MODEL = "claude-haiku-4-5"                   # fastest + cheapest capable Claude
-_KEYCHAIN_SERVICE = "claude-telegram-fleet-judge"   # darwin Keychain service (3rd in chain)
+_KEYCHAIN_SERVICE = "nexera-telebots-judge"   # darwin Keychain service (3rd in chain)
 _ENV_KEY_NAMES = ("ANTHROPIC_API_KEY_TLDR", "ANTHROPIC_API_KEY")  # accepted .env line names
 _API_URL = "https://api.anthropic.com/v1/messages"
 _KEY_TIMEOUT = 3.0                                  # security(1) fetch ceiling (s)
@@ -294,7 +294,7 @@ def _env_file_key(env_path):
 
 def _api_key(state_dir):
     """Resolve the judge key, in order: env ANTHROPIC_API_KEY_TLDR -> $STATE_DIR/.env
-    line -> macOS Keychain service 'claude-telegram-fleet-judge' (darwin only). Returns
+    line -> macOS Keychain service 'nexera-telebots-judge' (darwin only). Returns
     the key or None (absent -> judge silently off). Never logs or echoes the key."""
     k = os.environ.get("ANTHROPIC_API_KEY_TLDR")
     if k and k.strip():

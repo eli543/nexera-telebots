@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# uninstall.sh - tear down claude-telegram-fleet.
+# uninstall.sh - tear down nexera-telebots.
 #
 # Removes the launchd watchdog, stops running bot sessions by exact PID, removes
 # FLEET_HOME (engines, logs, config), and uninstalls this plugin. By default it
@@ -133,7 +133,7 @@ fi
 
 step "Uninstall the plugin"
 if command -v claude >/dev/null 2>&1; then
-  run claude plugin uninstall telegram-fleet@claude-telegram-fleet || true
+  run claude plugin uninstall telegram-fleet@nexera-telebots || true
   if confirm "Also remove the upstream telegram@claude-plugins-official plugin?" N; then
     run claude plugin uninstall telegram@claude-plugins-official || true
   else
@@ -141,7 +141,7 @@ if command -v claude >/dev/null 2>&1; then
   fi
 else
   note "No claude CLI found. Uninstall from a session with:"
-  note "  /plugin uninstall telegram-fleet@claude-telegram-fleet"
+  note "  /plugin uninstall telegram-fleet@nexera-telebots"
 fi
 
 # ---- state directories ------------------------------------------------------

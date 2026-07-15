@@ -1,6 +1,6 @@
 ---
 name: fleet-ops
-description: Day-two operations for a claude-telegram-fleet install. Use when the user wants to add a bot to the fleet, rotate a bot token, read the watchdog logs, park or re-enable a bot, turn a hook off with a kill switch, or test a hook safely. Covers the exact file paths and the safe procedures.
+description: Day-two operations for a nexera-telebots install. Use when the user wants to add a bot to the fleet, rotate a bot token, read the watchdog logs, park or re-enable a bot, turn a hook off with a kill switch, or test a hook safely. Covers the exact file paths and the safe procedures.
 ---
 
 Operational knowledge for running a fleet after it is set up. `$FLEET_HOME`

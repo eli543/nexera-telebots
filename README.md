@@ -1,4 +1,4 @@
-# claude-telegram-fleet
+# Nexera Telebots
 
 _Built and provided by [Nexera Intelligence](https://nexeraintelligence.com) - AI consulting, New York._
 
@@ -62,8 +62,8 @@ different personalities. Full topology: [docs/FLEET.md](docs/FLEET.md).
 Three lines inside a Claude Code session:
 
 ```
-/plugin marketplace add eli543/claude-telegram-fleet
-/plugin install telegram-fleet@claude-telegram-fleet
+/plugin marketplace add eli543/nexera-telebots
+/plugin install telegram-fleet@nexera-telebots
 /telegram-fleet:setup
 ```
 
@@ -75,8 +75,8 @@ Prefer a bare shell, or not yet in a session? The same underlying steps run
 from the installer:
 
 ```
-git clone https://github.com/eli543/claude-telegram-fleet
-cd claude-telegram-fleet
+git clone https://github.com/eli543/nexera-telebots
+cd nexera-telebots
 ./install.sh
 ```
 
@@ -161,7 +161,7 @@ Every claim below is measured against Anthropic's stock Telegram channel plugin,
 which does message round-trip, pairing and allowlist access control, and the
 `reply` / `react` / `edit_message` tools.
 
-| Capability | Stock telegram plugin | claude-telegram-fleet |
+| Capability | Stock telegram plugin | nexera-telebots |
 |---|---|---|
 | Message round-trip, pairing and allowlist access control | Yes | Yes, unchanged. We build on it |
 | Live progress: animated status box, edit-in-place, folds into a recap | Manual `edit_message` only | Automatic, zero model tokens |

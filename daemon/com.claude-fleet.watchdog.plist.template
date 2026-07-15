@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  LaunchAgent for the claude-telegram-fleet watchdog.
+  LaunchAgent for the nexera-telebots watchdog.
 
   The installer substitutes __FLEET_HOME__ with the absolute FLEET_HOME path and
   writes the result to ~/Library/LaunchAgents/com.claude-fleet.watchdog.plist,

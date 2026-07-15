@@ -20,7 +20,7 @@ Topic labels: an optional AI topic label (3-6 words) is attached per session ONL
 when labels are enabled - the tldr_judge option is true OR $ANTHROPIC_API_KEY_TLDR
 is set - and a key resolves via the judge key chain (env ANTHROPIC_API_KEY_TLDR ->
 the calling bot's state-dir .env -> macOS Keychain service
-"claude-telegram-fleet-judge"). Otherwise, and on ANY failure, each entry keeps
+"nexera-telebots-judge"). Otherwise, and on ANY failure, each entry keeps
 its heuristic preview. `list` always produces output; it never errors on a
 missing key or network.
 
@@ -323,7 +323,7 @@ def _get_api_key():
         try:
             out = subprocess.run(
                 ["security", "find-generic-password",
-                 "-s", "claude-telegram-fleet-judge", "-w"],
+                 "-s", "nexera-telebots-judge", "-w"],
                 capture_output=True, text=True, timeout=5,
             )
             v = (out.stdout or "").strip()

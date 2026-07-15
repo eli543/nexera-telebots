@@ -57,7 +57,7 @@ ALERT_KEY="$(fc option alert_bot 2>/dev/null || true)"
 ALERT_STATE="$(fc bot "$ALERT_KEY" state_dir 2>/dev/null || true)"
 
 # Fleet-specific lock so parallel fleets (or a test run) never collide.
-LOCK="/tmp/claude-telegram-fleet-watchdog-$(printf '%s' "$FLEET_HOME" | cksum | awk '{print $1}').lock"
+LOCK="/tmp/nexera-telebots-watchdog-$(printf '%s' "$FLEET_HOME" | cksum | awk '{print $1}').lock"
 
 log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null || true; }
 say() { log "$*"; [ $DRY_RUN -eq 1 ] && printf '%s\n' "$*"; }

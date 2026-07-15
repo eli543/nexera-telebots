@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# install.sh - bootstrap claude-telegram-fleet from a bare shell.
+# install.sh - bootstrap nexera-telebots from a bare shell.
 #
 # Installs the daemon layer (watchdog + snapshot/restore engines) into FLEET_HOME
 # and, with your consent, the official plugin, this repo's plugin, the launchd
@@ -214,13 +214,13 @@ if command -v claude >/dev/null 2>&1; then
   fi
   if confirm "Add this repo as a marketplace and install telegram-fleet?" Y; then
     run claude plugin marketplace add "$REPO_DIR" || true
-    run claude plugin install telegram-fleet@claude-telegram-fleet || true
+    run claude plugin install telegram-fleet@nexera-telebots || true
   fi
   note "After installing, run /reload-plugins inside a session if it is open."
 else
   note "Skipping plugin install (no claude CLI). Install the plugin from a session:"
-  note "  /plugin marketplace add eli543/claude-telegram-fleet"
-  note "  /plugin install telegram-fleet@claude-telegram-fleet"
+  note "  /plugin marketplace add eli543/nexera-telebots"
+  note "  /plugin install telegram-fleet@nexera-telebots"
 fi
 
 # ---- daemon -----------------------------------------------------------------

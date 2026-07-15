@@ -50,7 +50,7 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 }
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings `
-    -Description "Keepalive loop for the claude-telegram-fleet bots (experimental)." | Out-Null
+    -Description "Keepalive loop for the nexera-telebots bots (experimental)." | Out-Null
 
 Write-Host "registered scheduled task $TaskName (runs at logon; watchdog every 60s)"
 Write-Host "remove it with: .\register-task.ps1 -Remove"

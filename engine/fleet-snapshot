@@ -56,7 +56,7 @@ session_pid_for() {
 
 now=$(date +%s)
 {
-  echo "# claude-telegram-fleet snapshot  $(date '+%F %T')  dry_run=$DRY_RUN"
+  echo "# nexera-telebots snapshot  $(date '+%F %T')  dry_run=$DRY_RUN"
   printf '# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' key cwd state_dir proj_dir session_id was_running already_disabled we_parked session_mtime_epoch
 } > "$SNAP"
 

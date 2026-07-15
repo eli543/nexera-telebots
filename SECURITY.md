@@ -70,7 +70,7 @@ selects `full` for you.
   runtime. They are never inlined into a script, never echoed by the installer,
   and never written to a log.
 - The optional reply judge's Anthropic API key lives in the macOS Keychain under
-  a dedicated service (`claude-telegram-fleet-judge`), isolated so its spend is
+  a dedicated service (`nexera-telebots-judge`), isolated so its spend is
   separate from your other keys. It is read at runtime and never stored on disk.
 - The `/usage` plan-limits section (optional patch 08) reads your Claude Code
   OAuth access token from the Keychain service Claude Code itself maintains

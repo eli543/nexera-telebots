@@ -1,9 +1,9 @@
 ---
-description: Guided setup for claude-telegram-fleet. Runs preflight checks, writes fleet.json, creates per-bot state directories and tokens, sets the permission stance, and offers the daemon, patches, and voice. Use when the user wants to set up or reconfigure their Telegram fleet.
+description: Guided setup for nexera-telebots. Runs preflight checks, writes fleet.json, creates per-bot state directories and tokens, sets the permission stance, and offers the daemon, patches, and voice. Use when the user wants to set up or reconfigure their Telegram fleet.
 allowed-tools: Bash, Read, Write, Edit
 ---
 
-You are guiding the user through setting up claude-telegram-fleet. Work in
+You are guiding the user through setting up nexera-telebots. Work in
 steps, confirm before any system change, and never print a bot token back to the
 user or into a log. `$FLEET_HOME` defaults to `~/.claude/telegram-fleet`.
 
