@@ -4,6 +4,31 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims
 to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Pre-public polish pass.
+
+### Added
+
+- `SETUP-WITH-CLAUDE.md`: a guided install written to an assisting Claude, so
+  dropping the repo link into Claude and saying "set this up for me" stands up
+  the first bot end to end with a verify gate at each step, explains every
+  component as it goes, then repeats for more bots. Linked from the top of the
+  README.
+
+### Changed
+
+- `/usage` and `/context` meter legends restyled to the minimal form: the
+  colored squares are gone from the legend line under each bar (they stay inside
+  the bar itself). The legend now reads `↳ X% used · Y% left · resets ...` and
+  `↳ X% full · U used · F free of CAP`.
+- Install docs corrected: only the installer lays down the engine, so the
+  three-line plugin path is now honest that you also run `./install.sh`, and a
+  guard in `/telegram-fleet:setup` stops early if the engine is not installed.
+- README states it is built and provided by Nexera Intelligence, with a short
+  About section; the badge row is trimmed to platform and license; and
+  attribution was added to the plugin and marketplace metadata and NOTICE.
+
 ## [0.2.0] - 2026-07-14
 
 The phone-control release: interrupt a busy bot, switch models in one tap, read
@@ -86,5 +111,6 @@ path.
 - Offline test harnesses for the hooks and a CI workflow (shellcheck, bash -n,
   py_compile, and a secret scan).
 
+[Unreleased]: https://github.com/eli543/claude-telegram-fleet/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/eli543/claude-telegram-fleet/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/eli543/claude-telegram-fleet/releases/tag/v0.1.0
