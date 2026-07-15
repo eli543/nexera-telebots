@@ -2,7 +2,7 @@
   "name": "claude-telegram-fleet",
   "description": "Claude Code Telegram: the always-on upgrade for the official Telegram channel. Live streaming, voice notes, structured replies, a self-healing watchdog, reboot-surviving restore, and an N-bot fleet on one brain.",
   "owner": {
-    "name": "Eli Almo"
+    "name": "Nexera Intelligence"
   },
   "plugins": [
     {

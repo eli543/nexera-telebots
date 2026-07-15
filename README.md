@@ -1,5 +1,7 @@
 # claude-telegram-fleet
 
+_Built and provided by [Nexera Intelligence](https://nexeraintelligence.com) - AI consulting, New York._
+
 > Setting this up with Claude? If you dropped this repo's link into Claude and
 > said "set this up for me," point Claude at
 > [SETUP-WITH-CLAUDE.md](SETUP-WITH-CLAUDE.md). That file is written as direct
@@ -19,8 +21,6 @@ brain.
 
 ![platform: macOS](https://img.shields.io/badge/platform-macOS-black)
 ![license: MIT](https://img.shields.io/badge/license-MIT-black)
-![Claude Code](https://img.shields.io/badge/Claude%20Code-%E2%89%A5%202.1.80-black)
-![channels: research preview](https://img.shields.io/badge/channels-research%20preview-orange)
 
 The stock plugin gives you a chat bridge. This gives you an operation. It is
 built on Anthropic's official plugin and the sanctioned `--channels` path: no
@@ -368,9 +368,18 @@ Short answers here; the long ones are in [docs/FAQ.md](docs/FAQ.md).
 - Does a plugin update overwrite the optional patches? Yes. That is why they are
   optional and quarantined, with re-apply tooling.
 
+## About Nexera Intelligence
+
+Nexera Intelligence is an AI consulting firm in New York. We get small and
+mid-sized businesses using AI inside the tools they already work in, from the
+first setup to the automations that run in the background. We built this fleet
+to run our own operation, then opened it up so anyone can have the same
+always-on control of Claude Code from their phone. If you want AI working in
+your business, find us at [nexeraintelligence.com](https://nexeraintelligence.com).
+
 ## Credits
 
-Maintained by Eli Almo. Built on Anthropic's official Telegram channel plugin
+Maintained by Eli Almo at Nexera Intelligence. Built on Anthropic's official Telegram channel plugin
 (`telegram@claude-plugins-official`), which is installed, not redistributed. See
 [NOTICE.md](NOTICE.md) for the licensing relationship and the not-affiliated
 statement.

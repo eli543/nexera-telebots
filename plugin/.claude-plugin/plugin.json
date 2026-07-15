@@ -4,7 +4,7 @@
   "version": "0.2.0",
   "description": "The always-on upgrade for Claude Code's official Telegram channel: live progress streaming, voice-note prompts, enforced structured replies, /fresh /resume /model plus /esc interrupt, one-tap /opus /fable, live /context /usage meters and a real command menu from Telegram, a self-healing watchdog, reboot-surviving restore, and an N-bot fleet sharing one brain. macOS.",
   "author": {
-    "name": "Eli Almo",
+    "name": "Eli Almo, Nexera Intelligence",
     "url": "https://github.com/eli543"
   },
   "license": "MIT",
