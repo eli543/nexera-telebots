@@ -516,6 +516,7 @@ extension FleetModel {
 struct BotIndicators: Equatable {
     var model: String?          // "Opus 5.5" from the newest reply, else the alias ("Opus")
     var servedModel: String?    // the name from the transcript alone, nil before the first reply
+    var servedAt: TimeInterval? // when that transcript was last written (recency among siblings)
     var effort: String?         // "max", "high", ...
     var contextPercent: Int?    // nil when unknown (no transcript yet)
     var restartsLastHour: Int
@@ -549,6 +550,11 @@ extension FleetModel {
         let version = tokens.filter { !$0.isEmpty && $0.count <= 2 && $0.allSatisfy(\.isNumber) }
         let name = family.prefix(1).uppercased() + family.dropFirst()
         return version.isEmpty ? name : name + " " + version.joined(separator: ".")
+    }
+
+    /// The model family of a display name: "Opus 5.5" and "Opus" are both "opus".
+    static func modelFamily(_ name: String) -> String {
+        String(name.split(separator: " ").first ?? "").lowercased()
     }
 
     /// A launch alias as a name ("opus[1m]" reads "Opus"), used until the session's
@@ -641,14 +647,20 @@ extension FleetModel {
         let effort = flagValue(argv, ["--effort"]) ?? saved.effort
         var context: Int?
         var served: String?
+        var servedAt: TimeInterval?
         if withContext, health.state != .down {
             let resume = resolveResume(health.bot, source: config.settings.resumeSource)
             if resume.arg != "fresh-keep" {
                 let modelText = (FileManager.default.contents(atPath: health.bot.stateDir + "/model-state"))
                     .map { String(decoding: $0, as: UTF8.self) } ?? ""
-                let usage = transcriptUsage(transcript: health.bot.projectDir + "/" + resume.arg + ".jsonl", modelStateText: modelText)
-                context = usage.percent
-                served = usage.model
+                let transcript = health.bot.projectDir + "/" + resume.arg + ".jsonl"
+                let usage = transcriptUsage(transcript: transcript, modelStateText: modelText)
+                // Context stays hidden until the session has a usage record of its own.
+                if usage.model != nil {
+                    context = usage.percent
+                    served = usage.model
+                    servedAt = modificationTime(transcript)
+                }
             }
         }
         let beatPath = health.bot.stateDir + "/poller.heartbeat"
@@ -656,6 +668,7 @@ extension FleetModel {
         return BotIndicators(
             model: servedName ?? alias.map { modelName(fromAlias: $0) },
             servedModel: servedName,
+            servedAt: servedName == nil ? nil : servedAt,
             effort: effort,
             contextPercent: context,
             restartsLastHour: restartsLastHour(health.bot, config, now: health.checkedAt),

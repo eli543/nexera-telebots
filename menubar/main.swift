@@ -304,7 +304,10 @@ final class FleetStore: ObservableObject {
     private var lastProblem: String?
     private var lastHeaderProblem: String?
     private var loggedWarnings: [String] = []
-    private var contextCache: [String: (session: pid_t, value: Int?, served: String?, at: Date)] = [:]
+    private var contextCache: [String: (session: pid_t, value: Int?, served: String?, servedAt: TimeInterval?, at: Date)] = [:]
+    /// Model family to its newest full name seen in any bot's transcript ("opus" to
+    /// "Opus 5.5"). Kept in memory, so it survives the sibling it came from going down.
+    private var familyNames: [String: (name: String, at: TimeInterval)] = [:]
     private var probe: (reachable: Bool, at: Date)?
     private var probing = false
     private var confirmationToken = 0
@@ -419,14 +422,37 @@ final class FleetStore: ObservableObject {
             var previous: [String: Row] = [:]
             for row in rows { previous[row.id] = row }
             var next: [Row] = []
-            for health in healths {
+            var allIndicators = healths.map { indicators($0, cfg) }
+            // Learn each family's newest full name from the bots that have replied...
+            for ind in allIndicators {
+                guard let served = ind.servedModel else { continue }
+                let family = FleetModel.modelFamily(served)
+                let at = ind.servedAt ?? 0
+                if let known = familyNames[family], known.at > at { continue }
+                familyNames[family] = (served, at)
+            }
+            // ...and lend it to a bot on the same family that has not replied yet.
+            var borrowed = Set<String>()
+            for i in allIndicators.indices where allIndicators[i].servedModel == nil {
+                if let alias = allIndicators[i].model, let known = familyNames[FleetModel.modelFamily(alias)] {
+                    allIndicators[i].model = known.name
+                    borrowed.insert(healths[i].bot.key)
+                }
+            }
+            for (health, ind) in zip(healths, allIndicators) {
                 var pulse = previous[health.bot.key]?.pulse ?? 0
                 if let before = lastStates[health.bot.key], before != health.state {
                     pulse += 1
                     log("\(health.bot.key): \(before.rawValue) -> \(health.state.rawValue) (\(detail(health)))")
                 }
                 lastStates[health.bot.key] = health.state
-                next.append(makeRow(health, indicators(health, cfg), now: now, pulse: pulse))
+                var row = makeRow(health, ind, now: now, pulse: pulse)
+                if borrowed.contains(health.bot.key), let model = ind.model {
+                    row.detailTip = "\(model): the model this session was launched on, named from a sibling on the same model until this bot's first reply"
+                        + (health.state == .down ? " (it is down, so this is the model it starts with)" : "")
+                        + ". Context used appears after its first reply."
+                }
+                next.append(row)
             }
             rows = next
             let switches = FleetModel.readWatchdog(cfg)
@@ -480,10 +506,11 @@ final class FleetStore: ObservableObject {
             ind.contextPercent = cached.value
             if let served = cached.served {
                 ind.servedModel = served
+                ind.servedAt = cached.servedAt
                 ind.model = served
             }
         } else {
-            contextCache[health.bot.key] = (session, ind.contextPercent, ind.servedModel, Date())
+            contextCache[health.bot.key] = (session, ind.contextPercent, ind.servedModel, ind.servedAt, Date())
         }
         return ind
     }
