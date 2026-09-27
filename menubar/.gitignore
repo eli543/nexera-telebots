@@ -1,0 +1,2 @@
+# build.sh output (the app itself is assembled into ~/Applications)
+build/
