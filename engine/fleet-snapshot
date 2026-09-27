@@ -20,6 +20,19 @@
 
 set -uo pipefail
 
+# 2026-09-27 fixes, each reproduced on a scratch fleet first:
+#  - Session id: when <state_dir>/session.id names a session whose transcript
+#    exists, that RUNNING session is recorded, not whichever transcript is newest.
+#    A session.id with no transcript yet is a session that has not spoken: it is
+#    recorded empty (restore starts it fresh). With no session.id the newest
+#    transcript is still used, and the table says it is unverified.
+#  - Snapshot again: switches set by an earlier snapshot that no restore has
+#    consumed yet stay the snapshot's own (we_parked=1) instead of being recorded
+#    as manual disables, which left every bot down after the restore.
+#  - Write failures: the snapshot goes to a temp file and is moved into place only
+#    when every line was written; otherwise it exits 1 and removes the switches
+#    this run set. A switch that cannot be set also exits 1.
+
 case "${1:-}" in -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
 
 FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
@@ -39,7 +52,10 @@ WD_STATE="$FLEET_HOME/watchdog-state"
 RESTART_STATE="$FLEET_HOME/restart-state"
 SNAP="$RESTART_STATE/snapshot.tsv"
 [ $DRY_RUN -eq 1 ] && SNAP="$RESTART_STATE/snapshot.dryrun.tsv"
-mkdir -p "$RESTART_STATE" "$WD_STATE"
+if ! mkdir -p "$RESTART_STATE" "$WD_STATE"; then
+  echo "Snapshot FAILED: cannot create $RESTART_STATE or $WD_STATE. Nothing was saved and nothing was parked."
+  exit 1
+fi
 
 # pid of the live session whose TELEGRAM_STATE_DIR matches $1 (env match, exactly
 # like the watchdog, so one bot's pids are never confused with another's).
@@ -54,11 +70,53 @@ session_pid_for() {
   done
 }
 
+UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+
+# The session to resume for one bot (see the 2026-09-27 note). Sets sid, smtime
+# and sid_note.
+resolve_session() {   # resolve_session <state dir> <project dir>
+  local sdir="$1" proj="$2" cand="" f b
+  sid=""; smtime=0; sid_note=""
+  [ -f "$sdir/session.id" ] && cand=$(head -1 "$sdir/session.id" 2>/dev/null | tr -d '\r\n')
+  if [[ "$cand" =~ $UUID_RE ]]; then
+    if [ -f "$proj/$cand.jsonl" ]; then
+      sid="$cand"; smtime=$(stat -f %m "$proj/$cand.jsonl" 2>/dev/null || echo 0); sid_note="session.id"
+    else
+      sid_note="its session ${cand:0:8} has not spoken yet, so it restores fresh"
+    fi
+    return 0
+  fi
+  # transcript files are named by uuid (.jsonl) - no spaces; -t needs ls.
+  # shellcheck disable=SC2012
+  while IFS= read -r f; do
+    b=$(basename "$f" .jsonl)
+    [[ "$b" =~ $UUID_RE ]] || continue
+    sid="$b"; smtime=$(stat -f %m "$f" 2>/dev/null || echo 0)
+    sid_note="newest transcript, no session.id to verify it"
+    return 0
+  done < <(ls -t "$proj"/*.jsonl 2>/dev/null)
+}
+
+# Switches an earlier, still-unconsumed snapshot set (its we_parked=1 rows). They
+# stay the snapshot's own on a repeat snapshot. Empty fields are preserved.
+CARRIED=" "
+if [ -f "$RESTART_STATE/snapshot.tsv" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in \#*|"") continue ;; esac
+    IFS=$'\037' read -r k _ _ _ _ _ ad wp _ <<< "${line//$'\t'/$'\037'}"
+    [ "$ad" = "0" ] && [ "$wp" = "1" ] && CARRIED="$CARRIED$k "
+  done < "$RESTART_STATE/snapshot.tsv"
+fi
+
 now=$(date +%s)
+TMP="$SNAP.tmp.$$"
+write_ok=1
 {
   echo "# nexera-telebots snapshot  $(date '+%F %T')  dry_run=$DRY_RUN"
   printf '# %s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' key cwd state_dir proj_dir session_id was_running already_disabled we_parked session_mtime_epoch
-} > "$SNAP"
+} > "$TMP" || write_ok=0
+
+created=""; carried=""; park_failed=""
 
 printf '%-12s %-8s %-9s %-7s %s\n' "BOT" "RUNNING" "DISABLED" "PARKED" "SESSION (transcript age)"
 for key in $(fc bots); do
@@ -66,33 +124,39 @@ for key in $(fc bots); do
   proj=$(fc project-dir "$key")
   cwd=$(fc bot "$key" workdir)
 
-  sid=""; smtime=0; age_str="(no session)"
-  # transcript files are named by uuid (.jsonl) - no spaces; -t needs ls.
-  # shellcheck disable=SC2012
-  latest=$(ls -t "$proj"/*.jsonl 2>/dev/null | head -1)
-  if [ -n "$latest" ]; then
-    b=$(basename "$latest"); sid="${b%.jsonl}"
-    smtime=$(stat -f %m "$latest" 2>/dev/null || echo 0)
-    age_str="${sid} ($(( now - smtime ))s ago)"
+  resolve_session "$sdir" "$proj"
+  if [ -n "$sid" ]; then
+    age_str="${sid} ($(( now - smtime ))s ago, ${sid_note})"
+  else
+    age_str="(no session${sid_note:+: $sid_note})"
   fi
 
   pid=$(session_pid_for "$sdir")
   was_running=0; [ -n "$pid" ] && was_running=1
-  already_disabled=0; [ -f "$WD_STATE/$key.disabled" ] && already_disabled=1
 
   # Park every bot that isn't already manually disabled so the watchdog can't
-  # race the restore and start a blank session during boot.
-  we_parked=0
-  if [ $already_disabled -eq 0 ]; then
-    if [ $DRY_RUN -eq 0 ]; then
-      touch "$WD_STATE/$key.disabled" && we_parked=1
+  # race the restore and start a blank session during boot. A switch the
+  # unconsumed earlier snapshot set is the snapshot's own, not a manual disable.
+  already_disabled=0; we_parked=0
+  if [ -f "$WD_STATE/$key.disabled" ]; then
+    case "$CARRIED" in
+      *" $key "*) we_parked=1; carried="$carried $key" ;;
+      *)          already_disabled=1 ;;
+    esac
+  elif [ $DRY_RUN -eq 0 ]; then
+    if touch "$WD_STATE/$key.disabled"; then
+      we_parked=1; created="$created $key"
     else
-      we_parked=1
+      park_failed="$park_failed $key"
     fi
+  else
+    we_parked=1
   fi
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$key" "$cwd" "$sdir" "$proj" "$sid" "$was_running" "$already_disabled" "$we_parked" "$smtime" >> "$SNAP"
+  if [ $write_ok -eq 1 ]; then
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$key" "$cwd" "$sdir" "$proj" "$sid" "$was_running" "$already_disabled" "$we_parked" "$smtime" >> "$TMP" || write_ok=0
+  fi
   printf '%-12s %-8s %-9s %-7s %s\n' "$key" \
     "$([ $was_running -eq 1 ] && echo yes || echo no)" \
     "$([ $already_disabled -eq 1 ] && echo yes || echo no)" \
@@ -100,11 +164,35 @@ for key in $(fc bots); do
     "$age_str"
 done
 
+# Only a completely written snapshot replaces the file, in one rename; otherwise
+# the switches this run set are removed again, so a failed snapshot never leaves
+# the watchdog parked with nothing to restore.
+[ $write_ok -eq 1 ] && { mv -f "$TMP" "$SNAP" || write_ok=0; }
+if [ $write_ok -eq 0 ]; then
+  rm -f "$TMP" 2>/dev/null
+  undone=0
+  for key in $created; do
+    rm -f "$WD_STATE/$key.disabled" && undone=$((undone+1))
+  done
+  echo
+  echo "Snapshot FAILED: could not write $SNAP (see the error above). Nothing was saved, and the $undone watchdog switch(es) this run had just set were removed again. Do not restart yet."
+  exit 1
+fi
+
 echo
 echo "Snapshot written: $SNAP"
+if [ -n "$carried" ] && [ $DRY_RUN -eq 1 ]; then
+  echo "An earlier snapshot is still unconsumed: a real run keeps its watchdog switches for$carried as the snapshot's own."
+elif [ -n "$carried" ]; then
+  echo "Replaced an unconsumed earlier snapshot. Its watchdog switches for$carried stay the snapshot's own, so fleet-restore still re-enables the watchdog for them."
+fi
 if [ $DRY_RUN -eq 1 ]; then
   echo "DRY RUN: watchdog NOT parked. Nothing changed except this .dryrun file."
 else
   echo "Watchdog parked for the bots marked PARKED=yes - it will not start them during boot."
+  if [ -n "$park_failed" ]; then
+    echo "Snapshot saved but INCOMPLETE: the watchdog could not be parked for$park_failed (see the error above). Fix that and run fleet-snapshot again before restarting."
+    exit 1
+  fi
   echo "You're clear to restart. After you log back in, run:  fleet-restore"
 fi

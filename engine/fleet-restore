@@ -13,6 +13,14 @@
 
 set -uo pipefail
 
+# 2026-09-27 fix, reproduced on a scratch fleet first: launches are checked. An
+# osascript failure is reported and not counted as a launch, and each launched
+# bot must be seen running again (its session) within RESTORE_WAIT seconds; its
+# Telegram poller is reported too. A bot that did not launch or come back keeps
+# its watchdog switch and the snapshot is kept, not archived, so running
+# fleet-restore again retries exactly those bots (exit 1 then). Only switches the
+# snapshot set (we_parked=1) are removed, and only for bots that are up.
+
 case "${1:-}" in -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
 
 FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
@@ -29,6 +37,7 @@ DRY_RUN=0
 
 WD_STATE="$FLEET_HOME/watchdog-state"
 RESTART_STATE="$FLEET_HOME/restart-state"
+RESTORE_WAIT=120   # seconds each launched bot gets to come back before it counts as failed
 
 SNAP="$RESTART_STATE/snapshot.tsv"
 if [ $DRY_RUN -eq 1 ] && [ -f "$RESTART_STATE/snapshot.dryrun.tsv" ]; then
@@ -56,8 +65,23 @@ session_pid_for() {
   done
 }
 
-launched=0; skipped=0
+# The poller's own proof that it started after <since>: bot.pid written since
+# then naming a live process, and a heartbeat epoch since then.
+poller_live() {   # poller_live <state dir> <since epoch>
+  local sdir="$1" since="$2" bp hb
+  [ -f "$sdir/bot.pid" ] && [ -f "$sdir/poller.heartbeat" ] || return 1
+  [ "$(stat -f %m "$sdir/bot.pid" 2>/dev/null || echo 0)" -ge "$since" ] || return 1
+  bp=$(head -1 "$sdir/bot.pid" 2>/dev/null | tr -cd '0-9')
+  [ -n "$bp" ] && ps -p "$bp" -o pid= >/dev/null 2>&1 || return 1
+  hb=$(head -1 "$sdir/poller.heartbeat" 2>/dev/null | tr -cd '0-9')
+  [ -n "$hb" ] && [ "$hb" -ge "$since" ]
+}
+
+launched=0; skipped=0; failed=0
+problems=""
 to_unpark=()
+l_key=(); l_sdir=(); l_since=(); l_parked=()   # bots launched this run, still to be checked
+note_problem() { problems="${problems:+$problems; }$1"; failed=$((failed+1)); }
 
 # ---- pass 1: launch (or skip) each bot ------------------------------------
 # Parse tab-separated fields WITHOUT collapsing empties: `IFS=$'\t' read` treats
@@ -83,12 +107,12 @@ while IFS= read -r line; do
     echo "$key: was manually disabled before the snapshot -> leaving DOWN (respecting your kill switch)"
     continue
   fi
-  [ "$we_parked" = "1" ] && to_unpark+=("$key")
 
   existing=$(session_pid_for "$sdir")
   if [ -n "$existing" ]; then
     echo "$key: already running (pid=$existing) -> skip launch, no duplicate"
     skipped=$((skipped+1))
+    [ "$we_parked" = "1" ] && to_unpark+=("$key")
     continue
   fi
 
@@ -102,19 +126,29 @@ while IFS= read -r line; do
 
   if [ $DRY_RUN -eq 1 ]; then
     echo "   DRY RUN would open Terminal -> do script: $cmd"
-  else
-    /usr/bin/osascript >/dev/null 2>&1 <<OSA
+    [ "$we_parked" = "1" ] && to_unpark+=("$key")
+    continue
+  fi
+
+  since=$(date +%s)
+  osa_err=$(/usr/bin/osascript 2>&1 >/dev/null <<OSA
 tell application "Terminal"
   activate
   do script "$cmd"
 end tell
 OSA
-    launched=$((launched+1))
-    sleep 3   # stagger so windows come up one at a time
+)
+  osa_rc=$?
+  if [ $osa_rc -ne 0 ]; then
+    echo "$key: LAUNCH FAILED (osascript exit $osa_rc: ${osa_err:-no error text}) -> its watchdog switch stays on for a retry"
+    note_problem "$key did not launch"
+    continue
   fi
+  launched=$((launched+1))
+  l_key+=("$key"); l_sdir+=("$sdir"); l_since+=("$since"); l_parked+=("$we_parked")
+  sleep 3   # stagger so windows come up one at a time
 done < "$SNAP"
 
-# ---- pass 2: hand control back to the watchdog ----------------------------
 if [ $DRY_RUN -eq 1 ]; then
   for key in ${to_unpark[@]+"${to_unpark[@]}"}; do
     [ -z "$key" ] && continue
@@ -125,22 +159,70 @@ if [ $DRY_RUN -eq 1 ]; then
   exit 0
 fi
 
+# ---- pass 2: check every launch -------------------------------------------
+# A launch counts only once the bot's session is seen running again. Its Telegram
+# poller is reported too; a session that is up while its poller is not confirmed
+# yet is handed to the watchdog, which restarts a poller that stays dead.
+back=0; poller_pending=""
 if [ $launched -gt 0 ]; then
   echo
-  echo "Waiting ~25s for the bots to reconnect before re-enabling the watchdog..."
-  sleep 25
+  echo "Waiting up to ${RESTORE_WAIT}s for each launched bot to come back before re-enabling the watchdog..."
+  deadline=$(( $(date +%s) + RESTORE_WAIT ))
+  l_state=()
+  for i in "${!l_key[@]}"; do l_state[i]="down"; done
+  while :; do
+    all_live=1
+    for i in "${!l_key[@]}"; do
+      [ "${l_state[$i]}" = "live" ] && continue
+      if [ "${l_state[$i]}" = "down" ] && [ -n "$(session_pid_for "${l_sdir[$i]}")" ]; then l_state[i]="up"; fi
+      if [ "${l_state[$i]}" = "up" ] && poller_live "${l_sdir[$i]}" "${l_since[$i]}"; then l_state[i]="live"; fi
+      [ "${l_state[$i]}" = "live" ] || all_live=0
+    done
+    { [ $all_live -eq 1 ] || [ "$(date +%s)" -ge $deadline ]; } && break
+    sleep 3
+  done
+  for i in "${!l_key[@]}"; do
+    key="${l_key[$i]}"
+    case "${l_state[$i]}" in
+      live) echo "$key: back - session running, Telegram poller live" ;;
+      up)   echo "$key: back - session running, but its Telegram poller was not confirmed within ${RESTORE_WAIT}s (the watchdog takes it from here)"
+            poller_pending="${poller_pending:+$poller_pending }$key" ;;
+      *)    echo "$key: DID NOT COME BACK within ${RESTORE_WAIT}s -> its watchdog switch stays on for a retry"
+            note_problem "$key did not come back"
+            continue ;;
+    esac
+    back=$((back+1))
+    [ "${l_parked[$i]}" = "1" ] && to_unpark+=("$key")
+  done
 fi
 
+# ---- pass 3: hand control back to the watchdog ----------------------------
+# Only switches the snapshot set, and only for bots that are up. A bot that did
+# not come back keeps its switch, so nothing races a retry.
 unparked=0
 for key in ${to_unpark[@]+"${to_unpark[@]}"}; do
   [ -z "$key" ] && continue
-  rm -f "$WD_STATE/$key.disabled" && unparked=$((unparked+1))
+  [ -f "$WD_STATE/$key.disabled" ] || continue
+  if rm -f "$WD_STATE/$key.disabled"; then
+    unparked=$((unparked+1))
+  else
+    note_problem "could not re-enable the watchdog for $key"
+  fi
 done
 
-# Snapshot consumed - archive it so a stale snapshot can't be reused by accident.
-mv "$SNAP" "$SNAP.used.$(date +%s)" 2>/dev/null || true
-
 echo
-echo "Restore complete: $launched launched, $skipped already-up, watchdog re-enabled for $unparked bots."
-echo "Give the bots up to a minute to finish reconnecting Telegram."
-echo "If a bot was mid-task when you restarted, send it 'continue' to pick up where it left off."
+if [ $failed -eq 0 ]; then
+  # Snapshot consumed - archive it so a stale snapshot can't be reused by accident.
+  if ! mv "$SNAP" "$SNAP.used.$(date +%s)"; then
+    echo "Restore INCOMPLETE: every bot is up, but the snapshot could not be archived. Rename $SNAP by hand."
+    exit 1
+  fi
+  echo "Restore complete: $launched launched, $skipped already-up, watchdog re-enabled for $unparked bots."
+  [ -n "$poller_pending" ] && echo "Telegram poller not confirmed yet for: $poller_pending. The watchdog now watches them."
+  echo "Give the bots up to a minute to finish reconnecting Telegram."
+  echo "If a bot was mid-task when you restarted, send it 'continue' to pick up where it left off."
+  exit 0
+fi
+echo "Restore ran: $launched launched ($back back), $skipped already-up, watchdog re-enabled for $unparked bots."
+echo "Restore INCOMPLETE: $problems. The snapshot was kept at $SNAP and those bots' watchdog switches stay on. Run fleet-restore again to retry them."
+exit 1
