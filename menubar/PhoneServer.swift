@@ -63,6 +63,18 @@ enum PhoneSecurity {
         return isToken(token) ? token : nil
     }
 
+    static func ownerOnlyResource(method: String, path: String) -> Bool {
+        method == "GET" && ["/", "/manifest.webmanifest", "/icon-180.png", "/icon-512.png", "/apple-touch-icon.png"].contains(path)
+    }
+
+    /// Shared by the live handler and the offline authorization matrix.
+    static func accessStatus(method: String, path: String, ownerVerified: Bool,
+                             authorization: String?, expectedToken: String) -> Int {
+        guard ownerVerified else { return 403 }
+        if ownerOnlyResource(method: method, path: path) { return 200 }
+        return tokenMatches(bearerToken(authorization), expected: expectedToken) ? 200 : 401
+    }
+
     private static func identifier(_ value: Any?) -> String? {
         if let number = value as? NSNumber {
             guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
@@ -136,7 +148,7 @@ enum PhoneSecurity {
         if let site = headers["sec-fetch-site"], site != "same-origin" && site != "none" {
             // Following the phone link from another website is a document
             // navigation, not an API request. The handler grants this exception
-            // only to GET /, and both identity and bearer checks still apply.
+            // only to GET /. Resource authorization is checked separately.
             guard navigation, site == "cross-site" || site == "same-site", headers["origin"] == nil,
                   headers["sec-fetch-mode"] == "navigate", headers["sec-fetch-dest"] == "document" else { return false }
         }
@@ -561,9 +573,9 @@ final class PhoneServer {
         return allowed
     }
 
-    private func denied(_ status: Int, _ reason: String, fd: Int32, source: String, body: PhoneResponse? = nil) {
+    private func denied(_ status: Int, _ reason: String, fd: Int32, source: String) {
         ActionLog.shared.writePhone("phone denied source \(source): \(reason) (\(status))")
-        send(body ?? .json(status, ["error": reason]), to: fd)
+        send(.json(status, ["error": reason]), to: fd)
     }
 
     private func handle(_ fd: Int32, source: String) {
@@ -575,31 +587,34 @@ final class PhoneServer {
         securityLock.lock()
         let own = identity, expected = token
         securityLock.unlock()
-        guard let own, let expected, ownerAllows(source, identity: own) else {
+        guard let own, let expected else {
             denied(403, "This device is not the Mac owner's Tailscale peer", fd: fd, source: source); return
         }
-        guard PhoneSecurity.sameOrigin(headers: request.headers, identity: own,
-                                      navigation: request.method == "GET" && request.path == "/") else {
-            denied(403, "Request origin is not this phone link", fd: fd, source: source); return
+        let access = PhoneSecurity.accessStatus(method: request.method, path: request.path,
+            ownerVerified: ownerAllows(source, identity: own), authorization: request.headers["authorization"], expectedToken: expected)
+        guard access != 403 else {
+            denied(403, "This device is not the Mac owner's Tailscale peer", fd: fd, source: source); return
         }
-        guard PhoneSecurity.tokenMatches(PhoneSecurity.bearerToken(request.headers["authorization"]), expected: expected) else {
-            // A browser navigation cannot set Authorization. Its 401 bootstrap has
-            // no app data and trades the fragment for an authenticated HTML fetch.
-            let bootstrap = request.method == "GET" && request.path == "/"
-                ? PhoneResponse(status: 401, body: Self.bootstrap, contentType: "text/html; charset=utf-8") : nil
-            denied(401, "Open the current phone link from Telebots Bar", fd: fd, source: source, body: bootstrap); return
+        let ownerOnly = PhoneSecurity.ownerOnlyResource(method: request.method, path: request.path)
+        if !ownerOnly {
+            guard PhoneSecurity.sameOrigin(headers: request.headers, identity: own) else {
+                denied(403, "Request origin is not this phone link", fd: fd, source: source); return
+            }
+            guard access == 200 else {
+                denied(401, "Open the current phone link from Telebots Bar", fd: fd, source: source); return
+            }
         }
         securityLock.lock()
-        let stillAuthorized = identity == own && token == expected
+        let stillAuthorized = identity == own && (ownerOnly || token == expected)
         securityLock.unlock()
         guard stillAuthorized else { denied(401, "Phone link changed; open the current link", fd: fd, source: source); return }
         let response: PhoneResponse
         switch (request.method, request.path) {
         case ("GET", "/"): response = PhoneResponse(status: 200, body: page, contentType: "text/html; charset=utf-8")
         case ("GET", "/manifest.webmanifest"):
-            response = PhoneResponse(status: 200, body: Self.manifest, contentType: "application/manifest+json; charset=utf-8")
-        case ("GET", "/icon-180.png"), ("GET", "/icon-512.png"):
-            let size = request.path == "/icon-180.png" ? 180 : 512
+            response = PhoneResponse(status: 200, body: Self.manifest, contentType: "application/manifest+json")
+        case ("GET", "/icon-180.png"), ("GET", "/icon-512.png"), ("GET", "/apple-touch-icon.png"):
+            let size = request.path == "/icon-512.png" ? 512 : 180
             guard let icon = icons[size] else { denied(404, "Icon unavailable", fd: fd, source: source); return }
             response = PhoneResponse(status: 200, body: icon, contentType: "image/png")
         case ("GET", "/api/state"):
@@ -646,16 +661,11 @@ final class PhoneServer {
     }
 
     // iOS can add an HTTP page to its home screen. A service worker is neither
-    // available on plain HTTP nor needed. The page hydrates protected install
-    // assets as data URLs because Safari's icon/manifest fetches omit Authorization.
+    // available on plain HTTP nor needed. Static assets require the owner check.
+    // Omit start_url so the installing document's URL carries its fragment into
+    // standalone storage without putting a token in this shared manifest.
     private static let manifest = Data("""
-    {"id":"/","name":"Telebots","short_name":"Telebots","start_url":"/","scope":"/","display":"standalone","background_color":"#131313","theme_color":"#131313","icons":[{"src":"/icon-180.png","sizes":"180x180","type":"image/png"},{"src":"/icon-512.png","sizes":"512x512","type":"image/png","purpose":"any maskable"}]}
-    """.utf8)
-
-    private static let bootstrap = Data("""
-    <!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="referrer" content="no-referrer"><title>Telebots</title><style>:root{color-scheme:light dark}body{margin:0;min-height:100dvh;display:grid;place-items:center;padding:0 28px;box-sizing:border-box;font:17px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;background:#f4f4f4;color:#161616;text-align:center}@media(prefers-color-scheme:dark){body{background:#111;color:#ededed}}</style><body><p role="status" id="status">Opening Telebots</p><script>
-    (async()=>{const message=document.getElementById('status');let token='';try{const given=new URLSearchParams(location.hash.slice(1)).get('t');if(given&&/^[a-f0-9]{64}$/.test(given)){localStorage.setItem('telebots.phoneToken',given)}if(navigator.standalone||matchMedia('(display-mode: standalone)').matches){history.replaceState(null,'',location.pathname)}token=localStorage.getItem('telebots.phoneToken')||''}catch{message.textContent='Allow website storage, then open the current phone link from Telebots Bar.';return}if(!/^[a-f0-9]{64}$/.test(token)){message.textContent='Open the current phone link from Telebots Bar.';return}try{const response=await fetch('/',{headers:{Authorization:'Bearer '+token},cache:'no-store',credentials:'omit',redirect:'error'});if(!response.ok){message.textContent='Open the current phone link from Telebots Bar.';return}const html=await response.text();document.open();document.write(html);document.close()}catch{message.textContent='Turn on Tailscale on this phone, then pull to refresh'}})();
-    </script></body></html>
+    {"id":"/","name":"Telebots","short_name":"Telebots","scope":"/","display":"standalone","background_color":"#131313","theme_color":"#131313","icons":[{"src":"/icon-180.png","sizes":"180x180","type":"image/png"},{"src":"/icon-512.png","sizes":"512x512","type":"image/png","purpose":"any maskable"}]}
     """.utf8)
 }
 

@@ -83,6 +83,34 @@ enum PhoneServerTests {
             check("different or missing login denied", !PhoneSecurity.sameOwner(source: peerIP, whois: json(["Node": goodNode, "UserProfile": user]), identity: identity))
         }
 
+        let verifiedOwner = PhoneSecurity.sameOwner(source: peerIP, whois: json(whois), identity: identity)
+        let nonOwner = PhoneSecurity.sameOwner(source: peerIP, whois: json(["Node": goodNode,
+            "UserProfile": ["ID": userID, "LoginName": "other@example.test"]]), identity: identity)
+        func access(_ method: String, _ path: String, _ owner: Bool, _ authorization: String? = nil) -> Int {
+            PhoneSecurity.accessStatus(method: method, path: path, ownerVerified: owner,
+                authorization: authorization, expectedToken: token)
+        }
+        for path in ["/", "/manifest.webmanifest", "/icon-180.png", "/icon-512.png", "/apple-touch-icon.png"] {
+            check("owner static GET without token: \(path)", access("GET", path, verifiedOwner) == 200)
+            check("owner static GET ignores stale token: \(path)", access("GET", path, verifiedOwner, "Bearer stale") == 200)
+            check("non-owner static GET denied: \(path)", access("GET", path, nonOwner) == 403)
+            check("non-owner static GET with token denied: \(path)", access("GET", path, nonOwner, "Bearer " + token) == 403)
+            check("POST cannot use static exemption: \(path)", access("POST", path, verifiedOwner) == 401)
+        }
+        for (method, path) in [("GET", "/api/state"), ("POST", "/api/action"), ("GET", "/api/unknown")] {
+            check("owner API without token denied: \(path)", access(method, path, verifiedOwner) == 401)
+            check("owner API with valid token allowed: \(path)", access(method, path, verifiedOwner, "Bearer " + token) == 200)
+            check("owner API with wrong token denied: \(path)", access(method, path, verifiedOwner, "Bearer " + String(repeating: "0", count: 64)) == 401)
+            check("non-owner API denied: \(path)", access(method, path, nonOwner) == 403)
+            check("non-owner API with token denied: \(path)", access(method, path, nonOwner, "Bearer " + token) == 403)
+        }
+        let failedWhois = PhoneSecurity.sameOwner(source: peerIP, whois: nil, identity: identity)
+        let nonTailnet = PhoneSecurity.sameOwner(source: "127.0.0.1", whois: json(whois), identity: identity)
+        for owner in [failedWhois, nonTailnet] {
+            check("unverified source cannot load page", access("GET", "/", owner, "Bearer " + token) == 403)
+            check("unverified source cannot read API", access("GET", "/api/state", owner, "Bearer " + token) == 403)
+        }
+
         let host = "test-mac.example.ts.net:8477"
         check("local host allowed", PhoneSecurity.sameOrigin(headers: ["host": host], identity: identity))
         check("IP host allowed", PhoneSecurity.sameOrigin(headers: ["host": ownIP + ":8477"], identity: identity))

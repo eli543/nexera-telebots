@@ -14,8 +14,8 @@ enum PhonePage {
 <meta name="apple-mobile-web-app-title" content="Telebots">
 <meta name="referrer" content="no-referrer">
 <title>Telebots</title>
-<link id="app-manifest" rel="manifest">
-<link id="app-icon" rel="apple-touch-icon" sizes="180x180">
+<link id="app-manifest" rel="manifest" href="/manifest.webmanifest">
+<link id="app-icon" rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
 <style>
 :root {
   color-scheme: light dark;
@@ -221,6 +221,7 @@ dialog p { font-size: 14px; line-height: 1.55; margin: 0 0 20px; }
 (async () => {
   'use strict';
   const storageKey = 'telebots.phoneToken';
+  const missingTokenMessage = 'No link token. Open the link you were sent once so this phone learns it.';
   const $ = id => document.getElementById(id);
   const app = $('app');
   const quiet = $('quiet');
@@ -235,8 +236,6 @@ dialog p { font-size: 14px; line-height: 1.55; margin: 0 0 20px; }
   let sheetAction = null;
   let sheetTrigger = null;
   let localError = '';
-  let installAssetsReady = false;
-  let installingAssets = false;
   let nextRowID = 0;
   const icons = {
     pulse: '<svg width="13" height="13" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 10h4l2-5 4 10 2-5h6"/></svg>',
@@ -247,11 +246,14 @@ dialog p { font-size: 14px; line-height: 1.55; margin: 0 0 20px; }
   };
 
   try { token = localStorage.getItem(storageKey) || ''; } catch (_) { }
-  const fragmentToken = new URLSearchParams(location.hash.slice(1)).get('t');
-  if (fragmentToken && /^[a-f0-9]{64}$/i.test(fragmentToken)) {
+  function learnFragmentToken() {
+    const fragmentToken = new URLSearchParams(location.hash.slice(1)).get('t');
+    if (!fragmentToken || !/^[a-f0-9]{64}$/i.test(fragmentToken)) return false;
     token = fragmentToken.toLowerCase();
     try { localStorage.setItem(storageKey, token); } catch (_) { }
+    return true;
   }
+  learnFragmentToken();
   // Home-screen WebKit can have separate storage. Keep the fragment in Safari
   // until installation, then remove it once the standalone app has saved it.
   const standalone = navigator.standalone === true || window.matchMedia('(display-mode: standalone)').matches;
@@ -498,7 +500,7 @@ dialog p { font-size: 14px; line-height: 1.55; margin: 0 0 20px; }
   async function refresh() {
     if (document.hidden) return;
     if (!/^[a-f0-9]{64}$/.test(token)) {
-      showQuiet('Open the current phone link from Telebots Bar.');
+      showQuiet(missingTokenMessage);
       return;
     }
     if (polling) { refreshQueued = true; return polling; }
@@ -510,7 +512,6 @@ dialog p { font-size: 14px; line-height: 1.55; margin: 0 0 20px; }
         if (!Array.isArray(next.bots) || !next.watchdog || !next.snapshot) throw new Error('Incomplete state');
         state = next;
         render();
-        if (!installAssetsReady && !installingAssets) void installAssets();
       } catch (error) {
         fail(error);
       } finally {
@@ -557,43 +558,6 @@ dialog p { font-size: 14px; line-height: 1.55; margin: 0 0 20px; }
     }
   }
 
-  function dataURL(blob) {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result);
-      reader.onerror = () => reject(reader.error);
-      reader.readAsDataURL(blob);
-    });
-  }
-
-  async function installAssets() {
-    installingAssets = true;
-    try {
-      const [manifestResponse, smallResponse, largeResponse] = await Promise.all([
-        request('/manifest.webmanifest'), request('/icon-180.png'), request('/icon-512.png')
-      ]);
-      const manifest = await manifestResponse.json();
-      const [small, large] = await Promise.all([dataURL(await smallResponse.blob()), dataURL(await largeResponse.blob())]);
-      // This fragment is only in the authenticated in-memory manifest. It never
-      // enters an HTTP request, and initializes isolated home-screen storage.
-      manifest.start_url = location.origin + '/#t=' + encodeURIComponent(token);
-      manifest.scope = location.origin + '/';
-      manifest.id = location.origin + '/';
-      manifest.icons = [
-        { src: small, sizes: '180x180', type: 'image/png', purpose: 'any' },
-        { src: large, sizes: '512x512', type: 'image/png', purpose: 'any' }
-      ];
-      $('app-icon').href = small;
-      const manifestData = new Blob([JSON.stringify(manifest)], { type: 'application/manifest+json' });
-      $('app-manifest').href = await dataURL(manifestData);
-      installAssetsReady = true;
-    } catch (error) {
-      fail(error);
-    } finally {
-      installingAssets = false;
-    }
-  }
-
   $('legend-toggle').addEventListener('click', () => {
     const open = $('legend').hidden;
     $('legend').hidden = !open;
@@ -619,6 +583,11 @@ dialog p { font-size: 14px; line-height: 1.55; margin: 0 0 20px; }
   $('refresh').addEventListener('click', () => { localError = ''; void refresh(); });
   document.addEventListener('visibilitychange', () => { if (!document.hidden) void refresh(); });
   window.addEventListener('pageshow', () => { if (!document.hidden) void refresh(); });
+  window.addEventListener('hashchange', () => {
+    if (!learnFragmentToken()) return;
+    if (standalone) history.replaceState(null, '', location.pathname + location.search);
+    void refresh();
+  });
   window.addEventListener('online', () => void refresh());
   let touchStart = null;
   document.addEventListener('touchstart', event => {
@@ -629,7 +598,7 @@ dialog p { font-size: 14px; line-height: 1.55; margin: 0 0 20px; }
     touchStart = null;
   }, { passive: true });
   setInterval(() => { if (!document.hidden) void refresh(); }, 5000);
-  if (!/^[a-f0-9]{64}$/.test(token)) showQuiet('Open the current phone link from Telebots Bar.');
+  if (!/^[a-f0-9]{64}$/.test(token)) showQuiet(missingTokenMessage);
   else await refresh();
 })();
 </script>

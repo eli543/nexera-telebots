@@ -97,19 +97,23 @@ records the rotation and the address with the token redacted.
 
 Security: the server accepts only a Tailscale address whose `whois` identity
 matches the Mac's own login, with successful checks cached for ten minutes and
-lookup failures denied. Every successful response also needs the 32-byte bearer
-token; the only token-free page is an HTTP 401 sign-in shell for an owner device,
-which contains no fleet data and fetches the real page with the header. Actions
+lookup failures denied. The static page, manifest and icons need only that owner
+check and contain no fleet data or token; every API request also needs the
+32-byte bearer token. Actions
 use the panel's identity checks, deadlines, per-bot single-flight guard and
 ten-second cooldown, and denied requests and action results are logged in ET
 without tokens.
 
-The page fetches its manifest and both generated PNG icons with the same bearer
-header, then attaches them as local data URLs because browser icon and manifest
-requests cannot set that header themselves. It includes Apple's standalone meta
-tags and touch-icon link. This is manual Add to Home Screen over HTTP, with no
-TLS, service worker, or offline fleet cache. The browser's initial navigation is
-expected to return 401 before the script makes the authenticated request.
+The page links directly to `/manifest.webmanifest` and `/apple-touch-icon.png`.
+Safari can fetch these and both PNG icons without an Authorization header after
+the owner check. The manifest keeps `display: standalone` and leaves `start_url`
+unset so installation uses the current page URL, including its setup fragment,
+as defined by the [manifest standard](https://www.w3.org/TR/appmanifest/#start_url-member).
+The page includes Apple's standalone meta tags, and the page and API use
+`Cache-Control: no-store`. This is manual Add to Home Screen over HTTP, with no
+TLS, service worker, or offline fleet cache. Without a saved token or setup
+fragment, the page says "No link token. Open the link you were sent once so this
+phone learns it." and makes no API request.
 
 The phone never opens a Mac permission prompt. If Terminal access has not been
 granted, the action stops and the same error appears in the phone and Mac rows.
