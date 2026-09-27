@@ -145,4 +145,104 @@ if [ "$(fc option grid 2>/dev/null || echo false)" = "true" ]; then
   fi
 fi
 
+# >>> clear-stale-telegram-mcp-failure (2026-09-27)
+# Launch-side immunity to a "deaf restart". Any Claude Code session that loads the
+# telegram plugin WITHOUT TELEGRAM_STATE_DIR (a headless `claude -p` job, or a bare
+# `claude mcp list` / `claude mcp get` from a plain shell) makes the patched plugin
+# exit on purpose (patches/01-state-dir-guard.patch), and Claude Code caches that
+# failure in mcp-needs-auth-cache.json under "plugin:telegram:telegram". For the
+# next 15 minutes every NEW session on the machine skips the plugin, so a bot
+# launched in that window comes up with no poller and hears nothing. This removes
+# ONLY that one key, right before claude starts: never the file, never another key.
+# The write is atomic (temp file + rename, same mode). A missing, empty or invalid
+# file just logs one line and the launch goes on. The path follows Claude Code's
+# own (CLAUDE_CONFIG_DIR, else ~/.claude); an optional first argument overrides it
+# for tests. Needs python3, which fleet-config already requires.
+clear_stale_telegram_mcp_failure() {
+  local cache="${1:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/mcp-needs-auth-cache.json}"
+  local py=/usr/bin/python3
+  [ -x "$py" ] || py="$(command -v python3 2>/dev/null || true)"
+  if [ -z "$py" ]; then
+    echo "mcp-cache: python3 not found - skipped the stale telegram entry check, launching anyway" >&2
+    return 0
+  fi
+  "$py" - "$cache" <<'PY' || echo "mcp-cache: clear step exited $? - launching anyway" >&2
+import json
+import os
+import sys
+import tempfile
+import time
+
+KEY = "plugin:telegram:telegram"
+
+
+def say(msg):
+    sys.stderr.write("mcp-cache: " + msg + "\n")
+
+
+def main(path):
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except FileNotFoundError:
+        say("no " + path + " - nothing to clear")
+        return
+    except OSError as exc:
+        say("could not read " + path + " (" + type(exc).__name__ + ") - left as is, launching anyway")
+        return
+    if not raw.strip():
+        say(path + " is empty - left as is, launching anyway")
+        return
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        say(path + " is not valid JSON - left as is, launching anyway")
+        return
+    if not isinstance(data, dict):
+        say(path + " is not a JSON object - left as is, launching anyway")
+        return
+    if KEY not in data:
+        say("no stale " + KEY + " entry - nothing to clear")
+        return
+    entry = data.pop(KEY)
+    age = ""
+    ts = entry.get("timestamp") if isinstance(entry, dict) else None
+    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+        age = " (cached %ds ago)" % int(time.time() - ts / 1000.0)
+    target = os.path.realpath(path)
+    tmp = None
+    try:
+        mode = os.stat(target).st_mode & 0o7777
+        fd, tmp = tempfile.mkstemp(prefix=".mcp-needs-auth-cache.", suffix=".tmp", dir=os.path.dirname(target))
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, target)
+        tmp = None
+    except OSError as exc:
+        say("could not rewrite " + path + " (" + type(exc).__name__ + ") - left as is, launching anyway")
+        return
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    left = len(data)
+    say("cleared a stale %s entry%s, kept %d other %s" % (KEY, age, left, "entry" if left == 1 else "entries"))
+
+
+try:
+    main(sys.argv[1])
+except Exception as exc:
+    say("clear step hit " + type(exc).__name__ + " - launching anyway")
+sys.exit(0)
+PY
+  return 0
+}
+# <<< clear-stale-telegram-mcp-failure
+clear_stale_telegram_mcp_failure
+
 exec claude "${ARGS[@]}"
