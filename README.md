@@ -176,7 +176,7 @@ which does message round-trip, pairing and allowlist access control, and the
 | Live meters: plan limits left, context fill, token burn | No | Yes, `/usage` and `/context`, computed outside the model |
 | A real "/" command menu | Dead `/start` `/help` `/status` boilerplate | The actual command list, re-registered on every poller start |
 | Keeps bots alive with a watchdog | No. "Events only arrive while the session is open" | Yes, launchd plus auto-resume into the same conversation |
-| See and fix the fleet from the Mac menu bar | No | Yes, the optional [Telebots Bar](menubar/README.md): live status per bot, one-click Reconnect, the watchdog switch, snapshot and restore |
+| See and fix the fleet from the Mac menu bar or your phone | No | Yes, the optional [Telebots Bar](menubar/README.md): live status, Reconnect, watchdog, snapshot and restore, plus an iPhone home-screen page over Tailscale |
 | Survives a reboot with exact conversations | No | Yes, snapshot and restore |
 | Multi-bot | Manual multi-instance, separate allowlists | Managed fleet, one shared brain |
 

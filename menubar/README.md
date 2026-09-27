@@ -60,6 +60,74 @@ only after a crash, so Quit still quits), loads it, and only reports success onc
 launchd's own pid for the job runs this app with `--launchd` and holds the app's
 single-copy lock. Needs Xcode or the Command Line Tools for `swiftc`.
 
+## Phone
+
+The same fleet panel works on an iPhone through Tailscale. The Mac must be awake,
+signed in to Tailscale, and running Telebots Bar. The phone must use the same
+Tailscale login as the Mac.
+
+`install.sh` starts the app with `--serve`. A manual launch can use `--serve`,
+or `menubar.serve: true` in fleet.json. Without either, serving defaults on only
+when `$FLEET_HOME/phone-token` already exists. An explicit flag takes precedence
+over the config. The token is made on first serve and is removed by uninstall.
+
+The link looks like `http://<mac-magicdns-name>:8477/#t=<phone-token>`. The app
+gets its address and DNS name from the Tailscale CLI at runtime. When MagicDNS
+is off it uses the Mac's Tailscale IPv4 address instead. It binds only that
+address, never localhost or the Wi-Fi address. When Tailscale is off, the legend
+reads "Phone link: waiting for Tailscale" and the app checks again every 30 seconds.
+
+1. Turn on Tailscale on the iPhone and open the full phone link in Safari.
+2. Wait for the fleet to appear. Tap Share, then Add to Home Screen, then Add.
+3. Open Telebots from the home screen once with Tailscale still on.
+
+The phone saves the token locally. Safari keeps the link fragment until the app
+has been added because home-screen apps have their own storage; the standalone
+app removes it after saving it. Later launches use that stored token. Turn the
+phone's Tailscale toggle off whenever you like. When a request cannot reach the
+Mac, the page shows only "Turn on Tailscale on this phone, then pull to refresh".
+Turn Tailscale on and pull down, or reopen Telebots. On a cold launch while the
+VPN is off, Safari may show its own connection error before the page can load.
+The page checks every five seconds while visible and after each action.
+
+In the Mac panel, open the `?` legend and choose Rotate phone link. It replaces
+the token and copies the new link to the clipboard. The old link stops working;
+open the new one on the phone and replace the old home-screen shortcut. The log
+records the rotation and the address with the token redacted.
+
+Security: the server accepts only a Tailscale address whose `whois` identity
+matches the Mac's own login, with successful checks cached for ten minutes and
+lookup failures denied. Every successful response also needs the 32-byte bearer
+token; the only token-free page is an HTTP 401 sign-in shell for an owner device,
+which contains no fleet data and fetches the real page with the header. Actions
+use the panel's identity checks, deadlines, per-bot single-flight guard and
+ten-second cooldown, and denied requests and action results are logged in ET
+without tokens.
+
+The page fetches its manifest and both generated PNG icons with the same bearer
+header, then attaches them as local data URLs because browser icon and manifest
+requests cannot set that header themselves. It includes Apple's standalone meta
+tags and touch-icon link. This is manual Add to Home Screen over HTTP, with no
+TLS, service worker, or offline fleet cache. The browser's initial navigation is
+expected to return 401 before the script makes the authenticated request.
+
+The phone never opens a Mac permission prompt. If Terminal access has not been
+granted, the action stops and the same error appears in the phone and Mac rows.
+Grant Telebots Bar access in System Settings > Privacy & Security > Automation
+on the Mac before trying again.
+
+API: `GET /api/state` returns the store's rows, numeric indicators, watchdog,
+Telegram, snapshot, server time, notes and action receipts. `POST /api/action`
+accepts only `reconnect`, `fresh`, `reconnect_all_down`, `watchdog_on`,
+`watchdog_off`, `snapshot`, and `restore`; use `bot` for a single bot and
+`confirm: true` for Fresh start or a connected bot's Reconnect. An accepted
+request returns `action_id` and progresses in `/api/state`; malformed requests
+return 400, a missing token 401, an unverified peer 403, a busy action 409 and a
+cooldown 429. Snapshot pauses auto-recovery just as the native button does.
+
+Run `Telebots Bar --phone-self-test` for offline address, identity, token, HTTP
+parser and action-guard tests. The tests never restart a bot or read a live token.
+
 Only one copy runs per user: the app takes an exclusive lock on
 `~/Library/Application Support/Telebots Bar/instance.lock`, which the system
 releases when the process ends, crash or not. A second copy started by hand quits
@@ -126,6 +194,8 @@ block in `fleet.json` (other tools ignore it):
 | Key | Default |
 |---|---|
 | `fresh_engine` | `$FLEET_HOME/bin/fleet-fresh`, else `fleet-fresh` on the PATH |
+| `fresh_engine_log` | unset; optional engine log used to record its own Back and ready report, without claiming a Telegram receipt |
+| `serve` | on when `$FLEET_HOME/phone-token` exists; `--serve` always enables it |
 | `watchdog_state_dir` | `$FLEET_HOME/watchdog-state`, as in `daemon/watchdog.sh` |
 | `watchdog_log` | `$FLEET_HOME/logs/watchdog.log`, as in `daemon/watchdog.sh` |
 | `heartbeat_max_age` | `180` seconds, the limit in `daemon/watchdog.sh`; set it to match your watchdog |

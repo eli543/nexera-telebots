@@ -268,6 +268,13 @@ struct FleetRow: Identifiable, Equatable {
     var stall: Bool
     var uptimeLine: String?         // shown when the row is expanded
     var pulse: Int
+    var heartbeatAgeSeconds: Int? = nil
+    var model: String? = nil
+    var effort: String? = nil
+    var contextPercent: Int? = nil
+    var restartsLastHour: Int = 0
+    var sessionStarted: TimeInterval? = nil
+    var launchMode: String = "not running"
     var connected: Bool { state == .connected }
 }
 
@@ -302,6 +309,7 @@ struct RefreshResult {
     var snapshotTip = "No snapshot saved"
     var reachable: Bool?
     var windowNote: String?
+    var signals: FleetSignals?
 }
 
 /// The refresh work: the process scan, transcript reads and the network probe. It
@@ -346,6 +354,7 @@ final class RefreshWorker: @unchecked Sendable {
         let now = Int(Date().timeIntervalSince1970)
         let table = ProcessTable.snapshot()
         let signals = FleetModel.signals(cfg, now: now)
+        result.signals = signals
         var reachable = signals.telegramReachable
         if reachable == nil {
             reachable = currentProbe()
@@ -542,7 +551,10 @@ final class RefreshWorker: @unchecked Sendable {
         }
         return FleetRow(id: h.bot.key, name: h.bot.name, state: h.state, statusText: status, statusIcon: icon,
                         statusTip: tip, dumpStatus: dump, spokenStatus: spoken, detailLine: detailLine, detailTip: detailTip,
-                        stall: ind.stallSuspected, uptimeLine: uptimeLine, pulse: 0)
+                        stall: ind.stallSuspected, uptimeLine: uptimeLine, pulse: 0,
+                        heartbeatAgeSeconds: h.heartbeatAge, model: ind.model, effort: ind.effort,
+                        contextPercent: ind.contextPercent, restartsLastHour: ind.restartsLastHour,
+                        sessionStarted: ind.sessionStarted, launchMode: ind.launchMode)
     }
 }
 
@@ -571,6 +583,8 @@ final class FleetStore: ObservableObject {
     @Published private(set) var notes: [String: RowNote] = [:]
     /// The bottom group's own lasting line: a switch, snapshot or restore that failed.
     @Published private(set) var footerNote: RowNote?
+    @Published private(set) var phoneStatus = "Phone link: off"
+    @Published private(set) var phoneBaseURL: String?
 
     let mode: Mode
     private(set) var config: FleetConfig?
@@ -582,6 +596,14 @@ final class FleetStore: ObservableObject {
     private var lastHeaderProblem: String?
     private var loggedWarnings: [String] = []
     private var confirmationToken = 0
+    private var phoneServer: PhoneServer?
+    private var phoneAllowed = false
+    private var phoneForced = false
+    private var latestSignals: FleetSignals?
+    private var phoneStateWaiters: [(Data) -> Void] = []
+    private var actionGate = PhoneActionGate()
+    private var phoneActions: [[String: Any]] = []
+    private var phoneActionBots: [String: Set<String>] = [:]
     private let worker = RefreshWorker()
     private var refreshing = false
     private var refreshPending = false
@@ -649,7 +671,7 @@ final class FleetStore: ObservableObject {
         reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     }
 
-    func stop() { worker.stop() }
+    func stop() { worker.stop(); phoneServer?.stop() }
 
     func logStartup(owner: String) {
         guard actionsLive else { return }
@@ -711,6 +733,14 @@ final class FleetStore: ObservableObject {
     }
 
     private func apply(_ result: RefreshResult, reason: String?) {
+        defer {
+            if !phoneStateWaiters.isEmpty {
+                let callbacks = phoneStateWaiters
+                phoneStateWaiters.removeAll()
+                let data = phoneStateData()
+                callbacks.forEach { $0(data) }
+            }
+        }
         if let message = result.configProblem {
             config = nil
             problem = message
@@ -718,6 +748,9 @@ final class FleetStore: ObservableObject {
             watchdog = nil
             header = nil
             marks = []
+            phoneServer?.stop()
+            phoneServer = nil
+            phoneStatus = "Phone link: fleet config problem"
             if message != lastProblem { log("config problem: \(message)") }
             lastProblem = message
             onChange?()
@@ -731,6 +764,7 @@ final class FleetStore: ObservableObject {
             loggedWarnings = cfg.warnings
         }
         config = cfg
+        updatePhoneServing()
         problem = nil
         ActionLog.shared.setTimeZone(cfg.settings.timeZone)
         timeOfDay.timeZone = cfg.settings.timeZone
@@ -756,6 +790,7 @@ final class FleetStore: ObservableObject {
         marks = result.marks
         snapshotAvailable = result.snapshotAvailable
         snapshotTip = result.snapshotTip
+        latestSignals = result.signals
         if let note = result.windowNote { log(note) }
         if let odd = result.watchdog?.odd, !odd.isEmpty, didFirstRefresh == false {
             log("watchdog: not regular files, ignored like the watchdog ignores them: " + odd.joined(separator: ", "))
@@ -818,11 +853,186 @@ final class FleetStore: ObservableObject {
 
     // MARK: Actions
 
+    // MARK: Phone
+
+    func allowPhoneServing(forced: Bool) {
+        phoneAllowed = mode == .live
+        phoneForced = forced
+        updatePhoneServing()
+    }
+
+    private func updatePhoneServing() {
+        guard phoneAllowed, let cfg = config else { return }
+        let enabled = phoneForced || (cfg.settings.serve ?? isRegularFile(FleetPaths.fleetHome + "/phone-token"))
+        if !enabled {
+            phoneServer?.stop()
+            phoneServer = nil
+            phoneStatus = "Phone link: off"
+            phoneBaseURL = nil
+            return
+        }
+        guard phoneServer == nil else { return }
+        let icons = [180, 512].reduce(into: [Int: Data]()) { result, size in
+            result[size] = DotArt.appIcon(pixels: size)?.representation(using: .png, properties: [:])
+        }
+        let server = PhoneServer(page: Data(PhonePage.html.utf8), icons: icons, state: { [weak self] reply in
+            Task { @MainActor in
+                guard let self else { return reply(Data("{}".utf8)) }
+                self.phoneStateWaiters.append(reply)
+                self.refresh()
+            }
+        }, action: { [weak self] body, reply in
+            Task { @MainActor in
+                guard let self else { return reply(Self.phoneResponse(503, error: "App is stopping")) }
+                reply(self.phoneAction(body))
+            }
+        }, status: { [weak self] text, url in
+            Task { @MainActor in
+                self?.phoneStatus = text
+                self?.phoneBaseURL = url
+            }
+        })
+        phoneServer = server
+        server.start()
+    }
+
+    func rotatePhoneLink() {
+        phoneServer?.rotate { [weak self] url in
+            Task { @MainActor in
+                guard let self else { return }
+                if let url {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(url, forType: .string)
+                    self.confirm("New phone link copied")
+                } else {
+                    self.footerNote = RowNote(text: "Phone link could not be copied. Check Tailscale and menubar.log.",
+                                              isError: true, at: Date().timeIntervalSince1970, session: nil)
+                }
+            }
+        }
+    }
+
+    private static func phoneResponse(_ status: Int, error: String) -> PhoneResponse {
+        PhoneResponse(status: status, body: (try? JSONSerialization.data(withJSONObject: ["error": error])) ?? Data(),
+                      contentType: "application/json; charset=utf-8")
+    }
+
+    private func phoneStateData() -> Data {
+        let now = Date().timeIntervalSince1970
+        func nullable<T>(_ value: T?) -> Any { value.map { $0 as Any } ?? NSNull() }
+        let bots: [[String: Any]] = rows.map { row in
+            let note = notes[row.id]
+            return ["key": row.id, "name": row.name,
+                    "state": inFlight.contains(row.id) ? "reconnecting" : (row.state == .connected ? "connected" : row.state == .noPoller ? "no_poller" : "down"),
+                    "connected": row.connected, "in_flight": inFlight.contains(row.id), "succeeded": succeeded.contains(row.id),
+                    "heartbeat_age_seconds": nullable(row.heartbeatAgeSeconds), "model": nullable(row.model),
+                    "effort": nullable(row.effort), "context_percent": nullable(row.contextPercent),
+                    "restarts_last_hour": row.restartsLastHour, "stall": row.stall,
+                    "uptime_seconds": nullable(row.sessionStarted.map { max(0, Int(now - $0)) }),
+                    "launch_mode": row.launchMode, "last_error": nullable(note?.isError == true ? note?.text : nil),
+                    "note": nullable(note.map { noteText($0) }), "detail_line": row.detailLine,
+                    "uptime_line": nullable(row.uptimeLine), "status_text": row.statusText, "status_tip": row.statusTip]
+        }
+        let object: [String: Any] = [
+            "server_time": now, "summary": summary, "header_problem": nullable(headerProblem), "problem": nullable(problem),
+            "bots": bots,
+            "watchdog": ["state": watchdog?.available != true ? "unavailable" : watchdog?.isOn == true ? "on" : "off",
+                         "last_pass_age_seconds": nullable(header?.lastPassAge), "caption": watchdogCaption],
+            "telegram_reachable": nullable(header?.telegramReachable),
+            "snapshot": ["present": snapshotAvailable, "time": nullable(latestSignals?.snapshotSaved),
+                         "sessions": latestSignals?.snapshotSessions ?? 0, "tip": snapshotTip, "busy": snapshotBusy],
+            "restore_busy": restoreBusy, "confirmation": nullable(confirmation),
+            "footer_note": nullable(footerNote.map { noteText($0) }), "actions": phoneActions,
+        ]
+        return (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? Data("{}".utf8)
+    }
+
+    /// Validated requests enter the same MainActor store as panel clicks. No shell
+    /// text, path, pid or resume id from a request ever reaches an engine.
+    private func phoneAction(_ data: Data) -> PhoneResponse {
+        guard let request = PhoneActionRequest.parse(data) else { return Self.phoneResponse(400, error: "Unknown or malformed action") }
+        guard mode == .live, let cfg = config, problem == nil else { return Self.phoneResponse(503, error: "Fleet is unavailable") }
+        guard !snapshotBusy, !restoreBusy else { return Self.phoneResponse(409, error: "An action is already in flight") }
+        let single = request.action == "reconnect" || request.action == "fresh"
+        var targets: [Bot] = []
+        if single {
+            let matches = cfg.bots.filter { $0.key == request.bot || $0.name.lowercased() == request.bot?.lowercased() }
+            guard matches.count == 1, let bot = matches.first else { return Self.phoneResponse(400, error: "Unknown or ambiguous bot") }
+            targets = [bot]
+            if request.action == "fresh", request.confirm != true { return Self.phoneResponse(400, error: "Fresh start needs confirmation") }
+            // A healthy restart has the same confirmation as the native panel.
+            if request.action == "reconnect", rows.first(where: { $0.id == bot.key })?.connected == true, request.confirm != true {
+                return Self.phoneResponse(409, error: "Connected. Confirm the restart to keep its conversation.")
+            }
+        } else if request.action == "reconnect_all_down" {
+            targets = cfg.bots.filter { bot in rows.contains { $0.id == bot.key && !$0.connected } }
+            guard !targets.isEmpty else { return Self.phoneResponse(409, error: "Every bot is connected") }
+        } else {
+            targets = cfg.bots
+        }
+        let keys = targets.map(\.key)
+        guard inFlight.isDisjoint(with: keys) else { return Self.phoneResponse(409, error: "Already in flight") }
+        if request.action == "restore", !snapshotAvailable { return Self.phoneResponse(409, error: "No snapshot saved") }
+        if request.action.hasPrefix("watchdog_"), watchdog?.available != true { return Self.phoneResponse(409, error: "Watchdog unavailable") }
+        let wait = actionGate.remaining(keys)
+        guard wait == 0 else { return Self.phoneResponse(429, error: "Wait \(wait)s before another action on this bot") }
+        let id = UUID().uuidString.lowercased()
+        if phoneActions.count >= 30 { phoneActions.removeAll { ($0["status"] as? String) != "running" } }
+        phoneActions.append(["id": id, "action": request.action, "bots": keys, "status": "running", "started_at": Date().timeIntervalSince1970])
+        ActionLog.shared.writePhone("phone action \(id): \(request.action), bots \(keys.joined(separator: ", "))")
+        if single || request.action == "reconnect_all_down" {
+            phoneActionBots[id] = Set(keys)
+            for bot in targets {
+                notes[bot.key] = nil
+                startReconnect(bot, cfg, allowConnected: single && request.confirm == true,
+                               freshStart: request.action == "fresh", origin: "Phone \(request.action)", phone: true)
+            }
+        } else {
+            actionGate.record(keys)
+            switch request.action {
+            case "watchdog_on", "watchdog_off":
+                setWatchdog(on: request.action == "watchdog_on", admitted: true)
+                finishPhoneAction(id, error: footerNote?.text)
+            case "snapshot": snapshotNow(admitted: true)
+            case "restore": restoreNow(phone: true, admitted: true)
+            default: break
+            }
+        }
+        return PhoneResponse(status: 202, body: (try? JSONSerialization.data(withJSONObject: ["action_id": id])) ?? Data(),
+                             contentType: "application/json; charset=utf-8")
+    }
+
+    private func finishPhoneAction(_ id: String, error: String?) {
+        guard let i = phoneActions.firstIndex(where: { $0["id"] as? String == id }) else { return }
+        phoneActions[i]["status"] = error == nil ? "succeeded" : "failed"
+        phoneActions[i]["finished_at"] = Date().timeIntervalSince1970
+        if let error { phoneActions[i]["error"] = redactTokens(error) }
+        ActionLog.shared.writePhone("phone action \(id): \(error.map { "failed: \($0)" } ?? "succeeded")")
+    }
+
+    private func finishPhoneBot(_ key: String, error: String?) {
+        for id in Array(phoneActionBots.keys) where phoneActionBots[id]?.contains(key) == true {
+            phoneActionBots[id]?.remove(key)
+            if let error, let i = phoneActions.firstIndex(where: { $0["id"] as? String == id }) { phoneActions[i]["error"] = redactTokens(error) }
+            if phoneActionBots[id]?.isEmpty == true {
+                let failure = phoneActions.first(where: { $0["id"] as? String == id })?["error"] as? String
+                finishPhoneAction(id, error: failure)
+                phoneActionBots[id] = nil
+            }
+        }
+    }
+
+    private func finishPhoneFleetAction(_ action: String, error: String?) {
+        let ids = phoneActions.filter { $0["action"] as? String == action && $0["status"] as? String == "running" }
+            .compactMap { $0["id"] as? String }
+        for id in ids { finishPhoneAction(id, error: error) }
+    }
+
     /// Reconnect from a row. The bot's state is read fresh off the main thread; a
     /// connected bot asks first. The action itself re-checks everything again right
     /// before the engine runs.
     func requestReconnect(_ key: String) {
-        guard actionsLive else { return }
+        guard actionsLive, !snapshotBusy, !restoreBusy else { return }
         guard let cfg = config, let bot = cfg.bots.first(where: { $0.key == key }), !inFlight.contains(key) else { return }
         inFlight.insert(key)
         notes[key] = nil
@@ -859,7 +1069,7 @@ final class FleetStore: ObservableObject {
 
     /// Fresh start: a new, empty conversation through the /fresh path. Always asks.
     func requestFreshStart(_ key: String) {
-        guard actionsLive else { return }
+        guard actionsLive, !snapshotBusy, !restoreBusy else { return }
         guard let cfg = config, let bot = cfg.bots.first(where: { $0.key == key }), !inFlight.contains(key) else { return }
         NSApp.activate()
         let alert = NSAlert()
@@ -878,7 +1088,7 @@ final class FleetStore: ObservableObject {
     }
 
     func reconnectAllDown() {
-        guard actionsLive, let cfg = config else { return }
+        guard actionsLive, let cfg = config, !snapshotBusy, !restoreBusy else { return }
         let targets = rows.filter { !$0.connected && !inFlight.contains($0.id) }
         guard !targets.isEmpty else { return }
         log("Reconnect all down: \(targets.map(\.id).joined(separator: ", "))")
@@ -891,19 +1101,28 @@ final class FleetStore: ObservableObject {
         }
     }
 
-    private func startReconnect(_ bot: Bot, _ cfg: FleetConfig, allowConnected: Bool, freshStart: Bool, origin: String) {
+    private func startReconnect(_ bot: Bot, _ cfg: FleetConfig, allowConnected: Bool, freshStart: Bool, origin: String, phone: Bool = false) {
+        let remaining = actionGate.remaining([bot.key])
+        guard remaining == 0 else {
+            inFlight.remove(bot.key)
+            let error = "Wait \(remaining)s before another action on this bot"
+            notes[bot.key] = RowNote(text: error, isError: true, at: Date().timeIntervalSince1970, session: lastSessions[bot.key])
+            finishPhoneBot(bot.key, error: error)
+            return
+        }
+        actionGate.record([bot.key])
         inFlight.insert(bot.key)
         let dryRun = mode == .dryRun
         log("\(origin): queued \(bot.key)\(allowConnected && !freshStart ? " (confirmed restart of a connected bot)" : "")")
         reconnectQueue.async { [weak self] in
             let outcome = FleetModel.performReconnect(bot, cfg, allowConnected: allowConnected, dryRun: dryRun,
-                                                      askForPermission: true, freshStart: freshStart,
-                                                      log: { ActionLog.shared.write($0) })
-            Task { @MainActor in self?.finishReconnect(bot, outcome, freshStart: freshStart) }
+                                                      askForPermission: !phone, freshStart: freshStart,
+                                                      log: { if phone { ActionLog.shared.writePhone($0) } else { ActionLog.shared.write($0) } })
+            Task { @MainActor in self?.finishReconnect(bot, outcome, freshStart: freshStart, phone: phone) }
         }
     }
 
-    private func finishReconnect(_ bot: Bot, _ outcome: ReconnectOutcome, freshStart: Bool) {
+    private func finishReconnect(_ bot: Bot, _ outcome: ReconnectOutcome, freshStart: Bool, phone: Bool = false) {
         inFlight.remove(bot.key)
         let now = Date().timeIntervalSince1970
         let session = lastSessions[bot.key]
@@ -924,12 +1143,13 @@ final class FleetStore: ObservableObject {
         case .permissionBlocked:
             notes[bot.key] = RowNote(text: "\(freshStart ? "Fresh start" : "Reconnect") \(outcome.failureText ?? "did not run")",
                                      isError: true, at: now, session: session)
-            showPermissionAlert(bot.name + "'s Terminal window")
+            if !phone { showPermissionAlert(bot.name + "'s Terminal window") }
         default:
             let what = freshStart ? "Fresh start" : "Reconnect"
             notes[bot.key] = RowNote(text: "\(what) \(outcome.failureText ?? "failed, see menubar.log")",
                                      isError: true, at: now, session: session)
         }
+        finishPhoneBot(bot.key, error: outcome.failureText)
         refresh()
     }
 
@@ -942,8 +1162,21 @@ final class FleetStore: ObservableObject {
         alert.runModal()
     }
 
-    func setWatchdog(on: Bool) {
-        guard actionsLive, let cfg = config else { return }
+    private func admitPanelFleetAction(_ cfg: FleetConfig) -> Bool {
+        let keys = cfg.bots.map(\.key)
+        let remaining = actionGate.remaining(keys)
+        guard remaining == 0 else {
+            footerNote = RowNote(text: "Wait \(remaining)s before another fleet action", isError: true,
+                                 at: Date().timeIntervalSince1970, session: nil)
+            return false
+        }
+        actionGate.record(keys)
+        return true
+    }
+
+    func setWatchdog(on: Bool, admitted: Bool = false) {
+        guard actionsLive, let cfg = config, !snapshotBusy, !restoreBusy, inFlight.isEmpty else { return }
+        guard admitted || admitPanelFleetAction(cfg) else { return }
         log("watchdog switch set \(on ? "on" : "off") from the panel")
         let problems = FleetModel.applyWatchdog(on: on, cfg, dryRun: mode == .dryRun, log: { ActionLog.shared.write($0) })
         if problems.isEmpty {
@@ -956,8 +1189,9 @@ final class FleetStore: ObservableObject {
     }
 
     /// Snapshot: the fleet snapshot engine, with a spinner, then a short confirmation.
-    func snapshotNow() {
-        guard actionsLive, let cfg = config, !snapshotBusy, !restoreBusy else { return }
+    func snapshotNow(admitted: Bool = false) {
+        guard actionsLive, let cfg = config, !snapshotBusy, !restoreBusy, inFlight.isEmpty else { return }
+        guard admitted || admitPanelFleetAction(cfg) else { return }
         snapshotBusy = true
         let dryRun = mode == .dryRun
         log("Snapshot pressed")
@@ -968,6 +1202,7 @@ final class FleetStore: ObservableObject {
     }
 
     private func finishSnapshot(_ run: EngineRun?, dryRun: Bool) {
+        defer { finishPhoneFleetAction("snapshot", error: run?.code == 0 ? nil : (footerNote?.text ?? "Snapshot failed")) }
         snapshotBusy = false
         refresh()
         let now = Date().timeIntervalSince1970
@@ -988,24 +1223,29 @@ final class FleetStore: ObservableObject {
 
     /// Restore: every bot that is down says so first, the fleet restore engine runs,
     /// then each bot that comes back says "Back and ready" and its old window closes.
-    func restoreNow() {
-        guard actionsLive, let cfg = config, !snapshotBusy, !restoreBusy else { return }
+    func restoreNow(phone: Bool = false, admitted: Bool = false) {
+        guard actionsLive, let cfg = config, !snapshotBusy, !restoreBusy, inFlight.isEmpty else { return }
+        guard admitted || admitPanelFleetAction(cfg) else { return }
         restoreBusy = true
         let dryRun = mode == .dryRun
         log("Restore pressed")
         engineQueue.async { [weak self] in
-            let report = FleetModel.performRestore(cfg, dryRun: dryRun, askForPermission: true,
+            let report = FleetModel.performRestore(cfg, dryRun: dryRun, askForPermission: !phone,
                                                    log: { ActionLog.shared.write($0) })
-            Task { @MainActor in self?.finishRestore(report, dryRun: dryRun) }
+            Task { @MainActor in self?.finishRestore(report, dryRun: dryRun, phone: phone) }
         }
     }
 
-    private func finishRestore(_ report: RestoreReport, dryRun: Bool) {
+    private func finishRestore(_ report: RestoreReport, dryRun: Bool, phone: Bool = false) {
+        defer {
+            finishPhoneFleetAction("restore", error: report.run?.code == 0 && report.blocked == nil && report.notBack.isEmpty
+                                   ? nil : (footerNote?.text ?? "Restore did not bring every bot back"))
+        }
         restoreBusy = false
         let now = Date().timeIntervalSince1970
         if let blocked = report.blocked {
             footerNote = RowNote(text: "Restore did not run: Terminal automation is \(blocked.text)", isError: true, at: now, session: nil)
-            showPermissionAlert("the bots' Terminal windows")
+            if !phone { showPermissionAlert("the bots' Terminal windows") }
             refresh()
             return
         }
@@ -1631,6 +1871,17 @@ struct LegendV2: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Grid2.gap + 2) {
             legendGrid
+            Text(store.phoneStatus)
+                .font(.system(size: 11))
+                .foregroundStyle(Palette.label)
+                .accessibilityLabel(store.phoneStatus)
+            if store.phoneBaseURL != nil {
+                Button("Rotate phone link") { store.rotatePhoneLink() }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .medium))
+                    .help("Replaces the phone token and copies the new link. The old link stops working.")
+                    .accessibilityLabel("Rotate phone link")
+            }
             Button {
                 store.quit()
             } label: {
@@ -2091,6 +2342,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         store.onChange = { [weak self] in self?.updateStatusItem() }
         store.logStartup(owner: owner)
+        store.allowPhoneServing(forced: hasFlag("--serve"))
         store.refresh()
 
         let refreshTimer = Timer(timeInterval: 15, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
@@ -2210,9 +2462,11 @@ enum CLI {
                                 a clearly labelled DEMO panel with made-up states, for previews only
       --launchd                 set by install.sh's LaunchAgent: this copy is the supervised one
                                 and takes over from a copy started by hand
+      --serve                   enable the phone page on Tailscale only, port 8477
 
     Command line:
       --dump                    print the panel text for the fleet right now
+      --phone-self-test         run offline phone authentication and request tests
       --reconnect <bot>         reconnect one bot that is not connected, the way /fresh does it
                                 (its chat line first, the engine, Back and ready, the old window
                                 closed); --yes also restarts a connected bot, as the panel's
@@ -2496,6 +2750,9 @@ if hasFlag("--render-icon") {
 if hasFlag("--dump") {
     exit(MainActor.assumeIsolated { CLI.dump() })
 }
+if hasFlag("--phone-self-test") {
+    exit(PhoneServerTests.run())
+}
 if hasFlag("--reconnect") {
     guard let key = value(after: "--reconnect") else { usageExit("--reconnect needs a bot key") }
     exit(CLI.reconnect(key, dryRun: dryRunRequested, confirmed: hasFlag("--yes")))
@@ -2518,7 +2775,7 @@ if hasFlag("--render-preview") {
     exit(MainActor.assumeIsolated { CLI.renderPreview(path, demo: hasFlag("--demo")) })
 }
 
-let guiFlags: Set<String> = ["--dry-run", "--open-panel", "--open-menu", "--demo", "--appearance", "light", "dark", "--launchd"]
+let guiFlags: Set<String> = ["--dry-run", "--open-panel", "--open-menu", "--demo", "--appearance", "light", "dark", "--launchd", "--serve"]
 if let unknown = arguments.first(where: { !guiFlags.contains($0) }) {
     usageExit("unknown argument \(unknown)")
 }

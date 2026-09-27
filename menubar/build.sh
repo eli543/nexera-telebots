@@ -46,8 +46,9 @@ build() {
   touch "$BUILD/.metadata_never_index"
 
   echo "compiling with $(swiftc -version 2>&1 | head -1)"
-  swiftc -O -swift-version 5 -target "$(uname -m)-apple-macos$MIN_MACOS" \
-    -o "$BUILD/$APP_NAME" "$HERE/Fleet.swift" "$HERE/main.swift"
+  swiftc -O -warnings-as-errors -swift-version 5 -target "$(uname -m)-apple-macos$MIN_MACOS" \
+    -o "$BUILD/$APP_NAME" "$HERE/Fleet.swift" "$HERE/PhoneActions.swift" \
+    "$HERE/PhoneServer.swift" "$HERE/PhoneServerTests.swift" "$HERE/PhonePage.swift" "$HERE/main.swift"
 
   echo "drawing the app icon"
   "$BUILD/$APP_NAME" --render-icon "$BUILD/AppIcon.iconset"

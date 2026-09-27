@@ -49,3 +49,7 @@ case "$APP" in
 esac
 
 echo "kept the action log: $LOG_HOME/menubar.log (delete it by hand if you want)"
+if [ -f "$LOG_HOME/phone-token" ] || [ -L "$LOG_HOME/phone-token" ]; then
+  rm -f "$LOG_HOME/phone-token"
+  echo "removed the phone link token"
+fi

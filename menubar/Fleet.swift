@@ -92,10 +92,12 @@ func shortAge(_ seconds: Int) -> String {
 }
 
 private let tokenPattern = try! NSRegularExpression(pattern: "[0-9]{6,}:[A-Za-z0-9_-]{20,}")
+private let phoneTokenPattern = try! NSRegularExpression(pattern: "(?i)[0-9a-f]{64}")
 
 /// Any bot-token-shaped string becomes <redacted> before it can be shown or logged.
 func redactTokens(_ text: String) -> String {
-    tokenPattern.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: "<redacted>")
+    let clean = tokenPattern.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: "<redacted>")
+    return phoneTokenPattern.stringByReplacingMatches(in: clean, range: NSRange(clean.startIndex..., in: clean), withTemplate: "<redacted>")
 }
 
 func shellQuote(_ arg: String) -> String {
@@ -192,6 +194,8 @@ struct MenubarSettings {
     var restoreEngine: String
     var snapshotFile: String
     var freshStartArg: String
+    var serve: Bool? = nil
+    var freshEngineLog: String? = nil
 }
 
 struct FleetConfig {
@@ -215,6 +219,7 @@ enum FleetModel {
     private static let menubarKeys: Set<String> = [
         "fresh_engine", "watchdog_state_dir", "watchdog_log", "heartbeat_max_age", "resume_source", "time_zone",
         "snapshot_engine", "restore_engine", "snapshot_file", "fresh_start_arg",
+        "serve", "fresh_engine_log",
     ]
 
     static func loadConfig() -> ConfigLoad {
@@ -287,11 +292,19 @@ enum FleetModel {
                     if let s = v as? String, !s.isEmpty { apply(expandTilde(s)) } else { warnings.append("menubar.\(key) must be a path; default kept") }
                 }
                 path("fresh_engine") { settings.freshEngine = $0 }
+                path("fresh_engine_log") { settings.freshEngineLog = $0 }
                 path("watchdog_state_dir") { settings.watchdogStateDir = $0 }
                 path("watchdog_log") { settings.watchdogLog = $0 }
                 path("snapshot_engine") { settings.snapshotEngine = $0 }
                 path("restore_engine") { settings.restoreEngine = $0 }
                 path("snapshot_file") { settings.snapshotFile = $0 }
+                if let v = mb["serve"] {
+                    if let n = v as? NSNumber, CFGetTypeID(n) == CFBooleanGetTypeID() {
+                        settings.serve = n.boolValue
+                    } else {
+                        warnings.append("menubar.serve must be true or false; default kept")
+                    }
+                }
                 if let v = mb["heartbeat_max_age"] {
                     if let n = v as? NSNumber, !(v is Bool), n.intValue > 0 {
                         settings.heartbeatMaxAge = n.intValue
@@ -1505,7 +1518,29 @@ extension FleetModel {
     static func engineEnvironment() -> [String: String] {
         var env = Env.vars.filter { !$0.key.hasPrefix("TELEGRAM_") }
         env["PATH"] = FleetPaths.enginePATH
+        env["TZ"] = "America/New_York"
         return env
+    }
+
+    /// Optional evidence from an engine that writes its own log. Only the block
+    /// naming this exact pid and workdir is considered. This records the engine's
+    /// report, not a Telegram delivery receipt.
+    static func engineReadyEvidence(path: String, offset: UInt64, plan: ReconnectPlan) -> String? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        guard (try? handle.seek(toOffset: offset)) != nil,
+              let data = try? handle.read(upToCount: 131_072), let text = String(data: data, encoding: .utf8) else { return nil }
+        let marker = " restart pid=\(plan.targetPID) cwd=\(plan.bot.workdir) ==="
+        var ours = false
+        var reported: String?
+        for line in text.split(separator: "\n").map(String.init) {
+            if line.hasPrefix("=== "), line.contains("restart pid=") { ours = line.hasSuffix(marker); reported = nil }
+            if ours, line.contains("back-online ping sent") { reported = line.contains("Continue button attached") ? " with Continue button" : "" }
+            if ours, line == "=== done (exit=0) ===", let reported {
+                return "engine reports \(BotChat.backAndReady) sent\(reported) (engine log; no Bot API receipt retained)"
+            }
+        }
+        return nil
     }
 
     static func describe(_ health: BotHealth) -> String {
@@ -1616,6 +1651,11 @@ extension FleetModel {
 
         log("\(action) \(describe(health1)): running \(plan.commandLine) (resume from \(plan.resumeNote))")
         let deadline = engineDeadline(300)
+        let engineLogOffset: UInt64? = config.settings.freshEngineLog.flatMap { path in
+            guard let handle = FileHandle(forReadingAtPath: path) else { return 0 }
+            defer { try? handle.close() }
+            return try? handle.seekToEnd()
+        }
         let result: Subprocess.Result
         do {
             result = try Subprocess.run("/bin/bash", plan.arguments, environment: engineEnvironment(), capture: false,
@@ -1633,6 +1673,10 @@ extension FleetModel {
         let code = result.code
         let meaning = result.signaled ? "engine killed by signal \(code)" : (engineMeanings[code] ?? "engine failed")
         log("\(action) \(bot.key): engine exit \(code), \(meaning)")
+        if code == 0, !result.signaled, let path = config.settings.freshEngineLog, let offset = engineLogOffset {
+            log("\(action) \(bot.key): " + (engineReadyEvidence(path: path, offset: offset, plan: plan)
+                ?? "Back and ready could not be verified in the engine log"))
+        }
 
         // The engine closes a live session's window itself (the app then checks it is
         // gone); a session that was already down left a window only the app knows of.
@@ -1965,12 +2009,23 @@ final class ActionLog {
         f.timeZone = FleetModel.defaultTimeZone
         return f
     }()
+    private let phoneFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "EEEE, MMMM d, yyyy h:mm:ssa 'ET'"
+        f.amSymbol = "am"
+        f.pmSymbol = "pm"
+        f.timeZone = FleetModel.defaultTimeZone
+        return f
+    }()
 
     func setTimeZone(_ zone: TimeZone) {
         queue.sync { formatter.timeZone = zone }
     }
 
-    func write(_ message: String) {
+    func writePhone(_ message: String) { write(message, eastern: true) }
+
+    func write(_ message: String, eastern: Bool = false) {
         let clean = redactTokens(message)
         if echo {
             print(clean)
@@ -1985,7 +2040,7 @@ final class ActionLog {
             if stat(path, &st) == 0 && st.st_size > 1_048_576 {
                 _ = rename(path, path + ".1")
             }
-            let line = formatter.string(from: Date()) + " " + clean + "\n"
+            let line = (eastern ? phoneFormatter : formatter).string(from: Date()) + " " + clean + "\n"
             let fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
             guard fd >= 0 else { return }
             line.utf8CString.withUnsafeBufferPointer { buf in

@@ -100,6 +100,7 @@ render_plist() {
     <array>
       <string>$(xml_escape "$EXE")</string>
       <string>--launchd</string>
+      <string>--serve</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -137,7 +138,7 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "4. would write $PLIST:"
   render_plist
   echo "5. would run: launchctl bootstrap gui/$UID_NUM $PLIST"
-  echo "   then check launchd's pid for $LABEL runs $EXE --launchd and holds $LOCK"
+  echo "   then check launchd's pid for $LABEL runs $EXE --launchd --serve and holds $LOCK"
   exit 0
 fi
 
@@ -167,8 +168,8 @@ if [ -z "$pid" ]; then
 fi
 cmd="$(ps -o command= -p "$pid" 2>/dev/null || true)"
 case "$cmd" in
-  "$EXE --launchd"*) ;;
-  *) echo "install.sh: launchd's pid $pid runs '$cmd', not $EXE --launchd" >&2; exit 1 ;;
+  "$EXE --launchd --serve") ;;
+  *) echo "install.sh: launchd's pid $pid runs '$cmd', not $EXE --launchd --serve" >&2; exit 1 ;;
 esac
 holder=""
 for _ in $(seq 1 20); do
@@ -178,6 +179,11 @@ for _ in $(seq 1 20); do
 done
 if [ "$holder" != "$pid launchd" ]; then
   echo "install.sh: pid $pid is running but does not hold the single-copy lock ($LOCK says '${holder:-nothing}')" >&2
+  exit 1
+fi
+copies="$(running_copies)"
+if [ "$copies" != "$pid" ]; then
+  echo "install.sh: expected only launchd pid $pid, found: $copies" >&2
   exit 1
 fi
 echo "Telebots Bar is running under launchd (pid $pid, $EXE) and will start at every login."
