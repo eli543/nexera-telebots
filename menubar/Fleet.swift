@@ -82,15 +82,10 @@ func shortAge(_ seconds: Int) -> String {
 }
 
 private let tokenPattern = try! NSRegularExpression(pattern: "[0-9]{6,}:[A-Za-z0-9_-]{20,}")
-private let ansiPattern = try! NSRegularExpression(pattern: "\u{1B}\\[[0-9;?]*[ -/]*[@-~]")
 
 /// Any bot-token-shaped string becomes <redacted> before it can be shown or logged.
 func redactTokens(_ text: String) -> String {
     tokenPattern.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: "<redacted>")
-}
-
-func stripANSI(_ text: String) -> String {
-    ansiPattern.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: "")
 }
 
 func shellQuote(_ arg: String) -> String {
@@ -167,6 +162,9 @@ struct FleetConfig {
     let fleetHome: String
     let bots: [Bot]
     let settings: MenubarSettings
+    /// Menubar options this build does not understand or could not use. They are
+    /// logged and ignored, so a config newer than the app still shows the fleet.
+    var warnings: [String] = []
 }
 
 enum ConfigLoad {
@@ -241,56 +239,49 @@ enum FleetModel {
             snapshotFile: home + "/restart-state/snapshot.tsv",
             freshStartArg: ""
         )
+        var warnings: [String] = []
         if let mb = root["menubar"] {
             if let mb = mb as? [String: Any] {
-                for key in mb.keys where !menubarKeys.contains(key) {
-                    problems.append("unknown menubar option '\(key)'")
+                for key in mb.keys.sorted() where !menubarKeys.contains(key) {
+                    warnings.append("menubar.\(key) is not an option this build knows; ignored")
                 }
-                if let v = mb["fresh_engine"] {
-                    if let s = v as? String, !s.isEmpty { settings.freshEngine = expandTilde(s) } else { problems.append("menubar.fresh_engine must be a path") }
+                func path(_ key: String, _ apply: (String) -> Void) {
+                    guard let v = mb[key] else { return }
+                    if let s = v as? String, !s.isEmpty { apply(expandTilde(s)) } else { warnings.append("menubar.\(key) must be a path; default kept") }
                 }
-                if let v = mb["watchdog_state_dir"] {
-                    if let s = v as? String, !s.isEmpty { settings.watchdogStateDir = expandTilde(s) } else { problems.append("menubar.watchdog_state_dir must be a path") }
-                }
-                if let v = mb["watchdog_log"] {
-                    if let s = v as? String, !s.isEmpty { settings.watchdogLog = expandTilde(s) } else { problems.append("menubar.watchdog_log must be a path") }
-                }
+                path("fresh_engine") { settings.freshEngine = $0 }
+                path("watchdog_state_dir") { settings.watchdogStateDir = $0 }
+                path("watchdog_log") { settings.watchdogLog = $0 }
+                path("snapshot_engine") { settings.snapshotEngine = $0 }
+                path("restore_engine") { settings.restoreEngine = $0 }
+                path("snapshot_file") { settings.snapshotFile = $0 }
                 if let v = mb["heartbeat_max_age"] {
                     if let n = v as? NSNumber, !(v is Bool), n.intValue > 0 {
                         settings.heartbeatMaxAge = n.intValue
                     } else if let s = v as? String, let n = Int(s), n > 0 {
                         settings.heartbeatMaxAge = n
                     } else {
-                        problems.append("menubar.heartbeat_max_age must be a positive number of seconds")
+                        warnings.append("menubar.heartbeat_max_age must be a positive number of seconds; default kept")
                     }
                 }
                 if let v = mb["resume_source"] {
-                    if let s = v as? String, let source = ResumeSource(rawValue: s) { settings.resumeSource = source } else { problems.append("menubar.resume_source must be latest-transcript or session-id") }
-                }
-                for (key, apply) in [
-                    ("snapshot_engine", { (s: String) in settings.snapshotEngine = expandTilde(s) }),
-                    ("restore_engine", { (s: String) in settings.restoreEngine = expandTilde(s) }),
-                    ("snapshot_file", { (s: String) in settings.snapshotFile = expandTilde(s) }),
-                ] as [(String, (String) -> Void)] {
-                    if let v = mb[key] {
-                        if let s = v as? String, !s.isEmpty { apply(s) } else { problems.append("menubar.\(key) must be a path") }
-                    }
+                    if let s = v as? String, let source = ResumeSource(rawValue: s) { settings.resumeSource = source } else { warnings.append("menubar.resume_source must be latest-transcript or session-id; default kept") }
                 }
                 if let v = mb["fresh_start_arg"] {
-                    if let s = v as? String { settings.freshStartArg = s } else { problems.append("menubar.fresh_start_arg must be a string") }
+                    if let s = v as? String { settings.freshStartArg = s } else { warnings.append("menubar.fresh_start_arg must be a string; default kept") }
                 }
                 if let v = mb["time_zone"] {
-                    if let s = v as? String, let tz = TimeZone(identifier: s) { settings.timeZone = tz } else { problems.append("menubar.time_zone must be a time zone name like America/New_York") }
+                    if let s = v as? String, let tz = TimeZone(identifier: s) { settings.timeZone = tz } else { warnings.append("menubar.time_zone must be a time zone name like America/New_York; default kept") }
                 }
             } else {
-                problems.append("menubar must be an object")
+                warnings.append("menubar must be an object; ignored")
             }
         }
 
         if !problems.isEmpty {
             return .problem(problems.joined(separator: "; "), path: path)
         }
-        return .ok(FleetConfig(path: path, fleetHome: home, bots: bots, settings: settings))
+        return .ok(FleetConfig(path: path, fleetHome: home, bots: bots, settings: settings, warnings: warnings))
     }
 
     /// The restart engine: menubar.fresh_engine if set, else fleet-fresh from
@@ -468,11 +459,11 @@ struct BotHealth {
         return "fresh"
     }
 
-    /// Status text: "Connected · heard 12s ago", "No poller", "Down".
+    /// Status text: "Connected · heartbeat 12s ago", "No poller", "Down".
     var statusLine: String {
         switch state {
         case .connected:
-            if let age = heartbeatAge { return "Connected · heard \(shortAge(age)) ago" }
+            if let age = heartbeatAge { return "Connected · heartbeat \(shortAge(age)) ago" }
             return "Connected"
         case .noPoller: return "No poller"
         case .down: return "Down"
@@ -523,7 +514,8 @@ extension FleetModel {
 
 /// Everything the second line, the expanded line and the header show for a bot.
 struct BotIndicators: Equatable {
-    var model: String?          // "opus 1M", "fable", ...
+    var model: String?          // "Opus 5.5" from the newest reply, else the alias ("Opus")
+    var servedModel: String?    // the name from the transcript alone, nil before the first reply
     var effort: String?         // "max", "high", ...
     var contextPercent: Int?    // nil when unknown (no transcript yet)
     var restartsLastHour: Int
@@ -544,10 +536,28 @@ struct FleetSignals: Equatable {
 }
 
 extension FleetModel {
-    /// "opus[1m]" reads "opus 1M"; other aliases and ids as they are.
-    static func prettyModel(_ raw: String) -> String {
-        if raw.hasSuffix("[1m]") { return String(raw.dropLast(4)) + " 1M" }
-        return raw
+    /// A served model id as a name: claude-opus-5-5 reads "Opus 5.5", claude-fable-5-1
+    /// "Fable 5.1", claude-sonnet-5 "Sonnet 5". The claude- prefix and any [1m] suffix
+    /// are dropped, the family is capitalized, short version numbers are joined with
+    /// dots, and a trailing date stamp is ignored.
+    static func modelName(fromID id: String) -> String? {
+        var text = id.lowercased()
+        if let bracket = text.firstIndex(of: "[") { text = String(text[..<bracket]) }
+        if text.hasPrefix("claude-") { text = String(text.dropFirst("claude-".count)) }
+        let tokens = text.split(separator: "-").map(String.init)
+        guard let family = tokens.first(where: { $0.first?.isLetter == true }) else { return nil }
+        let version = tokens.filter { !$0.isEmpty && $0.count <= 2 && $0.allSatisfy(\.isNumber) }
+        let name = family.prefix(1).uppercased() + family.dropFirst()
+        return version.isEmpty ? name : name + " " + version.joined(separator: ".")
+    }
+
+    /// A launch alias as a name ("opus[1m]" reads "Opus"), used until the session's
+    /// transcript has a reply that names the exact model.
+    static func modelName(fromAlias alias: String) -> String {
+        if alias.lowercased().hasPrefix("claude-"), let name = modelName(fromID: alias) { return name }
+        var text = alias
+        if let bracket = text.firstIndex(of: "[") { text = String(text[..<bracket]) }
+        return text.prefix(1).uppercased() + text.dropFirst()
     }
 
     static func flagValue(_ argv: [String], _ names: [String]) -> String? {
@@ -575,7 +585,12 @@ extension FleetModel {
     /// assistant record's input + cache read + cache creation tokens, over a 1M cap
     /// for [1m] or fable models and 200k otherwise. Reads at most the last 5 MB.
     static func contextPercent(transcript: String, modelStateText: String) -> Int? {
-        guard isRegularFile(transcript), let handle = FileHandle(forReadingAtPath: transcript) else { return nil }
+        transcriptUsage(transcript: transcript, modelStateText: modelStateText).percent
+    }
+
+    /// The newest non-sidechain usage record: context used and the model that served it.
+    static func transcriptUsage(transcript: String, modelStateText: String) -> (percent: Int?, model: String?) {
+        guard isRegularFile(transcript), let handle = FileHandle(forReadingAtPath: transcript) else { return (nil, nil) }
         defer { try? handle.close() }
         let budget: UInt64 = 5_000_000
         let size = (try? handle.seekToEnd()) ?? 0
@@ -594,11 +609,12 @@ extension FleetModel {
                 return max(0, n.doubleValue.isFinite ? n.doubleValue.rounded(.towardZero) : 0)
             }
             let used = tokens("input_tokens") + tokens("cache_read_input_tokens") + tokens("cache_creation_input_tokens")
-            let serving = ((message["model"] as? String) ?? "").lowercased()
+            let served = message["model"] as? String
+            let serving = (served ?? "").lowercased()
             let cap: Double = (configured.contains("[1m]") || configured.contains("fable") || serving.contains("fable")) ? 1_000_000 : 200_000
-            return max(0, min(100, Int((used / cap * 100).rounded(.toNearestOrEven))))
+            return (max(0, min(100, Int((used / cap * 100).rounded(.toNearestOrEven)))), served)
         }
-        return start == 0 ? 0 : nil
+        return (start == 0 ? 0 : nil, nil)
     }
 
     /// Watchdog restarts in the last hour: epochs in <watchdog state>/<key>.restart_log.
@@ -621,20 +637,25 @@ extension FleetModel {
     static func indicators(_ health: BotHealth, _ config: FleetConfig, withContext: Bool) -> BotIndicators {
         let saved = modelState(health.bot)
         let argv = health.sessionArgv ?? []
-        let model = flagValue(argv, ["--model"]) ?? saved.model
+        let alias = flagValue(argv, ["--model"]) ?? saved.model
         let effort = flagValue(argv, ["--effort"]) ?? saved.effort
         var context: Int?
+        var served: String?
         if withContext, health.state != .down {
             let resume = resolveResume(health.bot, source: config.settings.resumeSource)
             if resume.arg != "fresh-keep" {
                 let modelText = (FileManager.default.contents(atPath: health.bot.stateDir + "/model-state"))
                     .map { String(decoding: $0, as: UTF8.self) } ?? ""
-                context = contextPercent(transcript: health.bot.projectDir + "/" + resume.arg + ".jsonl", modelStateText: modelText)
+                let usage = transcriptUsage(transcript: health.bot.projectDir + "/" + resume.arg + ".jsonl", modelStateText: modelText)
+                context = usage.percent
+                served = usage.model
             }
         }
         let beatPath = health.bot.stateDir + "/poller.heartbeat"
+        let servedName = served.flatMap { modelName(fromID: $0) }
         return BotIndicators(
-            model: model.map(prettyModel),
+            model: servedName ?? alias.map { modelName(fromAlias: $0) },
+            servedModel: servedName,
             effort: effort,
             contextPercent: context,
             restartsLastHour: restartsLastHour(health.bot, config, now: health.checkedAt),
@@ -686,46 +707,6 @@ extension FleetModel {
         }.resume()
         _ = done.wait(timeout: .now() + timeout + 1)
         return ok
-    }
-}
-
-// MARK: - Launch log
-
-enum LaunchLogTail {
-    case none
-    case empty
-    case lines([String])
-}
-
-extension FleetModel {
-    /// The last three lines of the bot's launch log (<state_dir>/launch/*.stderr.log,
-    /// the one for the running session when it exists, else the newest), with any
-    /// token-shaped text redacted.
-    static func launchLogTail(_ bot: Bot, sessionPID: pid_t?) -> LaunchLogTail {
-        let dir = bot.stateDir + "/launch"
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return .none }
-        let logs = names.filter { $0.hasSuffix(".stderr.log") && !$0.hasPrefix(".") }
-        guard !logs.isEmpty else { return .none }
-        var chosen: String?
-        if let pid = sessionPID { chosen = logs.first { $0.hasSuffix("-\(pid).stderr.log") } }
-        if chosen == nil {
-            chosen = logs.max { (modificationTime(dir + "/" + $0) ?? 0) < (modificationTime(dir + "/" + $1) ?? 0) }
-        }
-        guard let name = chosen, let handle = FileHandle(forReadingAtPath: dir + "/" + name) else { return .none }
-        defer { try? handle.close() }
-        let size = (try? handle.seekToEnd()) ?? 0
-        let window: UInt64 = 16_384
-        try? handle.seek(toOffset: size > window ? size - window : 0)
-        let data = (try? handle.readToEnd()) ?? Data()
-        let lines = String(decoding: data, as: UTF8.self)
-            .split(whereSeparator: { $0 == "\n" || $0 == "\r" })
-            .map { stripANSI(String($0)).trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-        guard !lines.isEmpty else { return .empty }
-        return .lines(lines.suffix(3).map { line in
-            let clean = redactTokens(line)
-            return clean.count > 160 ? String(clean.prefix(159)) + "…" : clean
-        })
     }
 }
 
@@ -811,8 +792,10 @@ extension FleetModel {
         }
     }
 
-    static func makePlan(_ health: BotHealth, _ config: FleetConfig, engine: String) -> ReconnectPlan {
-        let resume = resolveResume(health.bot, source: config.settings.resumeSource)
+    static func makePlan(_ health: BotHealth, _ config: FleetConfig, engine: String,
+                         resumeOverride: String? = nil) -> ReconnectPlan {
+        let resume = resumeOverride.map { (arg: $0, note: "a fresh start, the /fresh path") }
+            ?? resolveResume(health.bot, source: config.settings.resumeSource)
         let pid = health.sessionPIDs.first.map { String($0) } ?? "999999"
         return ReconnectPlan(bot: health.bot, state: health.state, targetPID: pid,
                              resumeArg: resume.arg, resumeNote: resume.note, engine: engine)
@@ -848,26 +831,31 @@ extension FleetModel {
     /// engine and then on the new poller). Never restarts a connected bot unless the
     /// caller confirmed it.
     static func performReconnect(_ bot: Bot, _ config: FleetConfig, allowConnected: Bool, dryRun: Bool,
-                                 askForPermission: Bool, log: (String) -> Void) -> ReconnectOutcome {
+                                 askForPermission: Bool, freshStart: Bool = false,
+                                 log: (String) -> Void) -> ReconnectOutcome {
+        let action = freshStart ? "fresh start" : "reconnect"
         let health = evaluateOne(bot, config)
         let who = "\(bot.key) (\(health.state.rawValue), session \(health.sessionPIDs.first.map { String($0) } ?? "none"), poller \(health.pollerPIDs.first.map { String($0) } ?? "none"))"
         if health.state == .connected && !allowConnected && !dryRun {
-            log("reconnect \(bot.key): connected again before the restart ran, nothing to do")
+            log("\(action) \(bot.key): connected again before the restart ran, nothing to do")
             return .healedBeforeRun
         }
         let resolved = resolveFreshEngine(config)
         guard let engine = resolved.path else {
-            log("reconnect \(bot.key): cannot run, \(resolved.note)")
+            log("\(action) \(bot.key): cannot run, \(resolved.note)")
             return .noEngine(resolved.note)
         }
-        let plan = makePlan(health, config, engine: engine)
+        let plan = makePlan(health, config, engine: engine,
+                            resumeOverride: freshStart ? config.settings.freshStartArg : nil)
 
         if dryRun {
-            if health.state == .connected && !allowConnected {
+            if freshStart {
+                log("[DRY-RUN] fresh start \(bot.key): the panel would first ask \"Start \(bot.name) fresh?\" (Cancel is the default)")
+            } else if health.state == .connected && !allowConnected {
                 log("[DRY-RUN] reconnect \(bot.key): connected, so the panel would first ask \"Restart \(bot.name) even though it is connected? It keeps the conversation.\" (Cancel is the default)")
             }
-            log("[DRY-RUN] reconnect \(who): would run: \(plan.commandLine)")
-            log("[DRY-RUN]   resume \(plan.resumeArg) (from \(plan.resumeNote)); PATH=\(FleetPaths.enginePATH)")
+            log("[DRY-RUN] \(action) \(who): would run: \(plan.commandLine)")
+            log("[DRY-RUN]   resume \(plan.resumeArg.isEmpty ? "\"\" (empty)" : plan.resumeArg) (from \(plan.resumeNote)); PATH=\(FleetPaths.enginePATH)")
             return .dryRun(plan)
         }
 
@@ -875,15 +863,15 @@ extension FleetModel {
         // window, so a Terminal permission that is missing must stop us first.
         var automation = terminalAutomation(askUser: false)
         if automation == .wouldPrompt && askForPermission {
-            log("reconnect \(bot.key): asking macOS for permission to open the bot's Terminal window")
+            log("\(action) \(bot.key): asking macOS for permission to open the bot's Terminal window")
             automation = terminalAutomation(askUser: true)
         }
         if automation == .denied || automation == .wouldPrompt {
-            log("reconnect \(bot.key): stopped before anything was touched, Terminal automation is \(automation.text)")
+            log("\(action) \(bot.key): stopped before anything was touched, Terminal automation is \(automation.text)")
             return .permissionBlocked(automation)
         }
 
-        log("reconnect \(who): running \(plan.commandLine) (resume from \(plan.resumeNote))")
+        log("\(action) \(who): running \(plan.commandLine) (resume from \(plan.resumeNote))")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = plan.arguments
@@ -895,14 +883,14 @@ extension FleetModel {
         do {
             try process.run()
         } catch {
-            log("reconnect \(bot.key): could not start /bin/bash (\(error.localizedDescription))")
+            log("\(action) \(bot.key): could not start /bin/bash (\(error.localizedDescription))")
             return .engineRefused(-1, "could not start the engine")
         }
         process.waitUntilExit()
         let code = process.terminationStatus
         let signaled = process.terminationReason == .uncaughtSignal
         let meaning = signaled ? "engine killed by signal \(code)" : (engineMeanings[code] ?? "engine failed")
-        log("reconnect \(bot.key): engine exit \(code), \(meaning)")
+        log("\(action) \(bot.key): engine exit \(code), \(meaning)")
         guard !signaled, [0, 6, 7].contains(code) else { return .engineRefused(code, meaning) }
 
         // The shipped engine returns as soon as the window opens; wait for the poller.
@@ -913,11 +901,90 @@ extension FleetModel {
             after = evaluateOne(bot, config)
         }
         if after.state == .connected {
-            log("reconnect \(bot.key): connected (session \(after.sessionPIDs.first.map { String($0) } ?? "?"), poller \(after.pollerPIDs.first.map { String($0) } ?? "?"), \(after.launchMode))")
+            log("\(action) \(bot.key): connected (session \(after.sessionPIDs.first.map { String($0) } ?? "?"), poller \(after.pollerPIDs.first.map { String($0) } ?? "?"), \(after.launchMode))")
             return .connected
         }
-        log("reconnect \(bot.key): still \(after.state.rawValue) 45s after the engine finished")
+        log("\(action) \(bot.key): still \(after.state.rawValue) 45s after the engine finished")
         return .stillDown(after.state)
+    }
+}
+
+// MARK: - Snapshot and restore
+
+enum FleetEngineAction: String {
+    case snapshot, restore
+}
+
+struct EngineRun {
+    let code: Int32
+    let summary: String
+}
+
+extension FleetModel {
+    static func enginePath(_ action: FleetEngineAction, _ config: FleetConfig) -> String {
+        action == .snapshot ? config.settings.snapshotEngine : config.settings.restoreEngine
+    }
+
+    static func engineCommandLine(_ action: FleetEngineAction, _ config: FleetConfig) -> String {
+        ["/bin/bash", enginePath(action, config)].map(shellQuote).joined(separator: " ")
+    }
+
+    /// What a real run does, in one line, for the dry-run log and the tooltips.
+    static func engineEffect(_ action: FleetEngineAction, _ config: FleetConfig) -> String {
+        switch action {
+        case .snapshot:
+            return "records every bot's current session in \(config.settings.snapshotFile) and pauses auto-recovery (a <key>.disabled file for each bot not already off) until Restore; it kills and launches nothing"
+        case .restore:
+            return "reopens every bot that is not running, resumed into its saved session in a new Terminal window, skips bots that are running, then turns auto-recovery back on and archives the snapshot"
+        }
+    }
+
+    /// Runs the snapshot or restore engine, or in dry run logs exactly what it would run.
+    static func runFleetEngine(_ action: FleetEngineAction, _ config: FleetConfig, dryRun: Bool,
+                               log: (String) -> Void) -> EngineRun? {
+        let path = enginePath(action, config)
+        guard isRegularFile(path) else {
+            log("\(action.rawValue): cannot run, no engine at \(path)")
+            return nil
+        }
+        let command = engineCommandLine(action, config)
+        let noSnapshot = action == .restore && !isRegularFile(config.settings.snapshotFile)
+        if dryRun {
+            log("[DRY-RUN] \(action.rawValue): would run: \(command)")
+            log("[DRY-RUN]   a real run \(engineEffect(action, config))")
+            if noSnapshot {
+                log("[DRY-RUN]   no snapshot at \(config.settings.snapshotFile) right now, so a real run would stop at once and change nothing")
+            }
+            return EngineRun(code: 0, summary: "dry run")
+        }
+        if noSnapshot {
+            log("restore: no snapshot at \(config.settings.snapshotFile), nothing to restore")
+            return nil
+        }
+        log("\(action.rawValue): running \(command)")
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [path]
+        process.environment = engineEnvironment()
+        process.currentDirectoryURL = URL(fileURLWithPath: "/")
+        process.standardInput = FileHandle.nullDevice
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        do {
+            try process.run()
+        } catch {
+            log("\(action.rawValue): could not start /bin/bash (\(error.localizedDescription))")
+            return nil
+        }
+        let output = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let lines = String(decoding: output.prefix(65_536), as: UTF8.self)
+            .split(separator: "\n").map { redactTokens(String($0)).trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let summary = lines.last(where: { !$0.hasPrefix("  ") }) ?? "no output"
+        log("\(action.rawValue): engine exit \(process.terminationStatus): \(summary)")
+        return EngineRun(code: process.terminationStatus, summary: summary)
     }
 }
 

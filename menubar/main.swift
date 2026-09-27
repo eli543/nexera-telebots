@@ -259,27 +259,20 @@ final class FleetStore: ObservableObject {
         let id: String
         let name: String
         var state: BotState
-        var statusText: String
+        var statusText: String          // "12s", "No poller", "Down"
+        var statusIcon: String?         // the pulse glyph beside a heartbeat age
+        var statusTip: String
         var dumpStatus: String
         var spokenStatus: String
-        var sessionPID: String
-        var pollerPID: String
-        var launchMode: String
-        var heartbeat: String
-        var logLines: [String]
-        var logNote: String?
+        var detailLine: String          // "Opus 5.5 · max · 41% ctx" (+ restarts when above zero)
+        var detailTip: String
+        var stall: Bool
+        var uptimeLine: String?         // shown when the row is expanded
         var pulse: Int
-        /// Indicator fields (shown only when indicators are on).
-        var statusIcon: String? = nil
-        var statusTip: String = ""
-        var detailLine: String? = nil
-        var detailTip: String = ""
-        var stall: Bool = false
-        var uptimeLine: String? = nil
         var connected: Bool { state == .connected }
     }
 
-    /// Watchdog and Telegram state for the header line.
+    /// Watchdog and Telegram state for the header line and the menu bar marks.
     struct HeaderStatus: Equatable {
         var watchdogOffFor: [String]      // bot names whose kill switch is set
         var watchdogTotal: Int
@@ -297,13 +290,60 @@ final class FleetStore: ObservableObject {
     @Published private(set) var header: HeaderStatus?
     @Published private(set) var marks: [MenuMark] = []
     @Published var showLegend = false
-    private(set) var indicatorsEnabled = false
-    /// Snapshot and restore state for the bottom group.
     @Published private(set) var snapshotAvailable = false
     @Published private(set) var snapshotTip = "No snapshot saved"
     @Published private(set) var snapshotBusy = false
     @Published private(set) var restoreBusy = false
     @Published private(set) var confirmation: String?
+
+    let mode: Mode
+    private(set) var config: FleetConfig?
+    var onChange: (() -> Void)?
+    private var lastStates: [String: BotState] = [:]
+    private var didFirstRefresh = false
+    private var lastProblem: String?
+    private var lastHeaderProblem: String?
+    private var loggedWarnings: [String] = []
+    private var contextCache: [String: (session: pid_t, value: Int?, served: String?, at: Date)] = [:]
+    private var probe: (reachable: Bool, at: Date)?
+    private var probing = false
+    private var confirmationToken = 0
+    private let reconnectQueue = DispatchQueue(label: "com.nexera.telebots-menubar.reconnect")
+    private let engineQueue = DispatchQueue(label: "com.nexera.telebots-menubar.engines")
+    private let timeOfDay: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "h:mma"
+        f.amSymbol = "am"
+        f.pmSymbol = "pm"
+        f.timeZone = FleetModel.defaultTimeZone
+        return f
+    }()
+
+    init(mode: Mode) { self.mode = mode }
+
+    var total: Int { rows.count }
+    var connectedCount: Int { rows.filter(\.connected).count }
+    var anyDown: Bool { problem == nil && rows.contains { !$0.connected } }
+    var canReconnectAll: Bool { problem == nil && rows.contains { !$0.connected && !inFlight.contains($0.id) } }
+    var alarm: Bool { problem != nil || connectedCount < total }
+    var countText: String { problem != nil ? "?" : "\(connectedCount)/\(total)" }
+    var summary: String { problem != nil ? "Fleet config problem" : "\(connectedCount) of \(total) online" }
+    var actionsLive: Bool { mode == .live || mode == .dryRun }
+    var badge: String? {
+        switch mode {
+        case .demo: return "DEMO"
+        case .dryRun: return "DRY RUN"
+        default: return nil
+        }
+    }
+    var watchdogCaption: String {
+        guard let w = watchdog else { return "Unavailable" }
+        if !w.dirExists { return "No watchdog state folder" }
+        if w.isOn { return "Auto-recovery on" }
+        if w.isFullyOff { return "Auto-recovery off" }
+        return "Auto-recovery off for " + w.disabled.map(\.name).joined(separator: ", ")
+    }
 
     /// The one short red header line, only when self-healing or Telegram is broken.
     var headerProblem: String? {
@@ -320,47 +360,8 @@ final class FleetStore: ObservableObject {
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
-    let mode: Mode
-    private(set) var config: FleetConfig?
-    var onChange: (() -> Void)?
-    private var lastStates: [String: BotState] = [:]
-    private var didFirstRefresh = false
-    private var lastProblem: String?
-    private let reconnectQueue = DispatchQueue(label: "com.nexera.telebots-menubar.reconnect")
-    private let clock: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "h:mm:ss a zzz"
-        f.timeZone = FleetModel.defaultTimeZone
-        return f
-    }()
-
-    init(mode: Mode) { self.mode = mode }
-
-    var total: Int { rows.count }
-    var connectedCount: Int { rows.filter(\.connected).count }
-    var anyDown: Bool { problem == nil && rows.contains { !$0.connected } }
-    var canReconnectAll: Bool { problem == nil && rows.contains { !$0.connected && !inFlight.contains($0.id) } }
-    var alarm: Bool { problem != nil || connectedCount < total }
-    var countText: String { problem != nil ? "?" : "\(connectedCount)/\(total)" }
-    var summary: String { problem != nil ? "Fleet config problem" : "\(connectedCount) of \(total) online" }
-    var badge: String? {
-        switch mode {
-        case .demo: return "DEMO"
-        case .dryRun: return "DRY RUN"
-        default: return nil
-        }
-    }
-    var watchdogCaption: String {
-        guard let w = watchdog else { return "Unavailable" }
-        if !w.dirExists { return "No watchdog state folder" }
-        if w.isOn { return "Auto-recovery on" }
-        if w.isFullyOff { return "Auto-recovery off" }
-        return "Off for " + w.disabled.map(\.name).joined(separator: ", ")
-    }
-
     private func log(_ message: String) {
-        guard mode == .live || mode == .dryRun else { return }
+        guard actionsLive else { return }
         ActionLog.shared.write(message)
     }
 
@@ -369,7 +370,7 @@ final class FleetStore: ObservableObject {
     }
 
     func logStartup() {
-        guard mode == .live || mode == .dryRun else { return }
+        guard actionsLive else { return }
         var line = "start: Telebots Bar \(appVersion) (pid \(getpid()), \(mode == .dryRun ? "dry run" : "live"))"
         switch FleetModel.loadConfig() {
         case .ok(let cfg):
@@ -377,6 +378,7 @@ final class FleetStore: ObservableObject {
             line += ", config \(cfg.path), \(cfg.bots.count) bots, engine \(engine.path ?? "none (\(engine.note))")"
             line += ", watchdog state \(cfg.settings.watchdogStateDir), heartbeat limit \(cfg.settings.heartbeatMaxAge)s"
             line += ", resume from \(cfg.settings.resumeSource.rawValue)"
+            line += ", snapshot \(cfg.settings.snapshotEngine), restore \(cfg.settings.restoreEngine)"
         case .problem(let message, _):
             line += ", config problem: \(message)"
         }
@@ -397,15 +399,22 @@ final class FleetStore: ObservableObject {
             problem = message
             rows = []
             watchdog = nil
+            header = nil
+            marks = []
             if message != lastProblem { log("config problem: \(message)") }
             lastProblem = message
         case .ok(let cfg):
             if lastProblem != nil { log("config readable again: \(cfg.path)") }
             lastProblem = nil
+            if cfg.warnings != loggedWarnings {
+                for warning in cfg.warnings { log("config warning: \(warning)") }
+                loggedWarnings = cfg.warnings
+            }
             config = cfg
             problem = nil
             ActionLog.shared.setTimeZone(cfg.settings.timeZone)
-            clock.timeZone = cfg.settings.timeZone
+            timeOfDay.timeZone = cfg.settings.timeZone
+            let now = Int(Date().timeIntervalSince1970)
             let healths = FleetModel.evaluateAll(cfg)
             var previous: [String: Row] = [:]
             for row in rows { previous[row.id] = row }
@@ -417,19 +426,78 @@ final class FleetStore: ObservableObject {
                     log("\(health.bot.key): \(before.rawValue) -> \(health.state.rawValue) (\(detail(health)))")
                 }
                 lastStates[health.bot.key] = health.state
-                next.append(makeRow(health, pulse: pulse))
+                next.append(makeRow(health, indicators(health, cfg), now: now, pulse: pulse))
             }
             rows = next
             let switches = FleetModel.readWatchdog(cfg)
             watchdog = switches
+            let signals = FleetModel.signals(cfg, now: now)
+            var reachable = signals.telegramReachable
+            if reachable == nil {
+                reachable = probe?.reachable
+                probeTelegramIfDue()
+            }
+            let status = HeaderStatus(watchdogOffFor: switches.disabled.map(\.name), watchdogTotal: cfg.bots.count,
+                                      lastPassAge: signals.lastPass.map { max(0, now - Int($0)) },
+                                      telegramReachable: reachable)
+            header = status
+            var newMarks: [MenuMark] = []
+            if !status.watchdogOffFor.isEmpty || (status.lastPassAge ?? 0) > 180 { newMarks.append(.watchdogOff) }
+            if status.telegramReachable == false { newMarks.append(.telegramDown) }
+            marks = newMarks
+            snapshotAvailable = signals.snapshotExists
+            snapshotTip = signals.snapshotExists
+                ? "Snapshot saved · \(signals.snapshotSessions) sessions · \(signals.snapshotSaved.map { clockTime($0) + " ET" } ?? "time unknown"). Restore reopens each bot that is not running in its saved conversation and turns auto-recovery back on."
+                : "No snapshot saved"
+            let problemNow = headerProblem
+            if problemNow != lastHeaderProblem {
+                if didFirstRefresh { log("header: \(problemNow ?? "all quiet (auto-recovery on, Telegram reachable)")") }
+                lastHeaderProblem = problemNow
+            }
             if !didFirstRefresh {
                 didFirstRefresh = true
-                log("first refresh: \(healths.count) bots evaluated, \(connectedCount)/\(total) connected, \(switches.label.lowercased())")
-                for health in healths { log("  \(health.bot.key): \(health.statusLine) (\(detail(health)))") }
+                log("first refresh: \(healths.count) bots evaluated, \(connectedCount)/\(total) connected, \(switches.label.lowercased())"
+                    + ", watchdog last pass \(status.lastPassAge.map { "\($0)s ago" } ?? "unknown")"
+                    + ", Telegram \(reachable.map { $0 ? "reachable" : "unreachable" } ?? "unknown")"
+                    + ", snapshot \(signals.snapshotExists ? "saved" : "none")")
+                for (health, row) in zip(healths, rows) {
+                    log("  \(health.bot.key): \(health.statusLine) (\(detail(health))) \(row.detailLine)\(row.stall ? " · stall suspected" : "")")
+                }
             }
             if let reason { log("\(reason): \(connectedCount)/\(total) connected, \(switches.label.lowercased())") }
         }
         onChange?()
+    }
+
+    /// Indicators for one bot; the context read (up to 5 MB of transcript) is cached
+    /// for 60 seconds per session.
+    private func indicators(_ health: BotHealth, _ cfg: FleetConfig) -> BotIndicators {
+        let session = health.sessionPIDs.first ?? 0
+        let cached = contextCache[health.bot.key]
+        let fresh = cached.map { $0.session == session && Date().timeIntervalSince($0.at) < 60 } ?? false
+        var ind = FleetModel.indicators(health, cfg, withContext: !fresh)
+        if fresh, let cached {
+            ind.contextPercent = cached.value
+            if let served = cached.served {
+                ind.servedModel = served
+                ind.model = served
+            }
+        } else {
+            contextCache[health.bot.key] = (session, ind.contextPercent, ind.servedModel, Date())
+        }
+        return ind
+    }
+
+    private func probeTelegramIfDue() {
+        guard !probing, probe.map({ Date().timeIntervalSince($0.at) >= 60 }) ?? true else { return }
+        probing = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let ok = FleetModel.probeTelegram()
+            Task { @MainActor in
+                self?.probe = (ok, Date())
+                self?.probing = false
+            }
+        }
     }
 
     private func detail(_ h: BotHealth) -> String {
@@ -439,44 +507,72 @@ final class FleetStore: ObservableObject {
         return "session \(session), poller \(poller), \(beat), launch \(h.launchMode)"
     }
 
-    private func makeRow(_ h: BotHealth, pulse: Int) -> Row {
+    func clockTime(_ epoch: TimeInterval) -> String {
+        timeOfDay.string(from: Date(timeIntervalSince1970: epoch))
+    }
+
+    private func uptime(_ seconds: Int) -> String {
+        let s = max(0, seconds)
+        if s < 60 { return "\(s)s" }
+        if s < 3600 { return "\(s / 60)m" }
+        if s < 86_400 { return String(format: "%dh %02dm", s / 3600, (s % 3600) / 60) }
+        return "\(s / 86_400)d \((s % 86_400) / 3600)h"
+    }
+
+    private func makeRow(_ h: BotHealth, _ ind: BotIndicators, now: Int, pulse: Int) -> Row {
         let status: String
+        var icon: String?
+        let tip: String
         let spoken: String
+        let dump: String
         switch h.state {
         case .connected:
             if let age = h.heartbeatAge {
-                status = "heard \(shortAge(age)) ago"
-                spoken = "connected, heard \(spokenAge(age)) ago"
+                status = shortAge(age)
+                icon = "waveform.path.ecg"
+                tip = "Heartbeat \(spokenAge(age)) ago: the Telegram poller's own liveness ping, written after every poll. It is not the time of the last message."
+                spoken = "connected, heartbeat \(spokenAge(age)) ago"
+                dump = "Connected · heartbeat \(shortAge(age)) ago"
             } else {
                 status = "Connected"
+                tip = "Connected: the session and its Telegram poller are both running (this poller writes no heartbeat file)."
                 spoken = "connected"
+                dump = "Connected"
             }
         case .noPoller:
             status = "No poller"
+            tip = "No poller: the session is running but its Telegram poller is gone or stopped polling, so this bot hears nothing. Reconnect restarts it through the watchdog's engine and keeps the conversation."
             spoken = "no poller, not receiving messages"
+            dump = "No poller"
         case .down:
             status = "Down"
+            tip = "Down: this bot's session is not running. Reconnect starts it again through the watchdog's engine, resumed into its latest conversation."
             spoken = "down, session not running"
+            dump = "Down"
         }
-        var beat = "no heartbeat file"
-        if let age = h.heartbeatAge, let epoch = h.heartbeat {
-            beat = "\(shortAge(age)) ago · " + clock.string(from: Date(timeIntervalSince1970: TimeInterval(epoch)))
-            if h.heartbeatStale { beat += " (stale)" }
-        } else if isRegularFile(h.bot.stateDir + "/poller.heartbeat") {
-            beat = "no time in poller.heartbeat"
+        var parts: [String] = []
+        if let model = ind.model { parts.append(model) }
+        if let effort = ind.effort { parts.append(effort) }
+        if let ctx = ind.contextPercent { parts.append("\(ctx)% ctx") }
+        if ind.restartsLastHour > 0 { parts.append("\(ind.restartsLastHour) restart\(ind.restartsLastHour == 1 ? "" : "s")/h") }
+        let detailLine = parts.isEmpty ? (h.state == .down ? "not running" : "no session details yet") : parts.joined(separator: " · ")
+        var detailTip = h.state == .down
+            ? "The model and effort this bot starts with (its saved model-state)"
+            : "The model that served this session's newest reply (or its launch model before the first reply), its effort"
+        if let ctx = ind.contextPercent { detailTip += ", \(ctx)% of its context window used" }
+        if ind.restartsLastHour > 0 { detailTip += ", and \(ind.restartsLastHour) watchdog restart\(ind.restartsLastHour == 1 ? "" : "s") in the last hour" }
+        detailTip += "."
+        var uptimeLine: String?
+        if let started = ind.sessionStarted {
+            uptimeLine = "Up \(uptime(now - Int(started))) · \(ind.launchMode) \(clockTime(started))"
+        } else if let beat = ind.lastHeartbeat {
+            uptimeLine = "Down since \(clockTime(beat))"
+        } else {
+            uptimeLine = "Down"
         }
-        var lines: [String] = []
-        var note: String?
-        switch FleetModel.launchLogTail(h.bot, sessionPID: h.sessionPIDs.first) {
-        case .none: note = "No launch log"
-        case .empty: note = "Launch log is empty"
-        case .lines(let tail): lines = tail
-        }
-        return Row(id: h.bot.key, name: h.bot.name, state: h.state, statusText: status, dumpStatus: h.statusLine,
-                   spokenStatus: spoken,
-                   sessionPID: h.sessionPIDs.first.map(String.init) ?? "not running",
-                   pollerPID: h.pollerPIDs.first.map(String.init) ?? "not running",
-                   launchMode: h.launchMode, heartbeat: beat, logLines: lines, logNote: note, pulse: pulse)
+        return Row(id: h.bot.key, name: h.bot.name, state: h.state, statusText: status, statusIcon: icon,
+                   statusTip: tip, dumpStatus: dump, spokenStatus: spoken, detailLine: detailLine, detailTip: detailTip,
+                   stall: ind.stallSuspected, uptimeLine: uptimeLine, pulse: pulse)
     }
 
     private func spokenAge(_ seconds: Int) -> String {
@@ -495,7 +591,7 @@ final class FleetStore: ObservableObject {
     // MARK: Actions
 
     func requestReconnect(_ key: String) {
-        guard mode == .live || mode == .dryRun else { return }
+        guard actionsLive else { return }
         guard let cfg = config, let bot = cfg.bots.first(where: { $0.key == key }), !inFlight.contains(key) else { return }
         refresh()
         let state = rows.first { $0.id == key }?.state ?? .down
@@ -518,29 +614,48 @@ final class FleetStore: ObservableObject {
             }
             confirmed = true
         }
-        startReconnect(bot, cfg, allowConnected: confirmed, origin: "Reconnect \(bot.name)")
+        startReconnect(bot, cfg, allowConnected: confirmed, freshStart: false, origin: "Reconnect \(bot.name)")
+    }
+
+    /// Fresh start: a new, empty conversation through the /fresh path. Always asks.
+    func requestFreshStart(_ key: String) {
+        guard actionsLive else { return }
+        guard let cfg = config, let bot = cfg.bots.first(where: { $0.key == key }), !inFlight.contains(key) else { return }
+        NSApp.activate()
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Start \(bot.name) fresh?"
+        alert.informativeText = "This ends \(bot.name)'s current conversation and starts a new, empty one (the /fresh path). Reconnect keeps the conversation instead."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Fresh start")
+        guard alert.runModal() == .alertSecondButtonReturn else {
+            log("fresh start \(key): cancelled at the confirm prompt")
+            return
+        }
+        startReconnect(bot, cfg, allowConnected: true, freshStart: true, origin: "Fresh start \(bot.name)")
     }
 
     func reconnectAllDown() {
-        guard mode == .live || mode == .dryRun, let cfg = config else { return }
+        guard actionsLive, let cfg = config else { return }
         refresh()
         let targets = rows.filter { !$0.connected && !inFlight.contains($0.id) }
         guard !targets.isEmpty else { return }
         log("Reconnect all down: \(targets.map(\.id).joined(separator: ", "))")
         for row in targets {
             if let bot = cfg.bots.first(where: { $0.key == row.id }) {
-                startReconnect(bot, cfg, allowConnected: false, origin: "Reconnect all down")
+                startReconnect(bot, cfg, allowConnected: false, freshStart: false, origin: "Reconnect all down")
             }
         }
     }
 
-    private func startReconnect(_ bot: Bot, _ cfg: FleetConfig, allowConnected: Bool, origin: String) {
+    private func startReconnect(_ bot: Bot, _ cfg: FleetConfig, allowConnected: Bool, freshStart: Bool, origin: String) {
         inFlight.insert(bot.key)
         let dryRun = mode == .dryRun
-        log("\(origin): queued \(bot.key)\(allowConnected ? " (confirmed restart of a connected bot)" : "")")
+        log("\(origin): queued \(bot.key)\(allowConnected && !freshStart ? " (confirmed restart of a connected bot)" : "")")
         reconnectQueue.async { [weak self] in
             let outcome = FleetModel.performReconnect(bot, cfg, allowConnected: allowConnected, dryRun: dryRun,
-                                                      askForPermission: true, log: { ActionLog.shared.write($0) })
+                                                      askForPermission: true, freshStart: freshStart,
+                                                      log: { ActionLog.shared.write($0) })
             Task { @MainActor in self?.finishReconnect(bot, outcome) }
         }
     }
@@ -556,33 +671,105 @@ final class FleetStore: ObservableObject {
                 self?.succeeded.remove(bot.key)
             }
         case .permissionBlocked:
-            NSApp.activate()
-            let alert = NSAlert()
-            alert.messageText = "Telebots Bar can't open \(bot.name)'s Terminal window"
-            alert.informativeText = "Reconnect needs permission to control Terminal. Allow Telebots Bar in System Settings > Privacy & Security > Automation, then try again. Nothing was restarted."
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
+            showPermissionAlert(bot.name + "'s Terminal window")
         default:
             break
         }
     }
 
+    private func showPermissionAlert(_ what: String) {
+        NSApp.activate()
+        let alert = NSAlert()
+        alert.messageText = "Telebots Bar can't open \(what)"
+        alert.informativeText = "This needs permission to control Terminal. Allow Telebots Bar in System Settings > Privacy & Security > Automation, then try again. Nothing was restarted."
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
     func setWatchdog(on: Bool) {
-        guard mode == .live || mode == .dryRun, let cfg = config else { return }
+        guard actionsLive, let cfg = config else { return }
         log("watchdog switch set \(on ? "on" : "off") from the panel")
         FleetModel.applyWatchdog(on: on, cfg, dryRun: mode == .dryRun, log: { ActionLog.shared.write($0) })
         refresh()
     }
 
-    func openLog() {
-        guard mode == .live || mode == .dryRun, let cfg = config else { return }
-        let path = cfg.settings.watchdogLog
-        guard FileManager.default.fileExists(atPath: path) else {
-            log("open fleet log: \(path) does not exist")
-            return
+    /// Snapshot: the fleet snapshot engine, with a spinner, then a short confirmation.
+    func snapshotNow() {
+        guard actionsLive, let cfg = config, !snapshotBusy, !restoreBusy else { return }
+        snapshotBusy = true
+        let dryRun = mode == .dryRun
+        log("Snapshot pressed")
+        engineQueue.async { [weak self] in
+            let run = FleetModel.runFleetEngine(.snapshot, cfg, dryRun: dryRun, log: { ActionLog.shared.write($0) })
+            Task { @MainActor in self?.finishSnapshot(run, dryRun: dryRun) }
         }
-        log("open fleet log: \(path)")
-        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+    }
+
+    private func finishSnapshot(_ run: EngineRun?, dryRun: Bool) {
+        snapshotBusy = false
+        refresh()
+        guard let run else { return confirm("Snapshot could not run · see menubar.log") }
+        if dryRun { return confirm("Dry run · snapshot command logged") }
+        guard run.code == 0, let cfg = config else { return confirm("Snapshot failed · see menubar.log") }
+        let signals = FleetModel.signals(cfg, now: Int(Date().timeIntervalSince1970))
+        let when = signals.snapshotSaved.map { clockTime($0) + " ET" } ?? "just now"
+        confirm("Snapshot saved · \(signals.snapshotSessions) sessions · \(when)")
+    }
+
+    /// Restore: the fleet restore engine, with a spinner, then a short confirmation.
+    func restoreNow() {
+        guard actionsLive, let cfg = config, !snapshotBusy, !restoreBusy else { return }
+        restoreBusy = true
+        let dryRun = mode == .dryRun
+        let someoneDown = rows.contains { !$0.connected }
+        log("Restore pressed")
+        engineQueue.async { [weak self] in
+            // Restore opens Terminal windows for bots that are not running, so the
+            // Terminal permission is settled first, before anything is touched.
+            if !dryRun && someoneDown {
+                var automation = FleetModel.terminalAutomation(askUser: false)
+                if automation == .wouldPrompt { automation = FleetModel.terminalAutomation(askUser: true) }
+                if automation == .denied || automation == .wouldPrompt {
+                    ActionLog.shared.write("restore: stopped before anything was touched, Terminal automation is \(automation.text)")
+                    Task { @MainActor in
+                        self?.restoreBusy = false
+                        self?.showPermissionAlert("the bots' Terminal windows")
+                    }
+                    return
+                }
+            }
+            let run = FleetModel.runFleetEngine(.restore, cfg, dryRun: dryRun, log: { ActionLog.shared.write($0) })
+            if let run, run.code == 0, !dryRun {
+                // Give reopened bots time to bring their pollers up before counting.
+                let deadline = Date().addingTimeInterval(30)
+                while Date() < deadline && FleetModel.evaluateAll(cfg).contains(where: { $0.state != .connected }) {
+                    Thread.sleep(forTimeInterval: 2)
+                }
+            }
+            Task { @MainActor in self?.finishRestore(run, dryRun: dryRun) }
+        }
+    }
+
+    private func finishRestore(_ run: EngineRun?, dryRun: Bool) {
+        restoreBusy = false
+        refresh()
+        guard let run else { return confirm("Restore could not run · see menubar.log") }
+        if dryRun { return confirm("Dry run · restore command logged") }
+        guard run.code == 0 else { return confirm("Restore failed · see menubar.log") }
+        confirm("Restored · \(connectedCount) bot\(connectedCount == 1 ? "" : "s") back")
+    }
+
+    /// A brief inline confirmation under the bottom group that fades after 6 seconds.
+    private func confirm(_ text: String) {
+        log("confirmation: \(text)")
+        confirmationToken += 1
+        let token = confirmationToken
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) { confirmation = text }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(6))
+            guard let self, self.confirmationToken == token else { return }
+            withAnimation(self.reduceMotion ? nil : .easeOut(duration: 0.4)) { self.confirmation = nil }
+        }
     }
 
     func quit() {
@@ -593,29 +780,33 @@ final class FleetStore: ObservableObject {
     // MARK: Text forms
 
     var iconText: String {
-        let marks = rows.map { $0.connected ? "●" : "○" }
-        let cols = DotArt.grid(max(marks.count, 1)).cols
-        return stride(from: 0, to: marks.count, by: cols)
-            .map { marks[$0..<min($0 + cols, marks.count)].joined() }
+        let dots = rows.map { $0.connected ? "●" : "○" }
+        let cols = DotArt.grid(max(dots.count, 1)).cols
+        return stride(from: 0, to: dots.count, by: cols)
+            .map { dots[$0..<min($0 + cols, dots.count)].joined() }
             .joined(separator: "/")
     }
 
     func dumpText() -> String {
         var out: [String] = []
-        let color = alarm ? "red" : "monochrome"
-        out.append("Status item: \(iconText.isEmpty ? "?" : iconText)  \(countText)  (\(color))")
+        let markText = marks.map { $0 == .watchdogOff ? "[shield-slash: auto-recovery off]" : "[antenna-slash: Telegram unreachable]" }
+        var itemParts: [String] = ["Status item: " + (iconText.isEmpty ? "?" : iconText)]
+        itemParts.append(contentsOf: markText)
+        itemParts.append(countText + "  (" + (alarm ? "red" : "monochrome") + ")")
+        out.append(itemParts.joined(separator: "  "))
         out.append("TELEBOTS · \(summary)")
+        if let headerProblem { out.append("  \(headerProblem)  (red)") }
         if let problem { out.append("  \(problem)") }
         let width = rows.map(\.name.count).max() ?? 0
         let statusWidth = rows.map(\.dumpStatus.count).max() ?? 0
         for row in rows {
             let name = row.name.padding(toLength: width, withPad: " ", startingAt: 0)
             let status = row.dumpStatus.padding(toLength: statusWidth, withPad: " ", startingAt: 0)
-            out.append("  \(row.connected ? "●" : "○") \(name)  \(status)  [Reconnect \(row.name)]")
+            out.append("  \(row.connected ? "●" : "○") \(name)  \(status)  \(row.detailLine)\(row.stall ? " · stall suspected" : "")  [Reconnect]")
         }
-        out.append("[Reconnect all down]" + (canReconnectAll ? "" : "  (disabled)"))
-        out.append(watchdog?.label ?? "Watchdog: unavailable")
-        out.append("[Refresh now]  [Open fleet log]  [Quit]")
+        if anyDown { out.append("[Reconnect all down]") }
+        out.append("Watchdog: \(watchdogCaption) [switch \(watchdog?.isOn == true ? "on" : "off")]")
+        out.append("[Snapshot]  [Restore\(snapshotAvailable ? "" : " (disabled: no snapshot saved)")]  [Refresh]")
         if let cfg = config { out.append("config: \(cfg.path)") }
         return out.joined(separator: "\n")
     }
@@ -633,29 +824,25 @@ final class FleetStore: ObservableObject {
         func row(_ i: Int, _ state: BotState, _ status: String, detail: String, stall: Bool = false,
                  uptime: String? = nil) -> Row {
             let beating = state == .connected
-            return Row(id: "demo-\(i)", name: names[i], state: state, statusText: status, dumpStatus: status,
-                       spokenStatus: status, sessionPID: "", pollerPID: "", launchMode: "",
-                       heartbeat: "", logLines: [], logNote: nil, pulse: 0,
+            return Row(id: "demo-\(i)", name: names[i], state: state, statusText: status,
                        statusIcon: beating ? "waveform.path.ecg" : nil,
                        statusTip: beating
                            ? "Heartbeat \(status) ago: the Telegram poller's own liveness ping, written after every poll. It is not the time of the last message."
-                           : "\(status): this bot cannot receive or answer messages. Reconnect restarts it through the watchdog's own engine.",
-                       detailLine: detail,
-                       detailTip: "Model and effort of the running session, context window used"
-                           + (detail.contains("restart") ? ", and watchdog restarts in the last hour." : "."),
-                       stall: stall,
-                       uptimeLine: uptime)
+                           : "\(status): this bot cannot receive or answer messages.",
+                       dumpStatus: status, spokenStatus: status, detailLine: detail,
+                       detailTip: "Model and effort of the running session and context window used.",
+                       stall: stall, uptimeLine: uptime, pulse: 0)
         }
         switch frame {
         case .main, .legend:
             store.rows = [
-                row(0, .connected, "12s", detail: "opus 1M · max · 41% ctx", uptime: "Up 5h 02m · resumed 7:46am"),
-                row(1, .connected, "3s", detail: "opus 1M · max · 63% ctx", stall: true, uptime: "Up 1h 20m · fresh 11:28am"),
-                row(2, .noPoller, "No poller", detail: "opus 1M · max · 12% ctx · 2 restarts/h",
+                row(0, .connected, "12s", detail: "Opus 5.5 · max · 41% ctx", uptime: "Up 5h 02m · resumed 7:46am"),
+                row(1, .connected, "3s", detail: "Opus 5.5 · max · 63% ctx", stall: true, uptime: "Up 1h 20m · fresh 11:28am"),
+                row(2, .noPoller, "No poller", detail: "Opus 5.5 · max · 12% ctx · 2 restarts/h",
                     uptime: "Up 2h 14m · resumed 10:34am"),
-                row(3, .noPoller, "No poller", detail: "fable · high · 18% ctx", uptime: "Up 38m · fresh 12:10pm"),
-                row(4, .down, "Down", detail: "opus 1M · max · 1 restart/h", uptime: "Down since 12:31pm"),
-                row(5, .connected, "1s", detail: "opus 1M · max · 7% ctx", uptime: "Up 1m · resumed 12:47pm"),
+                row(3, .noPoller, "No poller", detail: "Fable 5.1 · high · 18% ctx", uptime: "Up 38m · fresh 12:10pm"),
+                row(4, .down, "Down", detail: "Opus 5.5 · max · 1 restart/h", uptime: "Down since 12:31pm"),
+                row(5, .connected, "1s", detail: "Opus 5.5 · max · 7% ctx", uptime: "Up 1m · resumed 12:47pm"),
             ]
             store.inFlight = ["demo-3"]
             store.succeeded = ["demo-5"]
@@ -663,16 +850,14 @@ final class FleetStore: ObservableObject {
             store.watchdog = WatchdogSwitches(dir: "demo", dirExists: true, disabled: [], total: 6)
             store.header = HeaderStatus(watchdogOffFor: [], watchdogTotal: 6, lastPassAge: 12, telegramReachable: true)
             store.showLegend = frame == .legend
-            store.snapshotAvailable = false
-            store.snapshotTip = "No snapshot saved"
         case .snapshot:
             store.rows = [
-                row(0, .connected, "12s", detail: "opus 1M · max · 41% ctx"),
-                row(1, .connected, "3s", detail: "opus 1M · max · 63% ctx"),
-                row(2, .connected, "9s", detail: "opus 1M · max · 12% ctx"),
-                row(3, .connected, "20s", detail: "fable · high · 18% ctx"),
-                row(4, .connected, "5s", detail: "opus 1M · max · 22% ctx"),
-                row(5, .connected, "1s", detail: "opus 1M · max · 7% ctx"),
+                row(0, .connected, "12s", detail: "Opus 5.5 · max · 41% ctx"),
+                row(1, .connected, "3s", detail: "Opus 5.5 · max · 63% ctx"),
+                row(2, .connected, "9s", detail: "Opus 5.5 · max · 12% ctx"),
+                row(3, .connected, "20s", detail: "Fable 5.1 · high · 18% ctx"),
+                row(4, .connected, "5s", detail: "Opus 5.5 · max · 22% ctx"),
+                row(5, .connected, "1s", detail: "Opus 5.5 · max · 7% ctx"),
             ]
             let bots = names.prefix(6).map { Bot(key: $0.lowercased(), name: $0, workdir: "", stateDir: "") }
             store.watchdog = WatchdogSwitches(dir: "demo", dirExists: true, disabled: Array(bots), total: 6)
@@ -680,10 +865,9 @@ final class FleetStore: ObservableObject {
                                         telegramReachable: true)
             store.marks = [.watchdogOff]
             store.snapshotAvailable = true
-            store.snapshotTip = "Snapshot saved · 6 sessions · 12:41pm ET. Restore reopens each bot in that conversation and turns auto-recovery back on."
+            store.snapshotTip = "Snapshot saved · 6 sessions · 12:41pm ET. Restore reopens each bot that is not running in its saved conversation and turns auto-recovery back on."
             store.confirmation = "Snapshot saved · 6 sessions · 12:41pm ET"
         }
-        store.indicatorsEnabled = true
         return store
     }
 }
@@ -905,7 +1089,8 @@ struct MotifMark: View {
         let (r, c) = DotArt.grid(count)
         ZStack {
             RoundedRectangle(cornerRadius: Radius.tile, style: .continuous).fill(Palette.tile)
-            RoundedRectangle(cornerRadius: Radius.tile, style: .continuous).strokeBorder(Color.white.opacity(0.12), lineWidth: 0.5)
+            // A hairline in the ink color: invisible on light glass, a soft edge on dark.
+            RoundedRectangle(cornerRadius: Radius.tile, style: .continuous).strokeBorder(Palette.ink.opacity(0.3), lineWidth: 1)
             VStack(spacing: 4) {
                 ForEach(0..<r, id: \.self) { ri in
                     HStack(spacing: 4) {
@@ -950,176 +1135,6 @@ struct StatusRing: View {
     }
 }
 
-struct HeaderView: View {
-    @ObservedObject var store: FleetStore
-
-    var body: some View {
-        HStack(alignment: .center, spacing: Space.m) {
-            MotifMark(rows: store.rows, animate: !store.reduceMotion)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text("TELEBOTS")
-                        .font(.system(size: 13, weight: .bold))
-                        .tracking(2.2)
-                        .foregroundStyle(Palette.label)
-                    if let badge = store.badge {
-                        Text(badge)
-                            .font(.system(size: 9, weight: .bold))
-                            .tracking(0.8)
-                            .foregroundStyle(Palette.label)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1)
-                            .overlay(Capsule().strokeBorder(Palette.label, lineWidth: 1))
-                    }
-                }
-                Text(store.summary)
-                    .font(.system(size: 12))
-                    .monospacedDigit()
-                    .foregroundStyle(Palette.label)
-            }
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel("Telebots, \(store.summary)" + (store.badge.map { ", \($0.lowercased())" } ?? ""))
-            Spacer(minLength: Space.s)
-            StatusRing(states: store.rows.map(\.connected))
-                .frame(width: 26, height: 26)
-                .help("One segment per bot, in fleet order: solid when connected, red when not.")
-                .accessibilityElement()
-                .accessibilityLabel("Status ring, \(store.summary)")
-        }
-    }
-}
-
-struct BotRowView: View {
-    let row: FleetStore.Row
-    @ObservedObject var store: FleetStore
-    @State private var hovering = false
-    @FocusState private var focused: Bool
-
-    private var expanded: Bool { store.expanded.contains(row.id) }
-    private var busy: Bool { store.inFlight.contains(row.id) }
-    private var justBack: Bool { store.succeeded.contains(row.id) }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 0) {
-                HStack(spacing: 0) {
-                    PulseDot(connected: row.connected, pulse: row.pulse, size: 9, on: Palette.ink, off: Palette.alert,
-                             animate: !store.reduceMotion)
-                    Text(row.name)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(Palette.label)
-                        .lineLimit(1)
-                        .padding(.leading, 9)
-                    Spacer(minLength: 8)
-                    status.fixedSize()
-                }
-                .contentShape(Rectangle())
-                .onTapGesture { store.toggleExpanded(row.id) }
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel("\(row.name), \(busy ? "reconnecting" : row.spokenStatus)")
-                .accessibilityHint(expanded ? "Hides details" : "Shows details")
-                .accessibilityAddTraits(.isButton)
-                .accessibilityAction { store.toggleExpanded(row.id) }
-
-                Button {
-                    let id = row.id
-                    Task { @MainActor in store.requestReconnect(id) }
-                } label: {
-                    Text("Reconnect").font(.system(size: 11, weight: .medium)).foregroundStyle(Palette.label)
-                }
-                .capsuleButton(prominent: false)
-                .controlSize(.small)
-                .disabled(busy || store.problem != nil)
-                .help(row.connected
-                      ? "Restart \(row.name) through the watchdog's restart engine, resumed into its conversation. It asks first because the bot is connected."
-                      : "Restart \(row.name) through the watchdog's restart engine, resumed into its conversation.")
-                .accessibilityLabel("Reconnect \(row.name)")
-                .padding(.leading, 8)
-            }
-            .frame(minHeight: 40)
-
-            if expanded {
-                BotDetailsView(row: row)
-                    .padding(.leading, 18)
-                    .padding(.bottom, 10)
-            }
-        }
-        .padding(.horizontal, 8)
-        .background(
-            RoundedRectangle(cornerRadius: Radius.row, style: .continuous)
-                .fill(Palette.ink.opacity(hovering || focused ? 0.08 : 0))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: Radius.row, style: .continuous)
-                .strokeBorder(Palette.ink.opacity(focused ? 0.6 : 0), lineWidth: 1.5)
-        )
-        .onHover { hovering = $0 }
-        .focusable()
-        .focused($focused)
-        .focusEffectDisabled()
-        .onKeyPress(.return) { store.toggleExpanded(row.id); return .handled }
-        .onKeyPress(.space) { store.toggleExpanded(row.id); return .handled }
-    }
-
-    @ViewBuilder private var status: some View {
-        if busy {
-            RowSpinner()
-                .accessibilityLabel("Reconnecting")
-        } else if justBack {
-            HStack(spacing: 4) {
-                Image(systemName: "checkmark.circle.fill").font(.system(size: 11, weight: .semibold))
-                Text("Back").font(.system(size: 12, weight: .medium))
-            }
-            .foregroundStyle(Palette.label)
-            .transition(store.reduceMotion ? .identity : .scale(scale: 0.6).combined(with: .opacity))
-        } else {
-            Text(row.statusText)
-                .font(.system(size: 12, weight: row.connected ? .regular : .semibold))
-                .monospacedDigit()
-                .foregroundStyle(Palette.label)
-                .lineLimit(1)
-        }
-    }
-}
-
-struct BotDetailsView: View {
-    let row: FleetStore.Row
-
-    var body: some View {
-        Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 4) {
-            line("Session", row.sessionPID)
-            line("Poller", row.pollerPID)
-            line("Launch", row.launchMode)
-            line("Heartbeat", row.heartbeat)
-            GridRow {
-                Text("Launch log")
-                VStack(alignment: .leading, spacing: 2) {
-                    if let note = row.logNote {
-                        Text(note).fontWeight(.medium)
-                    }
-                    ForEach(Array(row.logLines.enumerated()), id: \.offset) { _, text in
-                        Text(text)
-                            .font(.system(size: 10, weight: .medium, design: .monospaced))
-                            .lineLimit(2)
-                            .truncationMode(.tail)
-                    }
-                }
-            }
-        }
-        .font(.system(size: 11))
-        .foregroundStyle(Palette.label)
-        .accessibilityElement(children: .combine)
-    }
-
-    private func line(_ label: String, _ value: String) -> some View {
-        GridRow {
-            Text(label)
-            Text(value).fontWeight(.medium).monospacedDigit().lineLimit(1)
-        }
-    }
-}
-
 struct IconButton: View {
     let symbol: String
     let label: String
@@ -1138,105 +1153,30 @@ struct IconButton: View {
     }
 }
 
-struct FooterView: View {
-    @ObservedObject var store: FleetStore
-
-    var body: some View {
-        VStack(spacing: 10) {
-            Button {
-                Task { @MainActor in store.reconnectAllDown() }
-            } label: {
-                Label("Reconnect all down", systemImage: "arrow.triangle.2.circlepath")
-                    .font(.system(size: 13, weight: .semibold))
-                    .frame(maxWidth: .infinity)
-            }
-            .capsuleButton(prominent: store.anyDown, tint: Palette.alertFill)
-            .controlSize(.large)
-            .disabled(!store.canReconnectAll)
-            .accessibilityLabel("Reconnect all down")
-
-            HStack(spacing: Space.s) {
-                Toggle(isOn: Binding(
-                    get: { store.watchdog?.isOn ?? false },
-                    set: { value in Task { @MainActor in store.setWatchdog(on: value) } }
-                )) {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("Watchdog").font(.system(size: 13, weight: .semibold)).foregroundStyle(Palette.label)
-                        Text(store.watchdogCaption).font(.system(size: 11)).foregroundStyle(Palette.label).lineLimit(1)
-                    }
-                }
-                .modifier(SwitchStyleChoice())
-                .tint(Palette.mono)
-                .controlSize(.small)
-                .disabled(store.watchdog?.dirExists != true)
-                .accessibilityLabel("Watchdog")
-                .accessibilityValue(store.watchdogCaption)
-
-                Spacer(minLength: Space.s)
-
-                IconButton(symbol: "arrow.clockwise", label: "Refresh now") {
-                    store.refresh(reason: "refresh now")
-                }
-                IconButton(symbol: "doc.text", label: "Open fleet log") { store.openLog() }
-                IconButton(symbol: "power", label: "Quit Telebots Bar") { store.quit() }
-            }
-        }
-    }
-}
-
 struct PanelView: View {
     @ObservedObject var store: FleetStore
     let close: () -> Void
     @FocusState private var headerFocused: Bool
 
     var body: some View {
-        Group {
-            if store.indicatorsEnabled { panelV2 } else { panelV1 }
+        VStack(alignment: .leading, spacing: Space.m) {
+            // The header takes the first focus when the panel opens, so no row shows a
+            // focus ring until Tab moves into the list.
+            HeaderV2(store: store)
+                .focusable()
+                .focused($headerFocused)
+                .focusEffectDisabled()
+            if store.showLegend {
+                LegendV2(store: store)
+            }
+            RowsGroupV2(store: store)
+            FooterV2(store: store)
         }
         .padding(Space.l)
         .frame(width: 320)
         .background(Palette.scrim, in: RoundedRectangle(cornerRadius: Radius.panel, style: .continuous))
         .defaultFocus($headerFocused, true)
         .onExitCommand(perform: close)
-    }
-
-    private var panelV1: some View {
-        VStack(alignment: .leading, spacing: Space.m) {
-            // The header takes the first focus when the panel opens, so no row shows a
-            // focus ring until Tab moves into the list.
-            HeaderView(store: store)
-                .focusable()
-                .focused($headerFocused)
-                .focusEffectDisabled()
-            GlassGroup {
-                VStack(spacing: 2) {
-                    if let problem = store.problem {
-                        ConfigProblemView(problem: problem)
-                    } else {
-                        ForEach(store.rows) { row in
-                            BotRowView(row: row, store: store)
-                        }
-                    }
-                }
-                .padding(4)
-                .glassSurface(cornerRadius: Radius.group)
-            }
-            FooterView(store: store)
-        }
-    }
-
-    private var panelV2: some View {
-        VStack(alignment: .leading, spacing: Space.m) {
-            HeaderV2(store: store)
-                .focusable()
-                .focused($headerFocused)
-                .focusEffectDisabled()
-            if store.showLegend {
-                LegendV2()
-            }
-            RowsGroupV2(store: store)
-            FooterV2(store: store)
-        }
     }
 }
 
@@ -1276,9 +1216,14 @@ enum Grid2 {
 }
 
 extension Palette {
-    /// Secondary text: the label color one step lighter. On the measured glass it
-    /// still holds 4.9:1 or better in both appearances.
-    static let secondary = Color(nsColor: .labelColor).opacity(0.8)
+    /// Secondary text: the label color one step lighter. Measured on the real light
+    /// glass, 80% came out at 4.3:1, so it sits at 90% to keep 4.5:1 or better.
+    static let secondary = Color(nsColor: .labelColor).opacity(0.9)
+    /// Labels on disabled buttons (the explicit label color would otherwise hide the
+    /// system's dimming).
+    static func label(enabled: Bool) -> Color {
+        enabled ? label : Color(nsColor: .labelColor).opacity(0.35)
+    }
 }
 
 struct HeaderV2: View {
@@ -1344,8 +1289,11 @@ struct HeaderV2: View {
     }
 }
 
-/// The legend behind the "?" button: every mark in the menu bar and the panel.
+/// The legend behind the "?" button: every mark in the menu bar and the panel, and
+/// the quiet way out of the app.
 struct LegendV2: View {
+    @ObservedObject var store: FleetStore
+
     private func dots(_ states: [Bool]) -> some View {
         HStack(spacing: 2) {
             ForEach(Array(states.enumerated()), id: \.offset) { _, on in
@@ -1359,6 +1307,26 @@ struct LegendV2: View {
     }
 
     var body: some View {
+        VStack(alignment: .leading, spacing: Grid2.gap + 2) {
+            legendGrid
+            Button {
+                store.quit()
+            } label: {
+                Text("Quit Telebots Bar")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Palette.secondary)
+                    .underline()
+            }
+            .buttonStyle(.plain)
+            .help("Quits this menu bar app only; the bots keep running")
+            .accessibilityLabel("Quit Telebots Bar")
+        }
+        .padding(Grid2.inset)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Palette.ink.opacity(0.05)))
+    }
+
+    private var legendGrid: some View {
         Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 6) {
             GridRow {
                 dots([true, true, false])
@@ -1396,9 +1364,6 @@ struct LegendV2: View {
         .font(.system(size: 11))
         .foregroundStyle(Palette.label)
         .lineLimit(1)
-        .padding(Grid2.inset)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Palette.ink.opacity(0.05)))
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Legend")
     }
@@ -1481,7 +1446,7 @@ struct RowV2: View {
                 } label: {
                     Text("Reconnect")
                         .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(Palette.label)
+                        .foregroundStyle(Palette.label(enabled: !(busy || store.problem != nil)))
                         .lineLimit(1)
                         .frame(width: Grid2.actionWidth)
                 }
@@ -1495,18 +1460,16 @@ struct RowV2: View {
             }
             .frame(height: 22)
 
-            if let detail = row.detailLine {
-                (Text(detail) + (row.stall ? Text(" · ") + Text("stall suspected").fontWeight(.semibold) : Text("")))
-                    .font(.system(size: 11))
-                    .monospacedDigit()
-                    .foregroundStyle(Palette.secondary)
-                    .lineLimit(1)
-                    .padding(.leading, Grid2.textIndent)
-                    .padding(.top, 3)
-                    .help(row.detailTip + (row.stall
-                          ? " Stall suspected: a message reached this bot over 10 minutes ago and nothing has happened since. The watchdog only flags this; it never restarts for it."
-                          : ""))
-            }
+            (Text(row.detailLine) + (row.stall ? Text(" · ") + Text("stall suspected").fontWeight(.semibold) : Text("")))
+                .font(.system(size: 11))
+                .monospacedDigit()
+                .foregroundStyle(Palette.secondary)
+                .lineLimit(1)
+                .padding(.leading, Grid2.textIndent)
+                .padding(.top, 3)
+                .help(row.detailTip + (row.stall
+                      ? " Stall suspected: a message reached this bot over 10 minutes ago and nothing has happened since. The watchdog only flags this; it never restarts for it."
+                      : ""))
 
             if expanded, let uptime = row.uptimeLine {
                 // One line and one button. When a long uptime cannot share the line with
@@ -1563,6 +1526,8 @@ struct RowV2: View {
 
     private var freshStartButton: some View {
         Button {
+            let id = row.id
+            Task { @MainActor in store.requestFreshStart(id) }
         } label: {
             Text("Fresh start")
                 .font(.system(size: 10.5, weight: .medium))
@@ -1571,7 +1536,8 @@ struct RowV2: View {
         }
         .buttonStyle(OutlineCapsuleStyle())
         .controlSize(.small)
-        .help("Restart \(row.name) with a new, empty conversation (the /fresh path). Reconnect keeps the conversation.")
+        .disabled(busy || store.problem != nil)
+        .help("Restart \(row.name) with a new, empty conversation (the /fresh path). It asks first. Reconnect keeps the conversation.")
         .accessibilityLabel("Fresh start \(row.name)")
     }
 
@@ -1657,6 +1623,7 @@ struct FooterV2: View {
 
                 HStack(spacing: Grid2.gap) {
                     Button {
+                        Task { @MainActor in store.snapshotNow() }
                     } label: {
                         HStack(spacing: 4) {
                             if store.snapshotBusy { RowSpinner() } else { Image(systemName: "camera") }
@@ -1664,7 +1631,7 @@ struct FooterV2: View {
                         }
                         .font(.system(size: 11, weight: .medium))
                         .fixedSize()
-                        .foregroundStyle(Palette.label)
+                        .foregroundStyle(Palette.label(enabled: !store.snapshotBusy && !store.restoreBusy))
                     }
                     .capsuleButton(prominent: false)
                     .controlSize(.small)
@@ -1673,6 +1640,7 @@ struct FooterV2: View {
                     .accessibilityLabel("Snapshot")
 
                     Button {
+                        Task { @MainActor in store.restoreNow() }
                     } label: {
                         HStack(spacing: 4) {
                             if store.restoreBusy { RowSpinner() } else { Image(systemName: "clock.arrow.circlepath") }
@@ -1680,7 +1648,7 @@ struct FooterV2: View {
                         }
                         .font(.system(size: 11, weight: .medium))
                         .fixedSize()
-                        .foregroundStyle(Palette.label)
+                        .foregroundStyle(Palette.label(enabled: store.snapshotAvailable && !store.snapshotBusy && !store.restoreBusy))
                     }
                     .capsuleButton(prominent: false)
                     .controlSize(.small)
@@ -1693,7 +1661,6 @@ struct FooterV2: View {
                     IconButton(symbol: "arrow.clockwise", label: "Refresh now: check every bot again") {
                         store.refresh(reason: "refresh now")
                     }
-                    IconButton(symbol: "power", label: "Quit Telebots Bar (the bots keep running)") { store.quit() }
                 }
                 .padding(Grid2.inset)
 
@@ -1799,7 +1766,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func updateStatusItem() {
         guard let button = statusItem?.button else { return }
         let states = store.rows.map(\.connected)
-        button.image = DotArt.statusImage(states.isEmpty ? [false] : states)
+        button.image = DotArt.statusImage(states.isEmpty ? [false] : states, marks: store.marks)
         let text = " " + (store.mode == .demo ? "DEMO " : "") + store.countText
         if store.alarm {
             button.attributedTitle = NSAttributedString(string: text, attributes: [
@@ -1809,8 +1776,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         } else {
             button.title = text
         }
-        button.setAccessibilityLabel("Telebots, \(store.summary)")
-        button.toolTip = "Telebots: \(store.summary)"
+        let extras = store.marks.map { $0 == .watchdogOff ? "auto-recovery off" : "Telegram unreachable" }
+        button.setAccessibilityLabel((["Telebots, \(store.summary)"] + extras).joined(separator: ", "))
+        var tip = "Telebots: \(store.summary). One dot per bot, hollow when not connected; click for details."
+        for mark in store.marks { tip += "\n" + mark.meaning + "." }
+        button.toolTip = tip
     }
 
     /// --open-panel: show the panel once so it can be captured, report where it is,
@@ -1870,6 +1840,11 @@ enum CLI {
                                 needs the confirmation in the panel); add --dry-run to log
                                 the exact engine command instead of running it
       --toggle-watchdog         flip the watchdog kill switches; add --dry-run to log only
+      --fresh-start <bot> --dry-run
+                                log the exact /fresh engine command (a real fresh start is
+                                only offered in the panel, behind a confirmation)
+      --snapshot                run the fleet snapshot engine; add --dry-run to log only
+      --restore                 run the fleet restore engine; add --dry-run to log only
       --render-preview <png>    render the panel (light and dark) and the status icon to PNGs;
                                 add --demo for the labelled demo states
       --render-icon <dir>       write the app icon PNGs into an .iconset folder
@@ -1882,6 +1857,9 @@ enum CLI {
         switch FleetModel.loadConfig() {
         case .ok(let cfg):
             ActionLog.shared.setTimeZone(cfg.settings.timeZone)
+            for warning in cfg.warnings {
+                FileHandle.standardError.write(Data(("telebots-bar: config warning: " + warning + "\n").utf8))
+            }
             return cfg
         case .problem(let message, _):
             FileHandle.standardError.write(Data(("telebots-bar: " + message + "\n").utf8))
@@ -1916,6 +1894,32 @@ enum CLI {
         case .dryRun, .connected, .healedBeforeRun: return 0
         default: return 1
         }
+    }
+
+    static func freshStart(_ key: String, dryRun: Bool) -> Int32 {
+        ActionLog.shared.echo = true
+        guard let cfg = loadOrExplain() else { return 2 }
+        guard let bot = cfg.bots.first(where: { $0.key == key || $0.name.lowercased() == key.lowercased() }) else {
+            FileHandle.standardError.write(Data("telebots-bar: no bot '\(key)' in \(cfg.path)\n".utf8))
+            return 2
+        }
+        ActionLog.shared.write("cli: --fresh-start \(bot.key)\(dryRun ? " --dry-run" : "")")
+        guard dryRun else {
+            ActionLog.shared.write("fresh start \(bot.key): not run, a fresh start ends the conversation and is only offered in the panel, behind a confirmation")
+            return 3
+        }
+        let outcome = FleetModel.performReconnect(bot, cfg, allowConnected: true, dryRun: true, askForPermission: false,
+                                                  freshStart: true, log: { ActionLog.shared.write($0) })
+        if case .dryRun = outcome { return 0 }
+        return 1
+    }
+
+    static func fleetEngine(_ action: FleetEngineAction, dryRun: Bool) -> Int32 {
+        ActionLog.shared.echo = true
+        guard let cfg = loadOrExplain() else { return 2 }
+        ActionLog.shared.write("cli: --\(action.rawValue)\(dryRun ? " --dry-run" : "")")
+        guard let run = FleetModel.runFleetEngine(action, cfg, dryRun: dryRun, log: { ActionLog.shared.write($0) }) else { return 1 }
+        return run.code == 0 ? 0 : 1
     }
 
     static func toggleWatchdog(dryRun: Bool) -> Int32 {
@@ -2100,6 +2104,16 @@ if hasFlag("--reconnect") {
 }
 if hasFlag("--toggle-watchdog") {
     exit(CLI.toggleWatchdog(dryRun: dryRunRequested))
+}
+if hasFlag("--fresh-start") {
+    guard let key = value(after: "--fresh-start") else { usageExit("--fresh-start needs a bot key") }
+    exit(CLI.freshStart(key, dryRun: dryRunRequested))
+}
+if hasFlag("--snapshot") {
+    exit(CLI.fleetEngine(.snapshot, dryRun: dryRunRequested))
+}
+if hasFlag("--restore") {
+    exit(CLI.fleetEngine(.restore, dryRun: dryRunRequested))
 }
 if hasFlag("--render-preview") {
     guard let path = value(after: "--render-preview") else { usageExit("--render-preview needs a PNG path") }

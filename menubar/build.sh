@@ -12,7 +12,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="Telebots Bar"
 DEST_DIR="${TELEBOTS_BAR_APP_DIR:-$HOME/Applications}"
 APP="$DEST_DIR/$APP_NAME.app"
-BUILD="$HERE/build"
+# Intermediates live in a hidden .noindex folder so Spotlight never lists the staging
+# copy next to the real app in ~/Applications.
+BUILD="$HERE/.build.noindex"
 MIN_MACOS="14.0"
 
 for tool in swiftc iconutil codesign ditto plutil; do
@@ -21,6 +23,7 @@ done
 
 rm -rf "$BUILD"
 mkdir -p "$BUILD"
+touch "$BUILD/.metadata_never_index"
 
 echo "compiling with $(swiftc -version 2>&1 | head -1)"
 swiftc -O -swift-version 5 -target "$(uname -m)-apple-macos$MIN_MACOS" \
