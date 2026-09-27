@@ -1,5 +1,5 @@
 // Fleet.swift - the model behind Telebots Bar: fleet config, bot health,
-// reconnect plans, the watchdog kill switches and the action log.
+// reconnect plans, window cleanup, the watchdog kill switches and the action log.
 //
 // Everything here mirrors the fleet's own shell engines on purpose, so the menu
 // bar never disagrees with the watchdog:
@@ -7,14 +7,24 @@
 //     $FLEET_HOME/fleet.json, then ~/.claude/telegram-fleet/fleet.json);
 //   - a bot is healthy exactly when the watchdog says so: a Claude session process
 //     and a Telegram poller (server.ts) process whose TELEGRAM_STATE_DIR is the
-//     bot's state dir, and a poller heartbeat no older than the watchdog's limit;
-//   - Reconnect runs the watchdog's restart engine with the same four arguments
-//     (session pid or 999999, workdir, resume id, quiet), and the engine does the
-//     pid + cwd guarded kill, so a sibling bot can never be touched;
+//     bot's state dir, and a poller heartbeat no older than the watchdog's limit,
+//     where a stale heartbeat does not count while Telegram itself is not
+//     confirmed reachable (the watchdog's own outage rule);
+//   - Reconnect and Fresh start work like /fresh: the bot first says in its own
+//     chat that the menu bar started it, then the restart engine runs with the same
+//     three arguments the /fresh hook passes (session pid or 999999, workdir, resume
+//     id), the engine sends "Back and ready" itself and closes the old window, and
+//     the engine does the pid + cwd guarded kill, so a sibling bot is never touched;
+//   - a window is closed only when it is provably the bot's own old window: the tty
+//     its session ran on, still held by exactly the shell that hosted it, as the
+//     window's only tab, with no claude process in it. Otherwise it is left open and
+//     the reason is logged;
 //   - the watchdog switch is the per-bot <key>.disabled file that the snapshot and
 //     restore engines create and remove.
 // Processes are read natively (sysctl KERN_PROCARGS2, the data `ps eww` prints);
-// nothing here shells out to the watchdog. No bot token is ever read.
+// nothing here shells out to the watchdog. A bot's token is read from
+// <state_dir>/.env only when an action sends that bot's chat line, and it is never
+// logged or kept.
 
 import Foundation
 import Darwin
@@ -92,6 +102,33 @@ func shellQuote(_ arg: String) -> String {
     let safe = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_./=:@%+,")
     if !arg.isEmpty && arg.unicodeScalars.allSatisfy({ safe.contains($0) }) { return arg }
     return "'" + arg.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
+private let uuidPattern = try! NSRegularExpression(
+    pattern: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+func fullMatch(_ regex: NSRegularExpression, _ text: String) -> Bool {
+    regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
+}
+
+/// A Claude session id. Only these ever reach an engine as a resume id, because the
+/// engines put that argument into shell and AppleScript text.
+func isSessionUUID(_ text: String) -> Bool { fullMatch(uuidPattern, text) }
+
+private let engineWordPattern = try! NSRegularExpression(pattern: "^[A-Za-z0-9-]{0,40}$")
+
+/// A resume sentinel such as fresh-keep or fresh-reset: letters, digits and dashes.
+func isEngineWord(_ text: String) -> Bool { fullMatch(engineWordPattern, text) }
+
+private let ttyPattern = try! NSRegularExpression(pattern: "^ttys[0-9]{1,4}$")
+
+func isTTYName(_ text: String) -> Bool { fullMatch(ttyPattern, text) }
+
+/// "ttys007" for a controlling-terminal device number, nil for none.
+func ttyName(_ device: dev_t) -> String? {
+    guard device != dev_t(bitPattern: UInt32.max), device != 0, let raw = devname(device, S_IFCHR) else { return nil }
+    let name = String(cString: raw)
+    return isTTYName(name) ? name : nil
 }
 
 // MARK: - Paths
@@ -268,7 +305,7 @@ enum FleetModel {
                     if let s = v as? String, let source = ResumeSource(rawValue: s) { settings.resumeSource = source } else { warnings.append("menubar.resume_source must be latest-transcript or session-id; default kept") }
                 }
                 if let v = mb["fresh_start_arg"] {
-                    if let s = v as? String { settings.freshStartArg = s } else { warnings.append("menubar.fresh_start_arg must be a string; default kept") }
+                    if let s = v as? String, isEngineWord(s) { settings.freshStartArg = s } else { warnings.append("menubar.fresh_start_arg must be letters, digits and dashes, like fresh-reset; default kept") }
                 }
                 if let v = mb["time_zone"] {
                     if let s = v as? String, let tz = TimeZone(identifier: s) { settings.timeZone = tz } else { warnings.append("menubar.time_zone must be a time zone name like America/New_York; default kept") }
@@ -305,7 +342,8 @@ enum FleetModel {
 // MARK: - Processes
 
 /// Same-user processes that look like a bot session or a bot poller, with the
-/// TELEGRAM_STATE_DIR each one was started with.
+/// TELEGRAM_STATE_DIR each one was started with, plus the kernel's basic record of
+/// every process (any user), which is what a tty check needs.
 struct ProcessTable {
     struct Entry {
         let pid: pid_t
@@ -316,12 +354,23 @@ struct ProcessTable {
         let started: TimeInterval   // process start, epoch seconds
     }
 
+    /// What the kernel lists for any process: no arguments, no environment.
+    struct Basic {
+        let pid: pid_t
+        let ppid: pid_t
+        let uid: uid_t
+        let tty: dev_t              // controlling terminal, or NODEV
+        let started: TimeInterval
+        let name: String            // p_comm, at most 16 characters
+    }
+
     /// The watchdog's own signatures: `grep 'channels plugin:telegram'` for the
     /// session and `grep 'server.ts'` for the poller, each followed by `grep -v grep`.
     static let sessionSignature = "channels plugin:telegram"
     static let pollerSignature = "server.ts"
 
     let entries: [Entry]
+    let basics: [pid_t: Basic]
 
     func sessionPIDs(stateDir: String) -> [pid_t] {
         entries.filter { $0.isSession && $0.stateDir == stateDir }.map(\.pid).sorted()
@@ -336,14 +385,38 @@ struct ProcessTable {
     }
 
     func started(_ pid: pid_t) -> TimeInterval? {
-        entries.first { $0.pid == pid }?.started
+        basics[pid]?.started ?? entries.first { $0.pid == pid }?.started
+    }
+
+    /// Every process whose controlling terminal is `device`, lowest pid first.
+    func processes(onTTY device: dev_t) -> [Basic] {
+        basics.values.filter { $0.tty == device }.sorted { $0.pid < $1.pid }
+    }
+
+    /// Where a session's Terminal tab is: the tty it runs on and the processes that
+    /// host it there (its shell, then the login above it), nearest first.
+    func windowRecord(session pid: pid_t) -> WindowRecord? {
+        guard let session = basics[pid], let tty = ttyName(session.tty) else { return nil }
+        var hosts: [WindowRecord.Host] = []
+        var next = session.ppid
+        while hosts.count < 8, next > 1, let parent = basics[next], parent.tty == session.tty {
+            hosts.append(WindowRecord.Host(pid: parent.pid, started: parent.started, name: parent.name))
+            next = parent.ppid
+        }
+        guard !hosts.isEmpty else { return nil }
+        return WindowRecord(tty: tty, sessionPID: pid, sessionStarted: session.started, hosts: hosts,
+                            recorded: Date().timeIntervalSince1970)
     }
 
     static func snapshot() -> ProcessTable {
         var buffer = [UInt8](repeating: 0, count: argMax())
+        let all = allProcesses()
+        var basics: [pid_t: Basic] = [:]
+        for basic in all { basics[basic.pid] = basic }
+        let uid = getuid()
         var found: [Entry] = []
-        for (pid, started) in userPIDs() where pid > 0 {
-            guard let (argv, env) = processArguments(pid, &buffer) else { continue }
+        for basic in all where basic.pid > 0 && basic.uid == uid {
+            guard let (argv, env) = processArguments(basic.pid, &buffer) else { continue }
             let command = argv.joined(separator: " ")
             if command.contains("grep") { continue }
             let isSession = command.contains(sessionSignature)
@@ -351,10 +424,17 @@ struct ProcessTable {
             guard isSession || isPoller else { continue }
             let prefix = "TELEGRAM_STATE_DIR="
             let stateDir = env.first { $0.hasPrefix(prefix) }.map { String($0.dropFirst(prefix.count)) }
-            found.append(Entry(pid: pid, argv: argv, stateDir: stateDir, isSession: isSession, isPoller: isPoller,
-                               started: started))
+            found.append(Entry(pid: basic.pid, argv: argv, stateDir: stateDir, isSession: isSession,
+                               isPoller: isPoller, started: basic.started))
         }
-        return ProcessTable(entries: found)
+        return ProcessTable(entries: found, basics: basics)
+    }
+
+    /// The kernel's process list alone, cheap: for tty checks.
+    static func basicsOnly() -> ProcessTable {
+        var basics: [pid_t: Basic] = [:]
+        for basic in allProcesses() { basics[basic.pid] = basic }
+        return ProcessTable(entries: [], basics: basics)
     }
 
     private static func argMax() -> Int {
@@ -365,7 +445,7 @@ struct ProcessTable {
         return 1 << 20
     }
 
-    private static func userPIDs() -> [(pid_t, TimeInterval)] {
+    private static func allProcesses() -> [Basic] {
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL]
         let stride = MemoryLayout<kinfo_proc>.stride
         for _ in 0..<4 {
@@ -380,11 +460,14 @@ struct ProcessTable {
                 if errno == ENOMEM { continue }
                 return []
             }
-            let uid = getuid()
-            return procs.prefix(size / stride).compactMap { p in
-                guard p.kp_eproc.e_ucred.cr_uid == uid else { return nil }
+            return procs.prefix(size / stride).map { p in
                 let start = p.kp_proc.p_un.__p_starttime
-                return (p.kp_proc.p_pid, TimeInterval(start.tv_sec) + TimeInterval(start.tv_usec) / 1e6)
+                let name = withUnsafeBytes(of: p.kp_proc.p_comm) { raw -> String in
+                    String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+                }
+                return Basic(pid: p.kp_proc.p_pid, ppid: p.kp_eproc.e_ppid, uid: p.kp_eproc.e_ucred.cr_uid,
+                             tty: p.kp_eproc.e_tdev,
+                             started: TimeInterval(start.tv_sec) + TimeInterval(start.tv_usec) / 1e6, name: name)
             }
         }
         return []
@@ -422,12 +505,37 @@ struct ProcessTable {
     }
 }
 
+/// The working directory of a process, as the kernel reports it (what `lsof -d cwd`
+/// prints), or nil when it cannot be read.
+func processCWD(_ pid: pid_t) -> String? {
+    var info = proc_vnodepathinfo()
+    let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+    guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, size) == size else { return nil }
+    let path = withUnsafeBytes(of: info.pvi_cdir.vip_path) { raw -> String in
+        String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+    }
+    return path.isEmpty ? nil : path
+}
+
 // MARK: - Health
 
 enum BotState: String {
     case connected = "Connected"
     case noPoller = "No poller"
     case down = "Down"
+}
+
+/// Whether a stale heartbeat counts against a bot right now. The live watchdog does
+/// not treat one as a fault while Telegram is not confirmed reachable, or while the
+/// code that writes heartbeats is known to be missing, and neither does the app.
+enum HeartbeatTrust: Equatable {
+    case trusted
+    case excused(String)
+
+    var excuse: String? {
+        if case .excused(let why) = self { return why }
+        return nil
+    }
 }
 
 struct BotHealth {
@@ -437,6 +545,7 @@ struct BotHealth {
     let pollerPIDs: [pid_t]
     let heartbeat: Int?          // epoch seconds from poller.heartbeat
     let heartbeatStale: Bool
+    let staleExcused: String?    // why a stale heartbeat does not count right now
     let sessionArgv: [String]?
     let sessionStarted: TimeInterval?
     let checkedAt: Int
@@ -463,7 +572,9 @@ struct BotHealth {
     var statusLine: String {
         switch state {
         case .connected:
-            if let age = heartbeatAge { return "Connected · heartbeat \(shortAge(age)) ago" }
+            if let age = heartbeatAge {
+                return "Connected · heartbeat \(shortAge(age)) ago" + (staleExcused != nil ? ", waiting on Telegram" : "")
+            }
             return "Connected"
         case .noPoller: return "No poller"
         case .down: return "Down"
@@ -472,8 +583,45 @@ struct BotHealth {
 }
 
 extension FleetModel {
+    /// The live watchdog's own numbers: a stale heartbeat only counts once Telegram
+    /// has been confirmed reachable this long, and a pass older than this means the
+    /// watchdog was asleep or stopped.
+    static let networkGoodDwell = 600
+    static let passGapMax = 180
+
+    /// A state file's first line as an epoch, only when it is all digits (the
+    /// watchdog rejects anything else the same way).
+    static func strictEpoch(_ path: String) -> Int? {
+        guard let line = firstLine(path)?.trimmingCharacters(in: CharacterSet(charactersIn: "\r\n ")),
+              !line.isEmpty, line.allSatisfy({ $0 >= "0" && $0 <= "9" }) else { return nil }
+        return Int(line)
+    }
+
+    /// The watchdog's rule for a stale heartbeat, from its own state files: the
+    /// plugin.alert-only latch, and net.good_since against its 600s dwell while its
+    /// passes are current. With no current watchdog, this Mac's own probe decides.
+    static func heartbeatTrust(_ config: FleetConfig, now: Int, probe: Bool?) -> HeartbeatTrust {
+        let state = config.settings.watchdogStateDir
+        if isRegularFile(state + "/plugin.alert-only") {
+            return .excused("the watchdog is alert-only because the code that writes heartbeats is missing, so a stale heartbeat is not a fault")
+        }
+        if let pass = strictEpoch(state + "/watchdog.last_pass"), now - pass >= 0, now - pass <= passGapMax {
+            guard let since = strictEpoch(state + "/net.good_since"), since <= now else {
+                return .excused("Telegram was not reachable on the watchdog's last check")
+            }
+            let good = now - since
+            if good < networkGoodDwell {
+                return .excused("Telegram has been reachable for only \(shortAge(good)) of the \(networkGoodDwell / 60)m the watchdog waits before it trusts a stale heartbeat")
+            }
+            return .trusted
+        }
+        if probe == false { return .excused("Telegram is not reachable from this Mac") }
+        return .trusted
+    }
+
     /// The watchdog's per-bot test, same files, same order.
-    static func evaluate(_ bot: Bot, table: ProcessTable, now: Int, maxAge: Int) -> BotHealth {
+    static func evaluate(_ bot: Bot, table: ProcessTable, now: Int, maxAge: Int,
+                         trust: HeartbeatTrust = .trusted) -> BotHealth {
         let sessions = table.sessionPIDs(stateDir: bot.stateDir)
         let pollers = table.pollerPIDs(stateDir: bot.stateDir)
         let heartbeatPath = bot.stateDir + "/poller.heartbeat"
@@ -484,8 +632,9 @@ extension FleetModel {
         if !sessions.isEmpty && !pollers.isEmpty, let hb = heartbeat, now - hb > maxAge {
             stale = true
         }
+        let excused = stale ? trust.excuse : nil
         let state: BotState
-        if !sessions.isEmpty && !pollers.isEmpty && !stale {
+        if !sessions.isEmpty && !pollers.isEmpty && (!stale || excused != nil) {
             state = .connected
         } else if sessions.isEmpty {
             state = .down
@@ -495,18 +644,21 @@ extension FleetModel {
         let argv = sessions.first.flatMap { table.argv(of: $0) }
         let started = sessions.first.flatMap { table.started($0) }
         return BotHealth(bot: bot, state: state, sessionPIDs: sessions, pollerPIDs: pollers,
-                         heartbeat: heartbeat, heartbeatStale: stale, sessionArgv: argv,
+                         heartbeat: heartbeat, heartbeatStale: stale, staleExcused: excused, sessionArgv: argv,
                          sessionStarted: started, checkedAt: now)
     }
 
-    static func evaluateAll(_ config: FleetConfig) -> [BotHealth] {
+    static func evaluateAll(_ config: FleetConfig, probe: Bool? = nil) -> [BotHealth] {
         let table = ProcessTable.snapshot()
         let now = Int(Date().timeIntervalSince1970)
-        return config.bots.map { evaluate($0, table: table, now: now, maxAge: config.settings.heartbeatMaxAge) }
+        let trust = heartbeatTrust(config, now: now, probe: probe)
+        return config.bots.map { evaluate($0, table: table, now: now, maxAge: config.settings.heartbeatMaxAge, trust: trust) }
     }
 
-    static func evaluateOne(_ bot: Bot, _ config: FleetConfig) -> BotHealth {
-        evaluate(bot, table: ProcessTable.snapshot(), now: Int(Date().timeIntervalSince1970), maxAge: config.settings.heartbeatMaxAge)
+    static func evaluateOne(_ bot: Bot, _ config: FleetConfig, table: ProcessTable = ProcessTable.snapshot()) -> BotHealth {
+        let now = Int(Date().timeIntervalSince1970)
+        return evaluate(bot, table: table, now: now, maxAge: config.settings.heartbeatMaxAge,
+                        trust: heartbeatTrust(config, now: now, probe: nil))
     }
 }
 
@@ -705,21 +857,480 @@ extension FleetModel {
         return FleetSignals(lastPass: lastPass, telegramReachable: reachable, snapshotFile: file,
                             snapshotExists: exists, snapshotSessions: sessions, snapshotSaved: saved)
     }
+}
 
-    /// Unauthenticated HTTPS request to Telegram's API host, for installs whose
-    /// watchdog does not record its own network check. No token is sent.
-    static func probeTelegram(timeout: TimeInterval = 8) -> Bool {
+// MARK: - Child processes
+
+/// The last `limit` bytes a child wrote, gathered as it writes them.
+final class OutputTail {
+    private let lock = NSLock()
+    private var data = Data()
+    private let limit: Int
+    private let ended = DispatchSemaphore(value: 0)
+
+    init(limit: Int) { self.limit = limit }
+
+    func append(_ chunk: Data) {
+        lock.lock()
+        data.append(chunk)
+        if data.count > limit { data.removeFirst(data.count - limit) }
+        lock.unlock()
+    }
+
+    func finish() { ended.signal() }
+
+    func waitForEnd(_ seconds: TimeInterval) { _ = ended.wait(timeout: .now() + seconds) }
+
+    var text: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return String(decoding: data, as: UTF8.self)
+    }
+}
+
+/// A child process with an overall deadline and a bounded capture of its output. At
+/// the deadline the exact child this started gets SIGTERM, then SIGKILL; nothing else.
+enum Subprocess {
+    struct Result {
+        let code: Int32        // exit status, the signal number when signaled, -1 if it never ended
+        let signaled: Bool
+        let timedOut: Bool
+        let output: String     // stdout and stderr together, the last bytes only
+    }
+
+    static func run(_ executable: String, _ arguments: [String], environment: [String: String]? = nil,
+                    input: Data? = nil, capture: Bool = true, limit: Int = 65_536,
+                    deadline: TimeInterval, started: (pid_t) -> Void = { _ in }) throws -> Result {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        if let environment { process.environment = environment }
+        process.currentDirectoryURL = URL(fileURLWithPath: "/")
+        let tail = OutputTail(limit: limit)
+        var pipe: Pipe?
+        if capture {
+            let out = Pipe()
+            out.fileHandleForReading.readabilityHandler = { handle in
+                let chunk = handle.availableData
+                if chunk.isEmpty {
+                    handle.readabilityHandler = nil
+                    tail.finish()
+                } else {
+                    tail.append(chunk)
+                }
+            }
+            process.standardOutput = out
+            process.standardError = out
+            pipe = out
+        } else {
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+        }
+        var inputPipe: Pipe?
+        if input != nil {
+            let pipeIn = Pipe()
+            process.standardInput = pipeIn
+            inputPipe = pipeIn
+        } else {
+            process.standardInput = FileHandle.nullDevice
+        }
+        let done = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in done.signal() }
+        try process.run()
+        let pid = process.processIdentifier
+        started(pid)
+        if let inputPipe, let input {
+            // A child that exits before reading must not take this app down with SIGPIPE.
+            let handle = inputPipe.fileHandleForWriting
+            _ = fcntl(handle.fileDescriptor, F_SETNOSIGPIPE, 1)
+            try? handle.write(contentsOf: input)
+            try? handle.close()
+        }
+        var timedOut = false
+        var ended = done.wait(timeout: .now() + deadline) == .success
+        if !ended {
+            timedOut = true
+            kill(pid, SIGTERM)
+            ended = done.wait(timeout: .now() + 5) == .success
+            if !ended {
+                kill(pid, SIGKILL)
+                ended = done.wait(timeout: .now() + 5) == .success
+            }
+        }
+        if let pipe {
+            // What the child wrote last may still be on its way; a grandchild that kept
+            // the pipe open must not hold this up, so the wait is short.
+            tail.waitForEnd(ended ? 1 : 0)
+            pipe.fileHandleForReading.readabilityHandler = nil
+        }
+        let code: Int32 = ended ? process.terminationStatus : -1
+        let signaled = ended && process.terminationReason == .uncaughtSignal
+        return Result(code: code, signaled: signaled, timedOut: timedOut, output: tail.text)
+    }
+}
+
+// MARK: - Terminal windows
+
+/// Where a bot's session ran: the tty of its Terminal tab and the processes that
+/// hosted it there. Recorded while the session runs, so the window it leaves behind
+/// once it is gone can still be proven to be that bot's own.
+struct WindowRecord: Codable, Equatable {
+    struct Host: Codable, Equatable {
+        let pid: Int32
+        let started: Double
+        let name: String
+    }
+
+    let tty: String              // "ttys007"
+    let sessionPID: Int32
+    let sessionStarted: Double
+    let hosts: [Host]            // the session's shell, then the login above it
+    var recorded: Double
+
+    /// The same session in the same tab, whenever it was recorded.
+    func sameSession(_ other: WindowRecord) -> Bool {
+        tty == other.tty && sessionPID == other.sessionPID && abs(sessionStarted - other.sessionStarted) < 0.01
+            && hosts == other.hosts
+    }
+
+    var hostList: String { hosts.map { "\($0.name) \($0.pid)" }.joined(separator: ", ") }
+}
+
+/// $FLEET_HOME/menubar-windows.json: each bot's last recorded window, written by the
+/// running menu bar app and read by every action, in the app or on the command line.
+enum WindowRecords {
+    static var path: String { FleetPaths.fleetHome + "/menubar-windows.json" }
+
+    private struct Stored: Codable {
+        var version: Int
+        var bots: [String: WindowRecord]
+    }
+
+    static func load() -> [String: WindowRecord] {
+        guard let data = FileManager.default.contents(atPath: path),
+              let stored = try? JSONDecoder().decode(Stored.self, from: data), stored.version == 1 else { return [:] }
+        return stored.bots.filter { isTTYName($0.value.tty) && !$0.value.hosts.isEmpty }
+    }
+
+    /// Written whole to a temporary file and renamed into place.
+    @discardableResult
+    static func save(_ records: [String: WindowRecord]) -> Bool {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(Stored(version: 1, bots: records)) else { return false }
+        let dir = (path as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let temp = path + ".tmp.\(getpid())"
+        guard FileManager.default.createFile(atPath: temp, contents: data, attributes: [.posixPermissions: 0o600]) else { return false }
+        if rename(temp, path) != 0 {
+            unlink(temp)
+            return false
+        }
+        return true
+    }
+}
+
+/// Closing a bot's old Terminal window, only ever by proof: its recorded tty, held
+/// by nothing but the shell that hosted the bot's old session, as its window's only
+/// tab, with no claude process in it. Never by position, never "the frontmost
+/// window". When the proof fails, the window stays open and the reason is logged.
+enum WindowCleanup {
+    /// The engines' own rule (claude-channels-fresh.sh and engine/fleet-fresh). The
+    /// tty arrives as an argument, never written into the script text.
+    static let closeScript = """
+    on run argv
+        set wanted to "/dev/" & (item 1 of argv)
+        tell application "Terminal"
+            set wid to missing value
+            set tabCount to 0
+            set hasClaude to false
+            repeat with w in windows
+                set tabList to tabs of w
+                repeat with t in tabList
+                    set tabTTY to ""
+                    try
+                        set tabTTY to tty of t
+                    end try
+                    if tabTTY is wanted then
+                        set wid to id of w
+                        set tabCount to count of tabList
+                        try
+                            set hasClaude to ((processes of t) contains "claude")
+                        end try
+                        exit repeat
+                    end if
+                end repeat
+                if wid is not missing value then exit repeat
+            end repeat
+            if wid is missing value then return "no tab on " & wanted & ", nothing to close"
+            if hasClaude then return "left window " & wid & " open: a claude process still runs in its tab on " & wanted
+            if tabCount is not 1 then return "left window " & wid & " open: the tab on " & wanted & " shares it with " & (tabCount - 1) & " other tab(s), and Terminal cannot close a single tab by script"
+            close (window id wid) saving no
+            return "closed window " & wid & " (its only tab was on " & wanted & ")"
+        end tell
+    end run
+    """
+
+    /// Read-only: is any tab still on that tty?
+    static let probeScript = """
+    on run argv
+        set wanted to "/dev/" & (item 1 of argv)
+        tell application "Terminal"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    set tabTTY to ""
+                    try
+                        set tabTTY to tty of t
+                    end try
+                    if tabTTY is wanted then return "open in window " & (id of w)
+                end repeat
+            end repeat
+        end tell
+        return "none"
+    end run
+    """
+
+    static func runScript(_ script: String, _ tty: String) -> (ok: Bool, text: String) {
+        guard isTTYName(tty) else { return (false, "implausible tty '\(tty)'") }
+        do {
+            let result = try Subprocess.run("/usr/bin/osascript", ["-", tty], input: Data(script.utf8), deadline: 30)
+            let text = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if result.timedOut { return (false, "osascript did not answer within 30s") }
+            if result.code != 0 || result.signaled { return (false, "osascript failed (\(result.code)): \(redactTokens(text))") }
+            return (true, text)
+        } catch {
+            return (false, "could not start osascript")
+        }
+    }
+
+    enum Verdict: Equatable {
+        case closed, gone, leftOpen
+    }
+
+    /// Closes the window a bot's old session ran in, when and only when it can be
+    /// proven to be that window. `note` receives one line saying what happened.
+    @discardableResult
+    static func closeOldWindow(_ record: WindowRecord, _ bot: Bot, dryRun: Bool, note: (String) -> Void) -> Verdict {
+        guard isTTYName(record.tty) else {
+            note("old window: left alone, the recorded tty '\(record.tty)' is not a Terminal tty")
+            return .leftOpen
+        }
+        var st = stat()
+        let device: dev_t? = stat("/dev/" + record.tty, &st) == 0 ? st.st_rdev : nil
+        let running = device.map { ProcessTable.basicsOnly().processes(onTTY: $0) } ?? []
+        if running.isEmpty {
+            // Nothing runs on that tty: the window is closed, or its tab has ended.
+            let probe = runScript(probeScript, record.tty)
+            if probe.ok && probe.text == "none" {
+                note("old window: \(bot.name)'s tab on \(record.tty) is closed")
+                return .gone
+            }
+            if !probe.ok {
+                note("old window: could not check \(record.tty) (\(probe.text)), so it was left as it is")
+                return .leftOpen
+            }
+            note("old window: left \(record.tty) open (\(probe.text)): nothing runs in it any more, so it cannot be proven to be \(bot.name)'s")
+            return .leftOpen
+        }
+        let strangers = running.filter { process in
+            !record.hosts.contains { $0.pid == process.pid && abs($0.started - process.started) < 0.01 }
+        }
+        if !strangers.isEmpty {
+            let names = strangers.prefix(4).map { "\($0.name) \($0.pid)" }.joined(separator: ", ")
+            note("old window: left \(record.tty) open, it runs \(names) now, not only the shell that hosted \(bot.name)'s old session (\(record.hostList))")
+            return .leftOpen
+        }
+        let hosts = running.map { "\($0.name) \($0.pid)" }.joined(separator: ", ")
+        if dryRun {
+            note("old window: would close \(bot.name)'s window on \(record.tty), where only the shell that hosted its old session runs (\(hosts)), if it is that window's only tab")
+            return .leftOpen
+        }
+        let result = runScript(closeScript, record.tty)
+        guard result.ok else {
+            note("old window: could not close \(record.tty) (\(result.text))")
+            return .leftOpen
+        }
+        if result.text.hasPrefix("closed") {
+            note("old window: \(result.text); it held only \(hosts)")
+            return .closed
+        }
+        if result.text.hasPrefix("no tab") {
+            note("old window: \(bot.name)'s tab on \(record.tty) is closed")
+            return .gone
+        }
+        note("old window: \(result.text)")
+        return .leftOpen
+    }
+}
+
+// MARK: - The bot's own chat
+
+/// Telegram's API with a hard deadline: the task is cancelled at the deadline and the
+/// session torn down, so nothing outlives the call.
+enum HTTP {
+    private final class Box: @unchecked Sendable {
+        let lock = NSLock()
+        var data: Data?
+        var response: URLResponse?
+        var error: Error?
+    }
+
+    static func run(_ request: URLRequest, timeout: TimeInterval) -> (Data?, URLResponse?, Error?) {
+        let box = Box()
+        let done = DispatchSemaphore(value: 0)
+        let session = URLSession(configuration: .ephemeral)
+        let task = session.dataTask(with: request) { data, response, error in
+            box.lock.lock()
+            box.data = data
+            box.response = response
+            box.error = error
+            box.lock.unlock()
+            done.signal()
+        }
+        task.resume()
+        let finished = done.wait(timeout: .now() + timeout + 1) == .success
+        if !finished { task.cancel() }
+        session.invalidateAndCancel()
+        guard finished else { return (nil, nil, URLError(.timedOut)) }
+        box.lock.lock()
+        defer { box.lock.unlock() }
+        return (box.data, box.response, box.error)
+    }
+}
+
+/// A cancellable, unauthenticated reachability check of Telegram's API host, for
+/// installs whose watchdog does not record its own. No token is sent.
+final class TelegramProbe {
+    private let lock = NSLock()
+    private var task: URLSessionDataTask?
+    private var session: URLSession?
+
+    func start(timeout: TimeInterval = 8, completion: @escaping (Bool) -> Void) {
+        cancel()
         var request = URLRequest(url: URL(string: "https://api.telegram.org/")!)
         request.httpMethod = "HEAD"
         request.timeoutInterval = timeout
-        let done = DispatchSemaphore(value: 0)
-        var ok = false
-        URLSession(configuration: .ephemeral).dataTask(with: request) { _, response, error in
-            ok = error == nil && response != nil
-            done.signal()
-        }.resume()
-        _ = done.wait(timeout: .now() + timeout + 1)
-        return ok
+        let session = URLSession(configuration: .ephemeral)
+        let task = session.dataTask(with: request) { [weak self] _, response, error in
+            let cancelled = (error as? URLError)?.code == .cancelled
+            self?.finished(session)
+            if !cancelled { completion(error == nil && response != nil) }
+        }
+        lock.lock()
+        self.task = task
+        self.session = session
+        lock.unlock()
+        task.resume()
+    }
+
+    func cancel() {
+        lock.lock()
+        let task = self.task, session = self.session
+        self.task = nil
+        self.session = nil
+        lock.unlock()
+        task?.cancel()
+        session?.invalidateAndCancel()
+    }
+
+    private func finished(_ done: URLSession) {
+        lock.lock()
+        if session === done {
+            task = nil
+            session = nil
+        }
+        lock.unlock()
+        done.finishTasksAndInvalidate()
+    }
+}
+
+struct ChatSend {
+    let ok: Bool
+    let detail: String         // "message 1234", or why it was not sent; never the token
+}
+
+/// The bot's own voice in its own chat, the way /fresh speaks: the same token and chat
+/// the engines use (token_of_state and chat_id_of_state in engine/fleet-fresh).
+enum BotChat {
+    static let backAndReady = "\u{26A1} Back and ready"
+
+    /// "Reconnect from the menu bar, one moment".
+    static func line(_ action: String) -> String { "\(action) from the menu bar, one moment" }
+
+    private static let tokenShape = try! NSRegularExpression(pattern: "^[0-9]{3,20}:[A-Za-z0-9_-]{20,200}$")
+    private static let chatShape = try! NSRegularExpression(pattern: "^-?[0-9]{1,20}$")
+
+    /// token_of_state: the first TELEGRAM_BOT_TOKEN= line of <state_dir>/.env, quotes
+    /// and whitespace removed. Read only when a line is about to go out.
+    static func token(_ bot: Bot) -> String? {
+        guard let data = FileManager.default.contents(atPath: bot.stateDir + "/.env") else { return nil }
+        let prefix = "TELEGRAM_BOT_TOKEN="
+        for line in String(decoding: data, as: UTF8.self).split(separator: "\n") where line.hasPrefix(prefix) {
+            let value = String(line.dropFirst(prefix.count).filter { $0 != "\"" && $0 != "'" && !$0.isWhitespace })
+            return fullMatch(tokenShape, value) ? value : nil
+        }
+        return nil
+    }
+
+    /// chat_id_of_state: the first allowFrom entry of <state_dir>/access.json, the
+    /// bot's own chat.
+    static func chatID(_ bot: Bot) -> String? {
+        guard let data = FileManager.default.contents(atPath: bot.stateDir + "/access.json"),
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let list = root["allowFrom"] as? [Any], let first = list.first else { return nil }
+        let text: String
+        if let s = first as? String {
+            text = s
+        } else if let n = first as? NSNumber, !(first is Bool) {
+            text = n.stringValue
+        } else {
+            return nil
+        }
+        return fullMatch(chatShape, text) ? text : nil
+    }
+
+    /// For a dry run: whether a line could go out, without keeping the token.
+    static func readiness(_ bot: Bot) -> String {
+        let chat = chatID(bot) != nil ? "its chat from access.json" : "no chat id in access.json, so it would be skipped"
+        let token = token(bot) != nil ? "its token from .env" : "no bot token in .env, so it would be skipped"
+        return "\(token), \(chat)"
+    }
+
+    private static func form(_ fields: [(String, String)]) -> Data {
+        // Plain ASCII letters and digits only: everything else is percent-encoded.
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+        let body = fields.map { key, value in
+            key + "=" + (value.addingPercentEncoding(withAllowedCharacters: allowed) ?? "")
+        }.joined(separator: "&")
+        return Data(body.utf8)
+    }
+
+    /// One sendMessage from the bot to its chat. The token is used for this call only
+    /// and never appears in what this returns.
+    static func send(_ bot: Bot, _ text: String, timeout: TimeInterval = 10) -> ChatSend {
+        guard let chat = chatID(bot) else { return ChatSend(ok: false, detail: "no chat id in \(bot.stateDir)/access.json") }
+        guard let token = token(bot) else { return ChatSend(ok: false, detail: "no bot token in \(bot.stateDir)/.env") }
+        guard let url = URL(string: "https://api.telegram.org/bot\(token)/sendMessage") else {
+            return ChatSend(ok: false, detail: "the bot token cannot form a URL")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = timeout
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.httpBody = form([("chat_id", chat), ("text", text)])
+        let (data, response, error) = HTTP.run(request, timeout: timeout)
+        if let error {
+            let code = (error as? URLError)?.code.rawValue ?? (error as NSError).code
+            return ChatSend(ok: false, detail: "the request failed (network error \(code))")
+        }
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let json = data.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+        if (json?["ok"] as? Bool) == true {
+            let id = ((json?["result"] as? [String: Any])?["message_id"] as? NSNumber)?.stringValue ?? "?"
+            return ChatSend(ok: true, detail: "Telegram accepted it as message \(id)")
+        }
+        let why = (json?["description"] as? String).map { redactTokens($0) } ?? "no description"
+        return ChatSend(ok: false, detail: "Telegram answered HTTP \(status): \(why)")
     }
 }
 
@@ -729,13 +1340,15 @@ struct ReconnectPlan {
     let bot: Bot
     let state: BotState
     let targetPID: String     // the live session pid, or 999999 when the session is down
-    let resumeArg: String     // a session id, or fresh-keep
+    let resumeArg: String     // a session id, fresh-keep, or the fresh-start word
     let resumeNote: String
     let engine: String
 
-    var arguments: [String] { [engine, targetPID, bot.workdir, resumeArg, "quiet"] }
+    /// The /fresh hook's exact shape: pid, workdir, resume id. No "quiet", so the
+    /// engine itself sends "Back and ready" once the new poller is confirmed.
+    var arguments: [String] { [engine, targetPID, bot.workdir, resumeArg] }
     var commandLine: String { (["/bin/bash"] + arguments).map(shellQuote).joined(separator: " ") }
-    var keepsConversation: Bool { resumeArg != "fresh-keep" }
+    var keepsConversation: Bool { isSessionUUID(resumeArg) }
 }
 
 enum AutomationStatus: Equatable {
@@ -747,20 +1360,40 @@ enum AutomationStatus: Equatable {
         case .granted: return "granted"
         case .wouldPrompt: return "not granted yet (the first real Reconnect asks once)"
         case .denied: return "denied (System Settings > Privacy & Security > Automation)"
-        case .terminalNotRunning: return "unknown (Terminal is not running)"
-        case .unknown(let code): return "unknown (status \(code))"
+        case .terminalNotRunning: return "unconfirmed: Terminal is not running, so macOS cannot answer (open Terminal, then try again)"
+        case .unknown(let code): return "unconfirmed (macOS answered \(code))"
         }
     }
 }
 
 enum ReconnectOutcome {
     case healedBeforeRun
+    case changedBeforeRun(String)
     case dryRun(ReconnectPlan)
     case noEngine(String)
     case permissionBlocked(AutomationStatus)
     case engineRefused(Int32, String)
+    case engineTimedOut(Int)
     case connected
     case stillDown(BotState)
+
+    /// How an action that did not work ended, as the tail of a sentence that starts
+    /// with the action ("Reconnect failed: ..."); nil for an outcome that is not a failure.
+    var failureText: String? {
+        switch self {
+        case .healedBeforeRun, .dryRun, .connected: return nil
+        case .changedBeforeRun(let why): return "did not run: \(why)"
+        case .noEngine(let note): return "did not run: \(note)"
+        case .permissionBlocked(let status): return "did not run: Terminal automation is \(status.text)"
+        case .engineRefused(let code, let meaning):
+            if code == -2 { return "did not run: \(meaning)" }
+            if code == -1 { return "failed: \(meaning)" }
+            return "failed: engine exit \(code), \(meaning)"
+        case .engineTimedOut(let seconds):
+            return "failed: the engine ran past \(seconds < 120 ? "\(seconds)s" : "\(seconds / 60)m") and was stopped"
+        case .stillDown(let state): return "failed: still \(state.rawValue.lowercased()) 45s after the engine finished"
+        }
+    }
 }
 
 extension FleetModel {
@@ -776,14 +1409,24 @@ extension FleetModel {
         8: "refused: the target pid could not be verified",
     ]
 
-    /// The resume id the restart passes, so a reconnect keeps the conversation.
+    /// Overall engine deadlines; TELEBOTS_BAR_ENGINE_DEADLINE (seconds) overrides
+    /// them, for tests.
+    static func engineDeadline(_ normal: TimeInterval) -> TimeInterval {
+        if let raw = Env.vars["TELEBOTS_BAR_ENGINE_DEADLINE"], let n = Double(raw), n > 0 { return n }
+        return normal
+    }
+
+    /// The resume id the restart passes, so a reconnect keeps the conversation. Only a
+    /// real session id (a UUID) is ever passed; anything else starts a new session on
+    /// the same model.
     static func resolveResume(_ bot: Bot, source: ResumeSource) -> (arg: String, note: String) {
         switch source {
         case .sessionID:
             let file = bot.stateDir + "/session.id"
             if isRegularFile(file), let line = firstLine(file) {
-                let candidate = line.filter { $0 != "\r" && $0 != "\n" }
-                if !candidate.isEmpty && !candidate.contains("/") {
+                let candidate = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !candidate.isEmpty {
+                    guard isSessionUUID(candidate) else { return ("fresh-keep", "session.id does not hold a session id") }
                     if isRegularFile(bot.projectDir + "/" + candidate + ".jsonl") {
                         return (candidate, "session.id")
                     }
@@ -796,7 +1439,8 @@ extension FleetModel {
                 return ("fresh-keep", "no project dir yet")
             }
             let newest = names
-                .filter { $0.hasSuffix(".jsonl") && !$0.hasPrefix(".") && isRegularFile(bot.projectDir + "/" + $0) }
+                .filter { $0.hasSuffix(".jsonl") && isSessionUUID(String($0.dropLast(".jsonl".count)))
+                    && isRegularFile(bot.projectDir + "/" + $0) }
                 .map { ($0, modificationTime(bot.projectDir + "/" + $0) ?? 0) }
                 .sorted { $0.1 != $1.1 ? $0.1 > $1.1 : $0.0 < $1.0 }
                 .first
@@ -812,6 +1456,30 @@ extension FleetModel {
         let pid = health.sessionPIDs.first.map { String($0) } ?? "999999"
         return ReconnectPlan(bot: health.bot, state: health.state, targetPID: pid,
                              resumeArg: resume.arg, resumeNote: resume.note, engine: engine)
+    }
+
+    /// A plan runs only when every argument is what it claims to be: the engines put
+    /// them into shell and AppleScript text.
+    static func planProblem(_ plan: ReconnectPlan) -> String? {
+        guard let pid = Int32(plan.targetPID), pid > 0 else { return "the target pid '\(plan.targetPID)' is not a pid" }
+        if !(isSessionUUID(plan.resumeArg) || isEngineWord(plan.resumeArg)) {
+            return "the resume argument is neither a session id nor a plain word like fresh-keep"
+        }
+        if !plan.bot.workdir.hasPrefix("/") || plan.bot.workdir.contains("\"") || plan.bot.workdir.contains("\\") {
+            return "the workdir \(plan.bot.workdir) is not a plain absolute path"
+        }
+        return nil
+    }
+
+    /// The window this restart should leave closed: the live session's own tab, or,
+    /// for a session that is already down, the tab recorded while it ran.
+    static func windowToClean(_ health: BotHealth, _ table: ProcessTable) -> (record: WindowRecord?, source: String) {
+        if let pid = health.sessionPIDs.first {
+            if let record = table.windowRecord(session: pid) { return (record, "its session's own tab") }
+            return (nil, "its session \(pid) has no Terminal tab")
+        }
+        if let record = WindowRecords.load()[health.bot.key] { return (record, "recorded while its last session ran") }
+        return (nil, "no window was recorded for its last session")
     }
 
     /// Whether this app may drive Terminal (the engines open the new bot window with
@@ -840,16 +1508,23 @@ extension FleetModel {
         return env
     }
 
-    /// One reconnect, start to finish. Runs off the main thread (it waits on the
-    /// engine and then on the new poller). Never restarts a connected bot unless the
-    /// caller confirmed it.
+    static func describe(_ health: BotHealth) -> String {
+        "\(health.bot.key) (\(health.state.rawValue), session \(health.sessionPIDs.first.map { String($0) } ?? "none"), poller \(health.pollerPIDs.first.map { String($0) } ?? "none"))"
+    }
+
+    /// One reconnect or fresh start, start to finish, the way /fresh does it: the
+    /// bot's first line in its chat, the engine (which sends "Back and ready" and
+    /// closes the old window), then the app closes a window only it knows about.
+    /// Runs off the main thread. Never restarts a connected bot unless the caller
+    /// confirmed it, and re-checks everything right before the engine runs.
     static func performReconnect(_ bot: Bot, _ config: FleetConfig, allowConnected: Bool, dryRun: Bool,
                                  askForPermission: Bool, freshStart: Bool = false,
                                  log: (String) -> Void) -> ReconnectOutcome {
         let action = freshStart ? "fresh start" : "reconnect"
-        let health = evaluateOne(bot, config)
-        let who = "\(bot.key) (\(health.state.rawValue), session \(health.sessionPIDs.first.map { String($0) } ?? "none"), poller \(health.pollerPIDs.first.map { String($0) } ?? "none"))"
-        if health.state == .connected && !allowConnected && !dryRun {
+        let spoken = freshStart ? "Fresh start" : "Reconnect"
+        let table0 = ProcessTable.snapshot()
+        let health0 = evaluateOne(bot, config, table: table0)
+        if health0.state == .connected && !allowConnected && !dryRun {
             log("\(action) \(bot.key): connected again before the restart ran, nothing to do")
             return .healedBeforeRun
         }
@@ -858,58 +1533,122 @@ extension FleetModel {
             log("\(action) \(bot.key): cannot run, \(resolved.note)")
             return .noEngine(resolved.note)
         }
-        let plan = makePlan(health, config, engine: engine,
-                            resumeOverride: freshStart ? config.settings.freshStartArg : nil)
+        let override = freshStart ? config.settings.freshStartArg : nil
+        let plan0 = makePlan(health0, config, engine: engine, resumeOverride: override)
+        if let problem = planProblem(plan0) {
+            log("\(action) \(bot.key): refused before anything ran, \(problem)")
+            return .engineRefused(-2, problem)
+        }
 
         if dryRun {
             if freshStart {
                 log("[DRY-RUN] fresh start \(bot.key): the panel would first ask \"Start \(bot.name) fresh?\" (Cancel is the default)")
-            } else if health.state == .connected && !allowConnected {
+            } else if health0.state == .connected && !allowConnected {
                 log("[DRY-RUN] reconnect \(bot.key): connected, so the panel would first ask \"Restart \(bot.name) even though it is connected? It keeps the conversation.\" (Cancel is the default)")
             }
-            log("[DRY-RUN] \(action) \(who): would run: \(plan.commandLine)")
-            log("[DRY-RUN]   resume \(plan.resumeArg.isEmpty ? "\"\" (empty)" : plan.resumeArg) (from \(plan.resumeNote)); PATH=\(FleetPaths.enginePATH)")
-            return .dryRun(plan)
+            log("[DRY-RUN] \(action) \(describe(health0)): \(bot.name) would first say in its chat \"\(BotChat.line(spoken))\" (\(BotChat.readiness(bot)))")
+            log("[DRY-RUN] \(action) \(bot.key): would run: \(plan0.commandLine)")
+            log("[DRY-RUN]   resume \(plan0.resumeArg.isEmpty ? "\"\" (empty)" : plan0.resumeArg) (from \(plan0.resumeNote)); PATH=\(FleetPaths.enginePATH)")
+            log("[DRY-RUN]   the engine then sends \"\(BotChat.backAndReady)\" from \(bot.name) once the new poller is up")
+            let window = windowToClean(health0, table0)
+            if let record = window.record {
+                if health0.sessionPIDs.isEmpty {
+                    WindowCleanup.closeOldWindow(record, bot, dryRun: true, note: { log("[DRY-RUN]   \($0)") })
+                } else {
+                    log("[DRY-RUN]   old window: \(bot.name)'s tab on \(record.tty) (hosted by \(record.hostList)); the engine closes it when it is its window's only tab with no claude left in it, and the app checks it is gone")
+                }
+            } else {
+                log("[DRY-RUN]   old window: \(window.source), so none would be closed")
+            }
+            return .dryRun(plan0)
         }
 
-        // The engine kills the old session before it asks Terminal for the new
-        // window, so a Terminal permission that is missing must stop us first.
+        // Terminal permission first; an answer macOS cannot confirm is not a go.
         var automation = terminalAutomation(askUser: false)
         if automation == .wouldPrompt && askForPermission {
             log("\(action) \(bot.key): asking macOS for permission to open the bot's Terminal window")
             automation = terminalAutomation(askUser: true)
         }
-        if automation == .denied || automation == .wouldPrompt {
+        guard automation == .granted else {
             log("\(action) \(bot.key): stopped before anything was touched, Terminal automation is \(automation.text)")
             return .permissionBlocked(automation)
         }
 
-        log("\(action) \(who): running \(plan.commandLine) (resume from \(plan.resumeNote))")
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = plan.arguments
-        process.environment = engineEnvironment()
-        process.currentDirectoryURL = URL(fileURLWithPath: "/")
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
+        // Everything again, right before the engine runs: a permission prompt can take
+        // a while, and the bot or its session may have changed meanwhile.
+        let table1 = ProcessTable.snapshot()
+        let health1 = evaluateOne(bot, config, table: table1)
+        if health1.state == .connected && !allowConnected {
+            log("\(action) \(bot.key): connected again before the restart ran (\(describe(health1))), nothing was run")
+            return .healedBeforeRun
+        }
+        let pidBefore = health0.sessionPIDs.first, pidNow = health1.sessionPIDs.first
+        var change: String?
+        if pidBefore != pidNow {
+            change = "its session changed from \(pidBefore.map { String($0) } ?? "none") to \(pidNow.map { String($0) } ?? "none") while waiting"
+        } else if let pid = pidNow {
+            if let s0 = health0.sessionStarted, let s1 = health1.sessionStarted, abs(s0 - s1) > 0.01 {
+                change = "pid \(pid) now belongs to a different process"
+            } else if !(table1.argv(of: pid)?.joined(separator: " ").contains(ProcessTable.sessionSignature) ?? false) {
+                change = "pid \(pid) no longer carries the session signature"
+            } else if let cwd = processCWD(pid), cwd != bot.workdir {
+                change = "its session \(pid) runs in \(cwd), not \(bot.workdir)"
+            } else if processCWD(pid) == nil {
+                change = "the working directory of session \(pid) cannot be read"
+            }
+        }
+        if let change {
+            log("\(action) \(bot.key): stopped, \(change); nothing was run")
+            return .changedBeforeRun(change)
+        }
+        let plan = makePlan(health1, config, engine: engine, resumeOverride: override)
+        if let problem = planProblem(plan) {
+            log("\(action) \(bot.key): refused before anything ran, \(problem)")
+            return .engineRefused(-2, problem)
+        }
+        let window = windowToClean(health1, table1)
+
+        // Like /fresh: the bot first says, in its own chat, that a restart is coming.
+        let first = BotChat.send(bot, BotChat.line(spoken))
+        log("\(action) \(bot.key): " + (first.ok
+            ? "said in its chat \"\(BotChat.line(spoken))\" (\(first.detail))"
+            : "chat line not sent: \(first.detail)"))
+
+        log("\(action) \(describe(health1)): running \(plan.commandLine) (resume from \(plan.resumeNote))")
+        let deadline = engineDeadline(300)
+        let result: Subprocess.Result
         do {
-            try process.run()
+            result = try Subprocess.run("/bin/bash", plan.arguments, environment: engineEnvironment(), capture: false,
+                                        deadline: deadline, started: { log("\(action) \(bot.key): engine started as pid \($0)") })
         } catch {
             log("\(action) \(bot.key): could not start /bin/bash (\(error.localizedDescription))")
+            let failed = BotChat.send(bot, "\(spoken) from the menu bar failed to launch, nothing was restarted")
+            log("\(action) \(bot.key): " + (failed.ok ? "said so in its chat (\(failed.detail))" : "failure line not sent: \(failed.detail)"))
             return .engineRefused(-1, "could not start the engine")
         }
-        process.waitUntilExit()
-        let code = process.terminationStatus
-        let signaled = process.terminationReason == .uncaughtSignal
-        let meaning = signaled ? "engine killed by signal \(code)" : (engineMeanings[code] ?? "engine failed")
+        if result.timedOut {
+            log("\(action) \(bot.key): the engine ran past \(Int(deadline))s and was stopped (exit \(result.code)); its restart lock clears itself within 3 minutes")
+            return .engineTimedOut(Int(deadline))
+        }
+        let code = result.code
+        let meaning = result.signaled ? "engine killed by signal \(code)" : (engineMeanings[code] ?? "engine failed")
         log("\(action) \(bot.key): engine exit \(code), \(meaning)")
-        guard !signaled, [0, 6, 7].contains(code) else { return .engineRefused(code, meaning) }
+
+        // The engine closes a live session's window itself (the app then checks it is
+        // gone); a session that was already down left a window only the app knows of.
+        if !result.signaled && (code == 0 || code == 6) {
+            if let record = window.record {
+                WindowCleanup.closeOldWindow(record, bot, dryRun: false, note: { log("\(action) \(bot.key): \($0)") })
+            } else {
+                log("\(action) \(bot.key): old window: \(window.source), so none was closed")
+            }
+        }
+        guard !result.signaled, [0, 6, 7].contains(code) else { return .engineRefused(code, meaning) }
 
         // The shipped engine returns as soon as the window opens; wait for the poller.
-        let deadline = Date().addingTimeInterval(45)
+        let wait = Date().addingTimeInterval(45)
         var after = evaluateOne(bot, config)
-        while after.state != .connected && Date() < deadline {
+        while after.state != .connected && Date() < wait {
             Thread.sleep(forTimeInterval: 2)
             after = evaluateOne(bot, config)
         }
@@ -931,6 +1670,16 @@ enum FleetEngineAction: String {
 struct EngineRun {
     let code: Int32
     let summary: String
+    var timedOut = false
+}
+
+/// What Restore did, bot by bot.
+struct RestoreReport {
+    var run: EngineRun?
+    var wasDown: [String] = []      // bot keys that were down when Restore started
+    var back: [String] = []         // of those, the ones that came back
+    var notBack: [String] = []      // and the ones that did not
+    var blocked: AutomationStatus?
 }
 
 extension FleetModel {
@@ -952,7 +1701,8 @@ extension FleetModel {
         }
     }
 
-    /// Runs the snapshot or restore engine, or in dry run logs exactly what it would run.
+    /// Runs the snapshot or restore engine with a deadline and a bounded capture of its
+    /// output, or in dry run logs exactly what it would run.
     static func runFleetEngine(_ action: FleetEngineAction, _ config: FleetConfig, dryRun: Bool,
                                log: (String) -> Void) -> EngineRun? {
         let path = enginePath(action, config)
@@ -975,29 +1725,113 @@ extension FleetModel {
             return nil
         }
         log("\(action.rawValue): running \(command)")
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [path]
-        process.environment = engineEnvironment()
-        process.currentDirectoryURL = URL(fileURLWithPath: "/")
-        process.standardInput = FileHandle.nullDevice
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
+        let deadline = engineDeadline(action == .snapshot ? 120 : 300)
+        let result: Subprocess.Result
         do {
-            try process.run()
+            result = try Subprocess.run("/bin/bash", [path], environment: engineEnvironment(), capture: true,
+                                        deadline: deadline)
         } catch {
             log("\(action.rawValue): could not start /bin/bash (\(error.localizedDescription))")
             return nil
         }
-        let output = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        let lines = String(decoding: output.prefix(65_536), as: UTF8.self)
-            .split(separator: "\n").map { redactTokens(String($0)).trimmingCharacters(in: .whitespaces) }
+        let lines = result.output.split(separator: "\n").map { redactTokens(String($0)).trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
         let summary = lines.last(where: { !$0.hasPrefix("  ") }) ?? "no output"
-        log("\(action.rawValue): engine exit \(process.terminationStatus): \(summary)")
-        return EngineRun(code: process.terminationStatus, summary: summary)
+        if result.timedOut {
+            log("\(action.rawValue): the engine ran past \(Int(deadline))s and was stopped; last line: \(summary)")
+            return EngineRun(code: result.code == 0 ? -1 : result.code, summary: "ran past \(Int(deadline))s and was stopped", timedOut: true)
+        }
+        log("\(action.rawValue): engine exit \(result.code): \(summary)")
+        return EngineRun(code: result.code, summary: summary)
+    }
+
+    /// Restore, the way /fresh speaks: every bot that is down says first that a restore
+    /// is coming, the restore engine runs, then each bot that comes back says "Back and
+    /// ready" and its old window is closed, when it is provably that window.
+    static func performRestore(_ config: FleetConfig, dryRun: Bool, askForPermission: Bool,
+                               log: (String) -> Void) -> RestoreReport {
+        let table0 = ProcessTable.snapshot()
+        let now0 = Int(Date().timeIntervalSince1970)
+        let trust0 = heartbeatTrust(config, now: now0, probe: nil)
+        let down = config.bots.filter {
+            evaluate($0, table: table0, now: now0, maxAge: config.settings.heartbeatMaxAge, trust: trust0).state == .down
+        }
+        let records = WindowRecords.load()
+        var report = RestoreReport(wasDown: down.map(\.key))
+        if dryRun {
+            report.run = runFleetEngine(.restore, config, dryRun: true, log: log)
+            if down.isEmpty {
+                log("[DRY-RUN]   no bot is down right now, so a real run would reopen nothing and send nothing")
+            }
+            for bot in down {
+                log("[DRY-RUN]   \(bot.name) is down: it would first say \"\(BotChat.line("Restore"))\" (\(BotChat.readiness(bot))), then \"\(BotChat.backAndReady)\" once its poller is up")
+                if let record = records[bot.key] {
+                    WindowCleanup.closeOldWindow(record, bot, dryRun: true, note: { log("[DRY-RUN]   \($0)") })
+                } else {
+                    log("[DRY-RUN]   \(bot.name): no window was recorded for its last session, so none would be closed")
+                }
+            }
+            return report
+        }
+        guard isRegularFile(config.settings.snapshotFile) else {
+            log("restore: no snapshot at \(config.settings.snapshotFile), nothing to restore")
+            return report
+        }
+        if !down.isEmpty {
+            var automation = terminalAutomation(askUser: false)
+            if automation == .wouldPrompt && askForPermission {
+                log("restore: asking macOS for permission to open the bots' Terminal windows")
+                automation = terminalAutomation(askUser: true)
+            }
+            guard automation == .granted else {
+                log("restore: stopped before anything was touched, Terminal automation is \(automation.text)")
+                report.blocked = automation
+                return report
+            }
+        }
+        for bot in down {
+            let sent = BotChat.send(bot, BotChat.line("Restore"))
+            log("restore \(bot.key): " + (sent.ok
+                ? "said in its chat \"\(BotChat.line("Restore"))\" (\(sent.detail))"
+                : "chat line not sent: \(sent.detail)"))
+        }
+        report.run = runFleetEngine(.restore, config, dryRun: false, log: log)
+        guard let run = report.run, run.code == 0 else {
+            report.notBack = report.wasDown
+            return report
+        }
+        var pending = down
+        let wait = Date().addingTimeInterval(60)
+        while !pending.isEmpty && Date() < wait {
+            Thread.sleep(forTimeInterval: 2)
+            let table = ProcessTable.snapshot()
+            let now = Int(Date().timeIntervalSince1970)
+            let trust = heartbeatTrust(config, now: now, probe: nil)
+            var still: [Bot] = []
+            for bot in pending {
+                let health = evaluate(bot, table: table, now: now, maxAge: config.settings.heartbeatMaxAge, trust: trust)
+                guard health.state == .connected else {
+                    still.append(bot)
+                    continue
+                }
+                report.back.append(bot.key)
+                let sent = BotChat.send(bot, BotChat.backAndReady)
+                log("restore \(bot.key): connected (\(describe(health))); " + (sent.ok
+                    ? "said \"\(BotChat.backAndReady)\" (\(sent.detail))"
+                    : "back-online line not sent: \(sent.detail)"))
+                if let record = records[bot.key] {
+                    WindowCleanup.closeOldWindow(record, bot, dryRun: false, note: { log("restore \(bot.key): \($0)") })
+                } else {
+                    log("restore \(bot.key): old window: no window was recorded for its last session, so none was closed")
+                }
+            }
+            pending = still
+        }
+        report.notBack = pending.map(\.key)
+        for bot in pending {
+            log("restore \(bot.key): still not connected 60s after the restore engine finished")
+        }
+        return report
     }
 }
 
@@ -1006,13 +1840,18 @@ extension FleetModel {
 struct WatchdogSwitches {
     let dir: String
     let dirExists: Bool
-    let disabled: [Bot]
+    let disabled: [Bot]      // bots whose <key>.disabled is a regular file, the watchdog's own -f test
+    let odd: [String]        // marker paths that exist but are not regular files; the watchdog ignores them
     let total: Int
 
-    var isOn: Bool { disabled.isEmpty }
-    var isFullyOff: Bool { total > 0 && disabled.count == total }
+    /// With no state folder nothing can say whether auto-recovery runs, so the switch
+    /// is unavailable rather than on.
+    var available: Bool { dirExists }
+    var isOn: Bool { available && disabled.isEmpty }
+    var isFullyOff: Bool { available && total > 0 && disabled.count == total }
 
     var label: String {
+        if !available { return "Watchdog: unavailable (no state folder)" }
         if isOn { return "Watchdog: on" }
         if isFullyOff { return "Watchdog: off" }
         return "Watchdog: off for " + disabled.map(\.name).joined(separator: ", ")
@@ -1020,51 +1859,92 @@ struct WatchdogSwitches {
 }
 
 extension FleetModel {
+    /// Whether anything at all sits at a path, without following a symlink.
+    static func somethingAt(_ path: String) -> Bool {
+        var st = stat()
+        return lstat(path, &st) == 0
+    }
+
     static func readWatchdog(_ config: FleetConfig) -> WatchdogSwitches {
         let dir = config.settings.watchdogStateDir
-        let disabled = config.bots.filter { FileManager.default.fileExists(atPath: dir + "/" + $0.key + ".disabled") }
-        return WatchdogSwitches(dir: dir, dirExists: isDirectory(dir), disabled: disabled, total: config.bots.count)
+        let exists = isDirectory(dir)
+        var disabled: [Bot] = []
+        var odd: [String] = []
+        if exists {
+            for bot in config.bots {
+                let file = dir + "/" + bot.key + ".disabled"
+                if isRegularFile(file) {
+                    disabled.append(bot)
+                } else if somethingAt(file) {
+                    odd.append(file)
+                }
+            }
+        }
+        return WatchdogSwitches(dir: dir, dirExists: exists, disabled: disabled, odd: odd, total: config.bots.count)
     }
 
     /// Off: create <key>.disabled for every bot that lacks one (what the snapshot
     /// engine touches). On: remove every bot's <key>.disabled (what restore removes).
+    /// Only regular files are ever created or removed, one unlink at a time; a
+    /// directory or anything else at a marker path is left alone and reported.
     /// Nothing else is touched, not even the crash-loop breaker's own markers.
+    /// Returns the problems, empty when every change went through.
     @discardableResult
-    static func applyWatchdog(on: Bool, _ config: FleetConfig, dryRun: Bool, log: (String) -> Void) -> Bool {
+    static func applyWatchdog(on: Bool, _ config: FleetConfig, dryRun: Bool, log: (String) -> Void) -> [String] {
         let dir = config.settings.watchdogStateDir
         guard isDirectory(dir) else {
-            log("watchdog: \(dir) does not exist, nothing changed (is the watchdog installed?)")
-            return false
+            let problem = "no watchdog state folder at \(dir), so auto-recovery cannot be switched (is the watchdog installed?)"
+            log("watchdog: \(problem); nothing changed")
+            return [problem]
         }
         let prefix = dryRun ? "[DRY-RUN] " : ""
         var changed = 0
-        var ok = true
+        var problems: [String] = []
         for bot in config.bots {
             let file = dir + "/" + bot.key + ".disabled"
-            let exists = FileManager.default.fileExists(atPath: file)
-            if on && exists {
-                if dryRun {
-                    log("\(prefix)watchdog on: would remove \(file)")
-                } else if (try? FileManager.default.removeItem(atPath: file)) != nil {
-                    log("watchdog on: removed \(file)")
-                } else {
-                    log("watchdog on: could not remove \(file)"); ok = false
+            let regular = isRegularFile(file)
+            let present = somethingAt(file)
+            if on {
+                if regular {
+                    if dryRun {
+                        log("\(prefix)watchdog on: would remove \(file)")
+                    } else if unlink(file) == 0 {
+                        log("watchdog on: removed \(file)")
+                    } else {
+                        let problem = "could not remove \(file) (\(String(cString: strerror(errno))))"
+                        log("watchdog on: \(problem)")
+                        problems.append(problem)
+                    }
+                    changed += 1
+                } else if present {
+                    log("\(prefix)watchdog on: left \(file) alone, it is not a regular file (the watchdog ignores it too)")
                 }
-                changed += 1
-            } else if !on && !exists {
-                if dryRun {
+            } else if !regular {
+                if present {
+                    let problem = "\(file) exists but is not a regular file, so \(bot.name) could not be switched off"
+                    log("\(prefix)watchdog off: \(problem)")
+                    problems.append(problem)
+                } else if dryRun {
                     log("\(prefix)watchdog off: would create \(file)")
-                } else if FileManager.default.createFile(atPath: file, contents: Data()) {
-                    log("watchdog off: created \(file)")
+                    changed += 1
                 } else {
-                    log("watchdog off: could not create \(file)"); ok = false
+                    let fd = open(file, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o644)
+                    if fd >= 0 {
+                        close(fd)
+                        log("watchdog off: created \(file)")
+                    } else {
+                        let problem = "could not create \(file) (\(String(cString: strerror(errno))))"
+                        log("watchdog off: \(problem)")
+                        problems.append(problem)
+                    }
+                    changed += 1
                 }
-                changed += 1
             }
         }
         let verb = on ? "on" : "off"
-        log("\(prefix)watchdog \(verb): \(changed) file(s) \(dryRun ? "would change" : "changed") in \(dir), \(config.bots.count - changed) already \(on ? "absent" : "present")")
-        return ok
+        log("\(prefix)watchdog \(verb): \(changed) file(s) \(dryRun ? "would change" : "changed") in \(dir), \(config.bots.count - changed) already \(on ? "absent" : "present")"
+            + (problems.isEmpty ? "" : ", \(problems.count) problem(s)"))
+        return problems
     }
 }
 

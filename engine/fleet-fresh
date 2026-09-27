@@ -17,7 +17,8 @@
 #   - refuses unless the PID is a claude process whose lsof cwd == that workdir,
 #     so a sibling bot is never killed by mistake (exit 3 / exit 4)
 #   - SIGTERM, wait up to 8s, then SIGKILL only if it lingers
-#   - closes the old window strictly by the killed session's own tty
+#   - closes the old window strictly by the killed session's own tty, and only
+#     when that tab is the window's only tab (never a window holding a sibling)
 #   - process discovery is ps -axo + lsof cwd match, never pgrep -f / pkill
 #
 # macOS only (osascript / Terminal.app / lsof / ps -o tty). Logs to
@@ -185,35 +186,50 @@ OSA
   fi
 
   # Close the old, now-dead window strictly by its old controlling tty so a
-  # sibling bot window is never closed.
-  case "$OLD_TTY" in
-    ttys[0-9]*)
-      sleep 2
-      echo "$(date '+%F %T') closing old window tty=/dev/$OLD_TTY"
-      /usr/bin/osascript <<OSA 2>>"$LOG" || true
+  # sibling bot window is never closed. The match is one TAB, and closing its
+  # window would also close every other tab in that window, which can hold a
+  # sibling bot. So the window is closed only when the matched tab is its only
+  # tab and no claude process still runs in it; otherwise it is left open and the
+  # reason is logged. Terminal cannot close a single tab by script.
+  if [[ "$OLD_TTY" =~ ^ttys[0-9]+$ ]]; then
+    sleep 2
+    echo "$(date '+%F %T') closing old window tty=/dev/$OLD_TTY"
+    close_result=$(/usr/bin/osascript 2>>"$LOG" <<OSA
+set wanted to "/dev/$OLD_TTY"
 tell application "Terminal"
-  set toClose to {}
+  set wid to missing value
+  set tabCount to 0
+  set hasClaude to false
   repeat with w in windows
-    repeat with t in tabs of w
+    set tabList to tabs of w
+    repeat with t in tabList
+      set tabTTY to ""
       try
-        if tty of t is "/dev/$OLD_TTY" then
-          set end of toClose to w
-        end if
+        set tabTTY to tty of t
       end try
+      if tabTTY is wanted then
+        set wid to id of w
+        set tabCount to count of tabList
+        try
+          set hasClaude to ((processes of t) contains "claude")
+        end try
+        exit repeat
+      end if
     end repeat
+    if wid is not missing value then exit repeat
   end repeat
-  repeat with w in toClose
-    try
-      close w saving no
-    end try
-  end repeat
+  if wid is missing value then return "no tab on " & wanted & ", nothing to close"
+  if hasClaude then return "left window " & wid & " open: a claude process still runs in its tab on " & wanted
+  if tabCount is not 1 then return "left window " & wid & " open: the tab on " & wanted & " shares it with " & (tabCount - 1) & " other tab(s), and Terminal cannot close a single tab by script"
+  close (window id wid) saving no
+  return "closed window " & wid & " (its only tab was on " & wanted & ")"
 end tell
 OSA
-      ;;
-    *)
-      echo "$(date '+%F %T') skip old-window close: implausible tty '$OLD_TTY'"
-      ;;
-  esac
+)
+    echo "$(date '+%F %T') old-window close: ${close_result:-osascript returned nothing}"
+  else
+    echo "$(date '+%F %T') skip old-window close: implausible tty '$OLD_TTY'"
+  fi
 
   echo "=== done ==="
 } >> "$LOG" 2>&1

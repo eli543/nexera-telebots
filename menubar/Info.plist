@@ -29,7 +29,7 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>Reconnect opens the bot's new Terminal window, which needs permission to control Terminal.</string>
+	<string>Reconnect opens the bot's new Terminal window and closes its old one, which needs permission to control Terminal.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>

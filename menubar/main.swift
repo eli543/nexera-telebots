@@ -3,13 +3,15 @@
 // The status item draws one dot per bot (filled = connected, hollow = not) next to
 // the connected count, and the count turns red when any bot is down. Clicking it
 // opens a Liquid Glass panel: one row per bot with a Reconnect capsule, details on
-// click, Reconnect all down, the watchdog switch, Refresh, Open log and Quit.
-// Health, reconnect and the watchdog switch live in Fleet.swift.
+// click, Reconnect all down, the watchdog switch, Snapshot, Restore, Refresh and a
+// legend with Quit. Health, reconnect, window cleanup and the watchdog switch live
+// in Fleet.swift; refreshes run off the main thread and land whole.
 //
-// Command line (see README.md): --dump, --reconnect <bot> [--dry-run],
-// --toggle-watchdog [--dry-run], --render-preview <png> [--demo],
+// Command line (see README.md): --dump, --reconnect <bot> [--yes] [--dry-run],
+// --fresh-start <bot> (--yes | --dry-run), --toggle-watchdog [--dry-run],
+// --snapshot [--dry-run], --restore [--dry-run], --render-preview <png> [--demo],
 // --render-icon <dir.iconset>, and for the menu bar app itself --dry-run,
-// --open-panel (alias --open-menu), --demo [--appearance light|dark].
+// --open-panel (alias --open-menu), --demo [--appearance light|dark], --launchd.
 
 import AppKit
 import SwiftUI
@@ -251,68 +253,71 @@ enum DotArt {
 
 // MARK: - Store
 
-@MainActor
-final class FleetStore: ObservableObject {
-    enum Mode { case live, dryRun, demo, snapshot }
+/// One bot's row, as the panel and the text dump show it.
+struct FleetRow: Identifiable, Equatable {
+    let id: String
+    let name: String
+    var state: BotState
+    var statusText: String          // "12s", "No poller", "Down"
+    var statusIcon: String?         // the pulse glyph beside a heartbeat age
+    var statusTip: String
+    var dumpStatus: String
+    var spokenStatus: String
+    var detailLine: String          // "Opus 5.5 · max · 41% ctx" (+ restarts when above zero)
+    var detailTip: String
+    var stall: Bool
+    var uptimeLine: String?         // shown when the row is expanded
+    var pulse: Int
+    var connected: Bool { state == .connected }
+}
 
-    struct Row: Identifiable, Equatable {
-        let id: String
-        let name: String
-        var state: BotState
-        var statusText: String          // "12s", "No poller", "Down"
-        var statusIcon: String?         // the pulse glyph beside a heartbeat age
-        var statusTip: String
-        var dumpStatus: String
-        var spokenStatus: String
-        var detailLine: String          // "Opus 5.5 · max · 41% ctx" (+ restarts when above zero)
-        var detailTip: String
-        var stall: Bool
-        var uptimeLine: String?         // shown when the row is expanded
-        var pulse: Int
-        var connected: Bool { state == .connected }
-    }
+/// Watchdog and Telegram state for the header line and the menu bar marks.
+struct HeaderStatus: Equatable {
+    var watchdogOffFor: [String]      // bot names whose kill switch is set
+    var watchdogTotal: Int
+    var watchdogAvailable: Bool = true
+    var lastPassAge: Int?             // seconds since the watchdog's last pass
+    var telegramReachable: Bool?      // nil when unknown
+}
 
-    /// Watchdog and Telegram state for the header line and the menu bar marks.
-    struct HeaderStatus: Equatable {
-        var watchdogOffFor: [String]      // bot names whose kill switch is set
-        var watchdogTotal: Int
-        var lastPassAge: Int?             // seconds since the watchdog's last pass
-        var telegramReachable: Bool?      // nil when unknown
-    }
+/// A line under a row (or under the bottom group) that stays until it no longer
+/// applies: a failed action, or a short note about what happened instead.
+struct RowNote: Equatable {
+    let text: String
+    let isError: Bool
+    let at: TimeInterval
+    let session: pid_t?               // the session running when it was written
+}
 
-    @Published private(set) var rows: [Row] = []
-    @Published private(set) var problem: String?
-    @Published private(set) var watchdog: WatchdogSwitches?
-    @Published private(set) var inFlight: Set<String> = []
-    @Published private(set) var succeeded: Set<String> = []
-    @Published var expanded: Set<String> = []
-    @Published private(set) var reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-    @Published private(set) var header: HeaderStatus?
-    @Published private(set) var marks: [MenuMark] = []
-    @Published var showLegend = false
-    @Published private(set) var snapshotAvailable = false
-    @Published private(set) var snapshotTip = "No snapshot saved"
-    @Published private(set) var snapshotBusy = false
-    @Published private(set) var restoreBusy = false
-    @Published private(set) var confirmation: String?
+/// Everything one refresh computes, built off the main thread and handed over whole.
+struct RefreshResult {
+    var configProblem: String?
+    var config: FleetConfig?
+    var healths: [BotHealth] = []
+    var rows: [FleetRow] = []
+    var watchdog: WatchdogSwitches?
+    var header: HeaderStatus?
+    var marks: [MenuMark] = []
+    var snapshotAvailable = false
+    var snapshotTip = "No snapshot saved"
+    var reachable: Bool?
+    var windowNote: String?
+}
 
-    let mode: Mode
-    private(set) var config: FleetConfig?
-    var onChange: (() -> Void)?
-    private var lastStates: [String: BotState] = [:]
-    private var didFirstRefresh = false
-    private var lastProblem: String?
-    private var lastHeaderProblem: String?
-    private var loggedWarnings: [String] = []
+/// The refresh work: the process scan, transcript reads and the network probe. It
+/// runs on one serial queue, and its caches live there, never on the main thread
+/// (hence unchecked Sendable: `queue` is the only way in).
+final class RefreshWorker: @unchecked Sendable {
+    let queue = DispatchQueue(label: "com.nexera.telebots-menubar.refresh", qos: .utility)
     private var contextCache: [String: (session: pid_t, value: Int?, served: String?, servedAt: TimeInterval?, at: Date)] = [:]
     /// Model family to its newest full name seen in any bot's transcript ("opus" to
     /// "Opus 5.5"). Kept in memory, so it survives the sibling it came from going down.
     private var familyNames: [String: (name: String, at: TimeInterval)] = [:]
-    private var probe: (reachable: Bool, at: Date)?
+    private var records: [String: WindowRecord]?
+    private let probe = TelegramProbe()
+    private let probeLock = NSLock()
+    private var probeResult: (reachable: Bool, at: Date)?
     private var probing = false
-    private var confirmationToken = 0
-    private let reconnectQueue = DispatchQueue(label: "com.nexera.telebots-menubar.reconnect")
-    private let engineQueue = DispatchQueue(label: "com.nexera.telebots-menubar.engines")
     private let timeOfDay: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
@@ -323,176 +328,118 @@ final class FleetStore: ObservableObject {
         return f
     }()
 
-    init(mode: Mode) { self.mode = mode }
+    func stop() { probe.cancel() }
 
-    var total: Int { rows.count }
-    var connectedCount: Int { rows.filter(\.connected).count }
-    var anyDown: Bool { problem == nil && rows.contains { !$0.connected } }
-    var canReconnectAll: Bool { problem == nil && rows.contains { !$0.connected && !inFlight.contains($0.id) } }
-    var alarm: Bool { problem != nil || connectedCount < total }
-    var countText: String { problem != nil ? "?" : "\(connectedCount)/\(total)" }
-    var summary: String { problem != nil ? "Fleet config problem" : "\(connectedCount) of \(total) online" }
-    var actionsLive: Bool { mode == .live || mode == .dryRun }
-    var badge: String? {
-        switch mode {
-        case .demo: return "DEMO"
-        case .dryRun: return "DRY RUN"
-        default: return nil
-        }
-    }
-    var watchdogCaption: String {
-        guard let w = watchdog else { return "Unavailable" }
-        if !w.dirExists { return "No watchdog state folder" }
-        if w.isOn { return "Auto-recovery on" }
-        if w.isFullyOff { return "Auto-recovery off" }
-        return "Auto-recovery off for " + w.disabled.map(\.name).joined(separator: ", ")
-    }
-
-    /// The one short red header line, only when self-healing or Telegram is broken.
-    var headerProblem: String? {
-        guard let h = header else { return nil }
-        var parts: [String] = []
-        if let age = h.lastPassAge, age > 180 {
-            parts.append("Watchdog not running")
-        } else if !h.watchdogOffFor.isEmpty {
-            parts.append(h.watchdogOffFor.count >= h.watchdogTotal
-                         ? "Auto-recovery off"
-                         : "Auto-recovery off for " + h.watchdogOffFor.joined(separator: ", "))
-        }
-        if h.telegramReachable == false { parts.append("Telegram unreachable") }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
-    }
-
-    private func log(_ message: String) {
-        guard actionsLive else { return }
-        ActionLog.shared.write(message)
-    }
-
-    func refreshReduceMotion() {
-        reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-    }
-
-    func logStartup() {
-        guard actionsLive else { return }
-        var line = "start: Telebots Bar \(appVersion) (pid \(getpid()), \(mode == .dryRun ? "dry run" : "live"))"
-        switch FleetModel.loadConfig() {
-        case .ok(let cfg):
-            let engine = FleetModel.resolveFreshEngine(cfg)
-            line += ", config \(cfg.path), \(cfg.bots.count) bots, engine \(engine.path ?? "none (\(engine.note))")"
-            line += ", watchdog state \(cfg.settings.watchdogStateDir), heartbeat limit \(cfg.settings.heartbeatMaxAge)s"
-            line += ", resume from \(cfg.settings.resumeSource.rawValue)"
-            line += ", snapshot \(cfg.settings.snapshotEngine), restore \(cfg.settings.restoreEngine)"
-        case .problem(let message, _):
-            line += ", config problem: \(message)"
-        }
-        log(line)
-        DispatchQueue.global(qos: .utility).async {
-            let status = FleetModel.terminalAutomation(askUser: false)
-            ActionLog.shared.write("start: Terminal automation for Reconnect is \(status.text)")
-        }
-    }
-
-    // MARK: Refresh
-
-    func refresh(reason: String? = nil) {
-        guard mode != .demo else { onChange?(); return }
+    /// One whole refresh. Called on `queue` only.
+    func compute(recordWindows: Bool) -> RefreshResult {
+        var result = RefreshResult()
+        let cfg: FleetConfig
         switch FleetModel.loadConfig() {
         case .problem(let message, _):
-            config = nil
-            problem = message
-            rows = []
-            watchdog = nil
-            header = nil
-            marks = []
-            if message != lastProblem { log("config problem: \(message)") }
-            lastProblem = message
-        case .ok(let cfg):
-            if lastProblem != nil { log("config readable again: \(cfg.path)") }
-            lastProblem = nil
-            if cfg.warnings != loggedWarnings {
-                for warning in cfg.warnings { log("config warning: \(warning)") }
-                loggedWarnings = cfg.warnings
-            }
-            config = cfg
-            problem = nil
-            ActionLog.shared.setTimeZone(cfg.settings.timeZone)
-            timeOfDay.timeZone = cfg.settings.timeZone
-            let now = Int(Date().timeIntervalSince1970)
-            let healths = FleetModel.evaluateAll(cfg)
-            var previous: [String: Row] = [:]
-            for row in rows { previous[row.id] = row }
-            var next: [Row] = []
-            var allIndicators = healths.map { indicators($0, cfg) }
-            // Learn each family's newest full name from the bots that have replied...
-            for ind in allIndicators {
-                guard let served = ind.servedModel else { continue }
-                let family = FleetModel.modelFamily(served)
-                let at = ind.servedAt ?? 0
-                if let known = familyNames[family], known.at > at { continue }
-                familyNames[family] = (served, at)
-            }
-            // ...and lend it to a bot on the same family that has not replied yet.
-            var borrowed = Set<String>()
-            for i in allIndicators.indices where allIndicators[i].servedModel == nil {
-                if let alias = allIndicators[i].model, let known = familyNames[FleetModel.modelFamily(alias)] {
-                    allIndicators[i].model = known.name
-                    borrowed.insert(healths[i].bot.key)
-                }
-            }
-            for (health, ind) in zip(healths, allIndicators) {
-                var pulse = previous[health.bot.key]?.pulse ?? 0
-                if let before = lastStates[health.bot.key], before != health.state {
-                    pulse += 1
-                    log("\(health.bot.key): \(before.rawValue) -> \(health.state.rawValue) (\(detail(health)))")
-                }
-                lastStates[health.bot.key] = health.state
-                var row = makeRow(health, ind, now: now, pulse: pulse)
-                if borrowed.contains(health.bot.key), let model = ind.model {
-                    row.detailTip = "\(model): the model this session was launched on, named from a sibling on the same model until this bot's first reply"
-                        + (health.state == .down ? " (it is down, so this is the model it starts with)" : "")
-                        + ". Context used appears after its first reply."
-                }
-                next.append(row)
-            }
-            rows = next
-            let switches = FleetModel.readWatchdog(cfg)
-            watchdog = switches
-            let signals = FleetModel.signals(cfg, now: now)
-            var reachable = signals.telegramReachable
-            if reachable == nil {
-                reachable = probe?.reachable
-                probeTelegramIfDue()
-            }
-            let status = HeaderStatus(watchdogOffFor: switches.disabled.map(\.name), watchdogTotal: cfg.bots.count,
-                                      lastPassAge: signals.lastPass.map { max(0, now - Int($0)) },
-                                      telegramReachable: reachable)
-            header = status
-            var newMarks: [MenuMark] = []
-            if !status.watchdogOffFor.isEmpty || (status.lastPassAge ?? 0) > 180 { newMarks.append(.watchdogOff) }
-            if status.telegramReachable == false { newMarks.append(.telegramDown) }
-            marks = newMarks
-            snapshotAvailable = signals.snapshotExists
-            snapshotTip = signals.snapshotExists
-                ? "Snapshot saved · \(signals.snapshotSessions) sessions · \(signals.snapshotSaved.map { clockTime($0) + " ET" } ?? "time unknown"). Restore reopens each bot that is not running in its saved conversation and turns auto-recovery back on."
-                : "No snapshot saved"
-            let problemNow = headerProblem
-            if problemNow != lastHeaderProblem {
-                if didFirstRefresh { log("header: \(problemNow ?? "all quiet (auto-recovery on, Telegram reachable)")") }
-                lastHeaderProblem = problemNow
-            }
-            if !didFirstRefresh {
-                didFirstRefresh = true
-                log("first refresh: \(healths.count) bots evaluated, \(connectedCount)/\(total) connected, \(switches.label.lowercased())"
-                    + ", watchdog last pass \(status.lastPassAge.map { "\($0)s ago" } ?? "unknown")"
-                    + ", Telegram \(reachable.map { $0 ? "reachable" : "unreachable" } ?? "unknown")"
-                    + ", snapshot \(signals.snapshotExists ? "saved" : "none")")
-                for (health, row) in zip(healths, rows) {
-                    log("  \(health.bot.key): \(health.statusLine) (\(detail(health))) \(row.detailLine)\(row.stall ? " · stall suspected" : "")")
-                }
-            }
-            if let reason { log("\(reason): \(connectedCount)/\(total) connected, \(switches.label.lowercased())") }
+            result.configProblem = message
+            return result
+        case .ok(let loaded):
+            cfg = loaded
         }
-        onChange?()
+        result.config = cfg
+        timeOfDay.timeZone = cfg.settings.timeZone
+        let now = Int(Date().timeIntervalSince1970)
+        let table = ProcessTable.snapshot()
+        let signals = FleetModel.signals(cfg, now: now)
+        var reachable = signals.telegramReachable
+        if reachable == nil {
+            reachable = currentProbe()
+            startProbeIfDue()
+        }
+        result.reachable = reachable
+        let trust = FleetModel.heartbeatTrust(cfg, now: now, probe: reachable)
+        let healths = cfg.bots.map {
+            FleetModel.evaluate($0, table: table, now: now, maxAge: cfg.settings.heartbeatMaxAge, trust: trust)
+        }
+        result.healths = healths
+        var allIndicators = healths.map { indicators($0, cfg) }
+        // Learn each family's newest full name from the bots that have replied...
+        for ind in allIndicators {
+            guard let served = ind.servedModel else { continue }
+            let family = FleetModel.modelFamily(served)
+            let at = ind.servedAt ?? 0
+            if let known = familyNames[family], known.at > at { continue }
+            familyNames[family] = (served, at)
+        }
+        // ...and lend it to a bot on the same family that has not replied yet.
+        var borrowed = Set<String>()
+        for i in allIndicators.indices where allIndicators[i].servedModel == nil {
+            if let alias = allIndicators[i].model, let known = familyNames[FleetModel.modelFamily(alias)] {
+                allIndicators[i].model = known.name
+                borrowed.insert(healths[i].bot.key)
+            }
+        }
+        for (health, ind) in zip(healths, allIndicators) {
+            var row = makeRow(health, ind, now: now)
+            if borrowed.contains(health.bot.key), let model = ind.model {
+                row.detailTip = "\(model): the model this session was launched on, named from a sibling on the same model until this bot's first reply"
+                    + (health.state == .down ? " (it is down, so this is the model it starts with)" : "")
+                    + ". Context used appears after its first reply."
+            }
+            result.rows.append(row)
+        }
+        let switches = FleetModel.readWatchdog(cfg)
+        result.watchdog = switches
+        let status = HeaderStatus(watchdogOffFor: switches.disabled.map(\.name), watchdogTotal: cfg.bots.count,
+                                  watchdogAvailable: switches.available,
+                                  lastPassAge: signals.lastPass.map { max(0, now - Int($0)) },
+                                  telegramReachable: reachable)
+        result.header = status
+        if !status.watchdogOffFor.isEmpty || !status.watchdogAvailable || (status.lastPassAge ?? 0) > 180 {
+            result.marks.append(.watchdogOff)
+        }
+        if status.telegramReachable == false { result.marks.append(.telegramDown) }
+        result.snapshotAvailable = signals.snapshotExists
+        result.snapshotTip = signals.snapshotExists
+            ? "Snapshot saved · \(signals.snapshotSessions) sessions · \(signals.snapshotSaved.map { clockTime($0) + " ET" } ?? "time unknown"). Restore reopens each bot that is not running in its saved conversation and turns auto-recovery back on."
+            : "No snapshot saved"
+        if recordWindows { result.windowNote = recordWindowsIfChanged(healths, table) }
+        return result
+    }
+
+    /// Keeps $FLEET_HOME/menubar-windows.json current: each running session's tab,
+    /// so its window can be proven to be the bot's own after the session is gone. A
+    /// bot that is down keeps its last record.
+    private func recordWindowsIfChanged(_ healths: [BotHealth], _ table: ProcessTable) -> String? {
+        if records == nil { records = WindowRecords.load() }
+        var next = records ?? [:]
+        var changed: [String] = []
+        for health in healths {
+            guard let pid = health.sessionPIDs.first, let record = table.windowRecord(session: pid) else { continue }
+            if let old = next[health.bot.key], old.sameSession(record) { continue }
+            next[health.bot.key] = record
+            changed.append("\(health.bot.key) on \(record.tty) (session \(pid), hosted by \(record.hostList))")
+        }
+        guard !changed.isEmpty else { return nil }
+        guard WindowRecords.save(next) else { return "windows: could not write \(WindowRecords.path)" }
+        records = next
+        return "windows recorded: " + changed.joined(separator: "; ")
+    }
+
+    private func currentProbe() -> Bool? {
+        probeLock.lock()
+        defer { probeLock.unlock() }
+        return probeResult?.reachable
+    }
+
+    private func startProbeIfDue() {
+        probeLock.lock()
+        let due = !probing && (probeResult.map { Date().timeIntervalSince($0.at) >= 60 } ?? true)
+        if due { probing = true }
+        probeLock.unlock()
+        guard due else { return }
+        probe.start { [weak self] ok in
+            guard let self else { return }
+            self.probeLock.lock()
+            self.probeResult = (ok, Date())
+            self.probing = false
+            self.probeLock.unlock()
+        }
     }
 
     /// Indicators for one bot; the context read (up to 5 MB of transcript) is cached
@@ -515,25 +462,6 @@ final class FleetStore: ObservableObject {
         return ind
     }
 
-    private func probeTelegramIfDue() {
-        guard !probing, probe.map({ Date().timeIntervalSince($0.at) >= 60 }) ?? true else { return }
-        probing = true
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let ok = FleetModel.probeTelegram()
-            Task { @MainActor in
-                self?.probe = (ok, Date())
-                self?.probing = false
-            }
-        }
-    }
-
-    private func detail(_ h: BotHealth) -> String {
-        let session = h.sessionPIDs.isEmpty ? "none" : h.sessionPIDs.map(String.init).joined(separator: ",")
-        let poller = h.pollerPIDs.isEmpty ? "none" : h.pollerPIDs.map(String.init).joined(separator: ",")
-        let beat = h.heartbeatAge.map { "heartbeat \(shortAge($0)) ago" + (h.heartbeatStale ? " (stale)" : "") } ?? "no heartbeat"
-        return "session \(session), poller \(poller), \(beat), launch \(h.launchMode)"
-    }
-
     func clockTime(_ epoch: TimeInterval) -> String {
         timeOfDay.string(from: Date(timeIntervalSince1970: epoch))
     }
@@ -546,7 +474,16 @@ final class FleetStore: ObservableObject {
         return "\(s / 86_400)d \((s % 86_400) / 3600)h"
     }
 
-    private func makeRow(_ h: BotHealth, _ ind: BotIndicators, now: Int, pulse: Int) -> Row {
+    static func spokenAge(_ seconds: Int) -> String {
+        let s = max(0, seconds)
+        func unit(_ n: Int, _ word: String) -> String { "\(n) \(word)\(n == 1 ? "" : "s")" }
+        if s < 60 { return unit(s, "second") }
+        if s < 3600 { return unit(s / 60, "minute") }
+        if s < 86_400 { return unit(s / 3600, "hour") }
+        return unit(s / 86_400, "day")
+    }
+
+    private func makeRow(_ h: BotHealth, _ ind: BotIndicators, now: Int) -> FleetRow {
         let status: String
         var icon: String?
         let tip: String
@@ -557,9 +494,15 @@ final class FleetStore: ObservableObject {
             if let age = h.heartbeatAge {
                 status = shortAge(age)
                 icon = "waveform.path.ecg"
-                tip = "Heartbeat \(spokenAge(age)) ago: the Telegram poller's own liveness ping, written after every poll. It is not the time of the last message."
-                spoken = "connected, heartbeat \(spokenAge(age)) ago"
-                dump = "Connected · heartbeat \(shortAge(age)) ago"
+                if let excuse = h.staleExcused {
+                    tip = "Heartbeat \(Self.spokenAge(age)) ago, older than the watchdog's limit, but not a fault right now: \(excuse). The poller reconnects on its own once Telegram answers again."
+                    spoken = "connected, heartbeat \(Self.spokenAge(age)) ago, waiting on Telegram"
+                    dump = "Connected · heartbeat \(shortAge(age)) ago, waiting on Telegram"
+                } else {
+                    tip = "Heartbeat \(Self.spokenAge(age)) ago: the Telegram poller's own liveness ping, written after every poll. It is not the time of the last message."
+                    spoken = "connected, heartbeat \(Self.spokenAge(age)) ago"
+                    dump = "Connected · heartbeat \(shortAge(age)) ago"
+                }
             } else {
                 status = "Connected"
                 tip = "Connected: the session and its Telegram poller are both running (this poller writes no heartbeat file)."
@@ -597,19 +540,277 @@ final class FleetStore: ObservableObject {
         } else {
             uptimeLine = "Down"
         }
-        return Row(id: h.bot.key, name: h.bot.name, state: h.state, statusText: status, statusIcon: icon,
-                   statusTip: tip, dumpStatus: dump, spokenStatus: spoken, detailLine: detailLine, detailTip: detailTip,
-                   stall: ind.stallSuspected, uptimeLine: uptimeLine, pulse: pulse)
+        return FleetRow(id: h.bot.key, name: h.bot.name, state: h.state, statusText: status, statusIcon: icon,
+                        statusTip: tip, dumpStatus: dump, spokenStatus: spoken, detailLine: detailLine, detailTip: detailTip,
+                        stall: ind.stallSuspected, uptimeLine: uptimeLine, pulse: 0)
+    }
+}
+
+@MainActor
+final class FleetStore: ObservableObject {
+    enum Mode { case live, dryRun, demo, snapshot }
+
+    typealias Row = FleetRow
+
+    @Published private(set) var rows: [Row] = []
+    @Published private(set) var problem: String?
+    @Published private(set) var watchdog: WatchdogSwitches?
+    @Published private(set) var inFlight: Set<String> = []
+    @Published private(set) var succeeded: Set<String> = []
+    @Published var expanded: Set<String> = []
+    @Published private(set) var reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    @Published private(set) var header: HeaderStatus?
+    @Published private(set) var marks: [MenuMark] = []
+    @Published var showLegend = false
+    @Published private(set) var snapshotAvailable = false
+    @Published private(set) var snapshotTip = "No snapshot saved"
+    @Published private(set) var snapshotBusy = false
+    @Published private(set) var restoreBusy = false
+    @Published private(set) var confirmation: String?
+    /// Per-row lines that stay until they no longer apply (failures, what happened instead).
+    @Published private(set) var notes: [String: RowNote] = [:]
+    /// The bottom group's own lasting line: a switch, snapshot or restore that failed.
+    @Published private(set) var footerNote: RowNote?
+
+    let mode: Mode
+    private(set) var config: FleetConfig?
+    var onChange: (() -> Void)?
+    private var lastStates: [String: BotState] = [:]
+    private var lastSessions: [String: pid_t] = [:]
+    private var didFirstRefresh = false
+    private var lastProblem: String?
+    private var lastHeaderProblem: String?
+    private var loggedWarnings: [String] = []
+    private var confirmationToken = 0
+    private let worker = RefreshWorker()
+    private var refreshing = false
+    private var refreshPending = false
+    private var pendingReason: String?
+    private let reconnectQueue = DispatchQueue(label: "com.nexera.telebots-menubar.reconnect")
+    private let engineQueue = DispatchQueue(label: "com.nexera.telebots-menubar.engines")
+    private let timeOfDay: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "h:mma"
+        f.amSymbol = "am"
+        f.pmSymbol = "pm"
+        f.timeZone = FleetModel.defaultTimeZone
+        return f
+    }()
+
+    init(mode: Mode) { self.mode = mode }
+
+    var total: Int { rows.count }
+    var connectedCount: Int { rows.filter(\.connected).count }
+    var anyDown: Bool { problem == nil && rows.contains { !$0.connected } }
+    var canReconnectAll: Bool { problem == nil && rows.contains { !$0.connected && !inFlight.contains($0.id) } }
+    var alarm: Bool { problem != nil || connectedCount < total }
+    var countText: String { problem != nil ? "?" : "\(connectedCount)/\(total)" }
+    var summary: String { problem != nil ? "Fleet config problem" : "\(connectedCount) of \(total) online" }
+    var actionsLive: Bool { mode == .live || mode == .dryRun }
+    var badge: String? {
+        switch mode {
+        case .demo: return "DEMO"
+        case .dryRun: return "DRY RUN"
+        default: return nil
+        }
+    }
+    var watchdogCaption: String {
+        guard let w = watchdog else { return "Unavailable" }
+        if !w.available { return "Unavailable: no watchdog state folder" }
+        if w.isOn { return "Auto-recovery on" }
+        if w.isFullyOff { return "Auto-recovery off" }
+        return "Auto-recovery off for " + w.disabled.map(\.name).joined(separator: ", ")
     }
 
-    private func spokenAge(_ seconds: Int) -> String {
-        let s = max(0, seconds)
-        func unit(_ n: Int, _ word: String) -> String { "\(n) \(word)\(n == 1 ? "" : "s")" }
-        if s < 60 { return unit(s, "second") }
-        if s < 3600 { return unit(s / 60, "minute") }
-        if s < 86_400 { return unit(s / 3600, "hour") }
-        return unit(s / 86_400, "day")
+    /// The one short red header line, only when self-healing or Telegram is broken.
+    var headerProblem: String? {
+        guard let h = header else { return nil }
+        var parts: [String] = []
+        if !h.watchdogAvailable {
+            parts.append("Auto-recovery unavailable")
+        } else if let age = h.lastPassAge, age > 180 {
+            parts.append("Watchdog not running")
+        } else if !h.watchdogOffFor.isEmpty {
+            parts.append(h.watchdogOffFor.count >= h.watchdogTotal
+                         ? "Auto-recovery off"
+                         : "Auto-recovery off for " + h.watchdogOffFor.joined(separator: ", "))
+        }
+        if h.telegramReachable == false { parts.append("Telegram unreachable") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
+
+    private func log(_ message: String) {
+        guard actionsLive else { return }
+        ActionLog.shared.write(message)
+    }
+
+    func refreshReduceMotion() {
+        reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    func stop() { worker.stop() }
+
+    func logStartup(owner: String) {
+        guard actionsLive else { return }
+        var line = "start: Telebots Bar \(appVersion) (pid \(getpid()), \(mode == .dryRun ? "dry run" : "live"), started \(owner))"
+        switch FleetModel.loadConfig() {
+        case .ok(let cfg):
+            let engine = FleetModel.resolveFreshEngine(cfg)
+            line += ", config \(cfg.path), \(cfg.bots.count) bots, engine \(engine.path ?? "none (\(engine.note))")"
+            line += ", watchdog state \(cfg.settings.watchdogStateDir), heartbeat limit \(cfg.settings.heartbeatMaxAge)s"
+            line += ", resume from \(cfg.settings.resumeSource.rawValue)"
+            line += ", snapshot \(cfg.settings.snapshotEngine), restore \(cfg.settings.restoreEngine)"
+        case .problem(let message, _):
+            line += ", config problem: \(message)"
+        }
+        log(line)
+        DispatchQueue.global(qos: .utility).async {
+            let status = FleetModel.terminalAutomation(askUser: false)
+            ActionLog.shared.write("start: Terminal automation for Reconnect is \(status.text)")
+        }
+    }
+
+    // MARK: Refresh
+
+    /// A refresh off the main thread; the result lands in one piece. Refreshes asked
+    /// for while one runs fold into a single follow-up.
+    func refresh(reason: String? = nil) {
+        guard mode != .demo else { onChange?(); return }
+        if refreshing {
+            refreshPending = true
+            if let reason { pendingReason = reason }
+            return
+        }
+        refreshing = true
+        let worker = self.worker
+        let record = mode == .live
+        worker.queue.async { [weak self] in
+            let result = worker.compute(recordWindows: record)
+            Task { @MainActor in
+                guard let self else { return }
+                self.refreshing = false
+                self.apply(result, reason: reason)
+                if self.refreshPending {
+                    self.refreshPending = false
+                    let next = self.pendingReason
+                    self.pendingReason = nil
+                    self.refresh(reason: next)
+                }
+            }
+        }
+    }
+
+    /// The same refresh, waited for: the command line and previews only.
+    func refreshNow(reason: String? = nil) {
+        guard mode != .demo else { onChange?(); return }
+        let worker = self.worker
+        let record = mode == .live
+        let result = worker.queue.sync { worker.compute(recordWindows: record) }
+        apply(result, reason: reason)
+    }
+
+    private func apply(_ result: RefreshResult, reason: String?) {
+        if let message = result.configProblem {
+            config = nil
+            problem = message
+            rows = []
+            watchdog = nil
+            header = nil
+            marks = []
+            if message != lastProblem { log("config problem: \(message)") }
+            lastProblem = message
+            onChange?()
+            return
+        }
+        guard let cfg = result.config else { return }
+        if lastProblem != nil { log("config readable again: \(cfg.path)") }
+        lastProblem = nil
+        if cfg.warnings != loggedWarnings {
+            for warning in cfg.warnings { log("config warning: \(warning)") }
+            loggedWarnings = cfg.warnings
+        }
+        config = cfg
+        problem = nil
+        ActionLog.shared.setTimeZone(cfg.settings.timeZone)
+        timeOfDay.timeZone = cfg.settings.timeZone
+        var previous: [String: Row] = [:]
+        for row in rows { previous[row.id] = row }
+        var next: [Row] = []
+        for (health, fresh) in zip(result.healths, result.rows) {
+            var row = fresh
+            var pulse = previous[health.bot.key]?.pulse ?? 0
+            let before = lastStates[health.bot.key]
+            if let before, before != health.state {
+                pulse += 1
+                log("\(health.bot.key): \(before.rawValue) -> \(health.state.rawValue) (\(detail(health)))")
+            }
+            lastStates[health.bot.key] = health.state
+            row.pulse = pulse
+            next.append(row)
+            settleNote(health, before: before)
+        }
+        rows = next
+        watchdog = result.watchdog
+        header = result.header
+        marks = result.marks
+        snapshotAvailable = result.snapshotAvailable
+        snapshotTip = result.snapshotTip
+        if let note = result.windowNote { log(note) }
+        if let odd = result.watchdog?.odd, !odd.isEmpty, didFirstRefresh == false {
+            log("watchdog: not regular files, ignored like the watchdog ignores them: " + odd.joined(separator: ", "))
+        }
+        let problemNow = headerProblem
+        if problemNow != lastHeaderProblem {
+            if didFirstRefresh { log("header: \(problemNow ?? "all quiet (auto-recovery on, Telegram reachable)")") }
+            lastHeaderProblem = problemNow
+        }
+        let switchLabel = result.watchdog?.label.lowercased() ?? "watchdog: unknown"
+        if !didFirstRefresh {
+            didFirstRefresh = true
+            log("first refresh: \(result.healths.count) bots evaluated, \(connectedCount)/\(total) connected, \(switchLabel)"
+                + ", watchdog last pass \(result.header?.lastPassAge.map { "\($0)s ago" } ?? "unknown")"
+                + ", Telegram \(result.reachable.map { $0 ? "reachable" : "unreachable" } ?? "unknown")"
+                + ", snapshot \(result.snapshotAvailable ? "saved" : "none")")
+            for (health, row) in zip(result.healths, rows) {
+                log("  \(health.bot.key): \(health.statusLine) (\(detail(health))) \(row.detailLine)\(row.stall ? " · stall suspected" : "")")
+            }
+        }
+        if let reason { log("\(reason): \(connectedCount)/\(total) connected, \(switchLabel)") }
+        onChange?()
+    }
+
+    /// A failure note stays until the bot comes back (it turns connected, or it is
+    /// connected on a new session) or a new action starts; a plain note fades after a
+    /// minute.
+    private func settleNote(_ health: BotHealth, before: BotState?) {
+        let key = health.bot.key
+        let session = health.sessionPIDs.first
+        defer { if let session { lastSessions[key] = session } }
+        guard let note = notes[key] else { return }
+        if note.isError {
+            guard health.state == .connected else { return }
+            let cameBack = before != nil && before != .connected
+            let newSession = session != nil && session != note.session
+            if cameBack || newSession { notes[key] = nil }
+        } else if Date().timeIntervalSince1970 - note.at > 60 {
+            notes[key] = nil
+        }
+    }
+
+    private func detail(_ h: BotHealth) -> String {
+        let session = h.sessionPIDs.isEmpty ? "none" : h.sessionPIDs.map(String.init).joined(separator: ",")
+        let poller = h.pollerPIDs.isEmpty ? "none" : h.pollerPIDs.map(String.init).joined(separator: ",")
+        var beat = h.heartbeatAge.map { "heartbeat \(shortAge($0)) ago" + (h.heartbeatStale ? " (stale)" : "") } ?? "no heartbeat"
+        if h.staleExcused != nil { beat += ", not a fault while Telegram is unconfirmed" }
+        return "session \(session), poller \(poller), \(beat), launch \(h.launchMode)"
+    }
+
+    func clockTime(_ epoch: TimeInterval) -> String {
+        timeOfDay.string(from: Date(timeIntervalSince1970: epoch))
+    }
+
+    func noteText(_ note: RowNote) -> String { "\(note.text) · \(clockTime(note.at))" }
 
     func toggleExpanded(_ id: String) {
         if expanded.contains(id) { expanded.remove(id) } else { expanded.insert(id) }
@@ -617,31 +818,43 @@ final class FleetStore: ObservableObject {
 
     // MARK: Actions
 
+    /// Reconnect from a row. The bot's state is read fresh off the main thread; a
+    /// connected bot asks first. The action itself re-checks everything again right
+    /// before the engine runs.
     func requestReconnect(_ key: String) {
         guard actionsLive else { return }
         guard let cfg = config, let bot = cfg.bots.first(where: { $0.key == key }), !inFlight.contains(key) else { return }
-        refresh()
-        let state = rows.first { $0.id == key }?.state ?? .down
-        var confirmed = false
-        if state == .connected {
-            let engine = FleetModel.resolveFreshEngine(cfg).path ?? "the restart engine"
-            let plan = FleetModel.makePlan(FleetModel.evaluateOne(bot, cfg), cfg, engine: engine)
-            NSApp.activate()
-            let alert = NSAlert()
-            alert.alertStyle = .warning
-            alert.messageText = "Restart \(bot.name) even though it is connected? It keeps the conversation."
-            alert.informativeText = plan.keepsConversation
-                ? "It resumes conversation \(plan.resumeArg.prefix(8)) in a new Terminal window."
-                : "No saved conversation was found, so it starts a new session on the same model."
-            alert.addButton(withTitle: "Cancel")
-            alert.addButton(withTitle: "Restart")
-            guard alert.runModal() == .alertSecondButtonReturn else {
-                log("reconnect \(key): cancelled at the confirm prompt (it is connected)")
-                return
+        inFlight.insert(key)
+        notes[key] = nil
+        let engine = FleetModel.resolveFreshEngine(cfg).path ?? "the restart engine"
+        // Not the reconnect queue: a restart already running there must not hold up
+        // this read-only check.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let health = FleetModel.evaluateOne(bot, cfg)
+            let plan = FleetModel.makePlan(health, cfg, engine: engine)
+            Task { @MainActor in
+                guard let self else { return }
+                var confirmed = false
+                if health.state == .connected {
+                    NSApp.activate()
+                    let alert = NSAlert()
+                    alert.alertStyle = .warning
+                    alert.messageText = "Restart \(bot.name) even though it is connected? It keeps the conversation."
+                    alert.informativeText = plan.keepsConversation
+                        ? "It resumes conversation \(plan.resumeArg.prefix(8)) in a new Terminal window."
+                        : "No saved conversation was found, so it starts a new session on the same model."
+                    alert.addButton(withTitle: "Cancel")
+                    alert.addButton(withTitle: "Restart")
+                    guard alert.runModal() == .alertSecondButtonReturn else {
+                        self.inFlight.remove(key)
+                        self.log("reconnect \(key): cancelled at the confirm prompt (it is connected)")
+                        return
+                    }
+                    confirmed = true
+                }
+                self.startReconnect(bot, cfg, allowConnected: confirmed, freshStart: false, origin: "Reconnect \(bot.name)")
             }
-            confirmed = true
         }
-        startReconnect(bot, cfg, allowConnected: confirmed, freshStart: false, origin: "Reconnect \(bot.name)")
     }
 
     /// Fresh start: a new, empty conversation through the /fresh path. Always asks.
@@ -659,17 +872,20 @@ final class FleetStore: ObservableObject {
             log("fresh start \(key): cancelled at the confirm prompt")
             return
         }
+        inFlight.insert(key)
+        notes[key] = nil
         startReconnect(bot, cfg, allowConnected: true, freshStart: true, origin: "Fresh start \(bot.name)")
     }
 
     func reconnectAllDown() {
         guard actionsLive, let cfg = config else { return }
-        refresh()
         let targets = rows.filter { !$0.connected && !inFlight.contains($0.id) }
         guard !targets.isEmpty else { return }
         log("Reconnect all down: \(targets.map(\.id).joined(separator: ", "))")
         for row in targets {
             if let bot = cfg.bots.first(where: { $0.key == row.id }) {
+                inFlight.insert(bot.key)
+                notes[bot.key] = nil
                 startReconnect(bot, cfg, allowConnected: false, freshStart: false, origin: "Reconnect all down")
             }
         }
@@ -683,32 +899,45 @@ final class FleetStore: ObservableObject {
             let outcome = FleetModel.performReconnect(bot, cfg, allowConnected: allowConnected, dryRun: dryRun,
                                                       askForPermission: true, freshStart: freshStart,
                                                       log: { ActionLog.shared.write($0) })
-            Task { @MainActor in self?.finishReconnect(bot, outcome) }
+            Task { @MainActor in self?.finishReconnect(bot, outcome, freshStart: freshStart) }
         }
     }
 
-    private func finishReconnect(_ bot: Bot, _ outcome: ReconnectOutcome) {
+    private func finishReconnect(_ bot: Bot, _ outcome: ReconnectOutcome, freshStart: Bool) {
         inFlight.remove(bot.key)
-        refresh()
+        let now = Date().timeIntervalSince1970
+        let session = lastSessions[bot.key]
         switch outcome {
         case .connected:
+            notes[bot.key] = nil
             succeeded.insert(bot.key)
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(2.5))
                 self?.succeeded.remove(bot.key)
             }
+        case .healedBeforeRun:
+            notes[bot.key] = RowNote(text: "Connected again before the restart ran, so nothing was restarted",
+                                     isError: false, at: now, session: session)
+        case .dryRun:
+            notes[bot.key] = RowNote(text: "Dry run: the \(freshStart ? "fresh start" : "reconnect") was logged, nothing ran",
+                                     isError: false, at: now, session: session)
         case .permissionBlocked:
+            notes[bot.key] = RowNote(text: "\(freshStart ? "Fresh start" : "Reconnect") \(outcome.failureText ?? "did not run")",
+                                     isError: true, at: now, session: session)
             showPermissionAlert(bot.name + "'s Terminal window")
         default:
-            break
+            let what = freshStart ? "Fresh start" : "Reconnect"
+            notes[bot.key] = RowNote(text: "\(what) \(outcome.failureText ?? "failed, see menubar.log")",
+                                     isError: true, at: now, session: session)
         }
+        refresh()
     }
 
     private func showPermissionAlert(_ what: String) {
         NSApp.activate()
         let alert = NSAlert()
         alert.messageText = "Telebots Bar can't open \(what)"
-        alert.informativeText = "This needs permission to control Terminal. Allow Telebots Bar in System Settings > Privacy & Security > Automation, then try again. Nothing was restarted."
+        alert.informativeText = "This needs permission to control Terminal, and macOS has not confirmed it (Terminal must be running for macOS to answer). Allow Telebots Bar in System Settings > Privacy & Security > Automation, then try again. Nothing was restarted."
         alert.addButton(withTitle: "OK")
         alert.runModal()
     }
@@ -716,7 +945,13 @@ final class FleetStore: ObservableObject {
     func setWatchdog(on: Bool) {
         guard actionsLive, let cfg = config else { return }
         log("watchdog switch set \(on ? "on" : "off") from the panel")
-        FleetModel.applyWatchdog(on: on, cfg, dryRun: mode == .dryRun, log: { ActionLog.shared.write($0) })
+        let problems = FleetModel.applyWatchdog(on: on, cfg, dryRun: mode == .dryRun, log: { ActionLog.shared.write($0) })
+        if problems.isEmpty {
+            footerNote = nil
+        } else {
+            footerNote = RowNote(text: "Auto-recovery switch: " + problems.joined(separator: "; "), isError: true,
+                                 at: Date().timeIntervalSince1970, session: nil)
+        }
         refresh()
     }
 
@@ -735,55 +970,69 @@ final class FleetStore: ObservableObject {
     private func finishSnapshot(_ run: EngineRun?, dryRun: Bool) {
         snapshotBusy = false
         refresh()
-        guard let run else { return confirm("Snapshot could not run · see menubar.log") }
+        let now = Date().timeIntervalSince1970
+        guard let run else {
+            footerNote = RowNote(text: "Snapshot could not run, see menubar.log", isError: true, at: now, session: nil)
+            return
+        }
         if dryRun { return confirm("Dry run · snapshot command logged") }
-        guard run.code == 0, let cfg = config else { return confirm("Snapshot failed · see menubar.log") }
-        let signals = FleetModel.signals(cfg, now: Int(Date().timeIntervalSince1970))
+        guard run.code == 0, let cfg = config else {
+            footerNote = RowNote(text: "Snapshot failed: \(run.summary)", isError: true, at: now, session: nil)
+            return
+        }
+        footerNote = nil
+        let signals = FleetModel.signals(cfg, now: Int(now))
         let when = signals.snapshotSaved.map { clockTime($0) + " ET" } ?? "just now"
         confirm("Snapshot saved · \(signals.snapshotSessions) sessions · \(when)")
     }
 
-    /// Restore: the fleet restore engine, with a spinner, then a short confirmation.
+    /// Restore: every bot that is down says so first, the fleet restore engine runs,
+    /// then each bot that comes back says "Back and ready" and its old window closes.
     func restoreNow() {
         guard actionsLive, let cfg = config, !snapshotBusy, !restoreBusy else { return }
         restoreBusy = true
         let dryRun = mode == .dryRun
-        let someoneDown = rows.contains { !$0.connected }
         log("Restore pressed")
         engineQueue.async { [weak self] in
-            // Restore opens Terminal windows for bots that are not running, so the
-            // Terminal permission is settled first, before anything is touched.
-            if !dryRun && someoneDown {
-                var automation = FleetModel.terminalAutomation(askUser: false)
-                if automation == .wouldPrompt { automation = FleetModel.terminalAutomation(askUser: true) }
-                if automation == .denied || automation == .wouldPrompt {
-                    ActionLog.shared.write("restore: stopped before anything was touched, Terminal automation is \(automation.text)")
-                    Task { @MainActor in
-                        self?.restoreBusy = false
-                        self?.showPermissionAlert("the bots' Terminal windows")
-                    }
-                    return
-                }
-            }
-            let run = FleetModel.runFleetEngine(.restore, cfg, dryRun: dryRun, log: { ActionLog.shared.write($0) })
-            if let run, run.code == 0, !dryRun {
-                // Give reopened bots time to bring their pollers up before counting.
-                let deadline = Date().addingTimeInterval(30)
-                while Date() < deadline && FleetModel.evaluateAll(cfg).contains(where: { $0.state != .connected }) {
-                    Thread.sleep(forTimeInterval: 2)
-                }
-            }
-            Task { @MainActor in self?.finishRestore(run, dryRun: dryRun) }
+            let report = FleetModel.performRestore(cfg, dryRun: dryRun, askForPermission: true,
+                                                   log: { ActionLog.shared.write($0) })
+            Task { @MainActor in self?.finishRestore(report, dryRun: dryRun) }
         }
     }
 
-    private func finishRestore(_ run: EngineRun?, dryRun: Bool) {
+    private func finishRestore(_ report: RestoreReport, dryRun: Bool) {
         restoreBusy = false
+        let now = Date().timeIntervalSince1970
+        if let blocked = report.blocked {
+            footerNote = RowNote(text: "Restore did not run: Terminal automation is \(blocked.text)", isError: true, at: now, session: nil)
+            showPermissionAlert("the bots' Terminal windows")
+            refresh()
+            return
+        }
+        guard let run = report.run else {
+            footerNote = RowNote(text: "Restore could not run, see menubar.log", isError: true, at: now, session: nil)
+            refresh()
+            return
+        }
+        if dryRun {
+            refresh()
+            return confirm("Dry run · restore command logged")
+        }
+        guard run.code == 0 else {
+            footerNote = RowNote(text: "Restore failed: \(run.summary)", isError: true, at: now, session: nil)
+            refresh()
+            return
+        }
+        footerNote = nil
+        for key in report.notBack {
+            notes[key] = RowNote(text: "Restore did not bring it back within a minute", isError: true, at: now,
+                                 session: lastSessions[key])
+        }
         refresh()
-        guard let run else { return confirm("Restore could not run · see menubar.log") }
-        if dryRun { return confirm("Dry run · restore command logged") }
-        guard run.code == 0 else { return confirm("Restore failed · see menubar.log") }
-        confirm("Restored · \(connectedCount) bot\(connectedCount == 1 ? "" : "s") back")
+        let back = report.back.count
+        confirm(report.wasDown.isEmpty
+                ? "Restore ran · no bot was down"
+                : "Restored · \(back) of \(report.wasDown.count) back")
     }
 
     /// A brief inline confirmation under the bottom group that fades after 6 seconds.
@@ -832,7 +1081,7 @@ final class FleetStore: ObservableObject {
             out.append("  \(row.connected ? "●" : "○") \(name)  \(status)  \(row.detailLine)\(row.stall ? " · stall suspected" : "")  [Reconnect]")
         }
         if anyDown { out.append("[Reconnect all down]") }
-        out.append("Watchdog: \(watchdogCaption) [switch \(watchdog?.isOn == true ? "on" : "off")]")
+        out.append("Watchdog: \(watchdogCaption) [switch \(watchdog?.available == false ? "unavailable" : (watchdog?.isOn == true ? "on" : "off"))]")
         out.append("[Snapshot]  [Restore\(snapshotAvailable ? "" : " (disabled: no snapshot saved)")]  [Refresh]")
         if let cfg = config { out.append("config: \(cfg.path)") }
         return out.joined(separator: "\n")
@@ -874,7 +1123,9 @@ final class FleetStore: ObservableObject {
             store.inFlight = ["demo-3"]
             store.succeeded = ["demo-5"]
             store.expanded = ["demo-2"]
-            store.watchdog = WatchdogSwitches(dir: "demo", dirExists: true, disabled: [], total: 6)
+            store.notes = ["demo-4": RowNote(text: "Reconnect failed: engine exit 4, refused: that pid runs in another workdir (sibling protection)",
+                                             isError: true, at: Date().timeIntervalSince1970, session: nil)]
+            store.watchdog = WatchdogSwitches(dir: "demo", dirExists: true, disabled: [], odd: [], total: 6)
             store.header = HeaderStatus(watchdogOffFor: [], watchdogTotal: 6, lastPassAge: 12, telegramReachable: true)
             store.showLegend = frame == .legend
         case .snapshot:
@@ -887,7 +1138,7 @@ final class FleetStore: ObservableObject {
                 row(5, .connected, "1s", detail: "Opus 5.5 · max · 7% ctx"),
             ]
             let bots = names.prefix(6).map { Bot(key: $0.lowercased(), name: $0, workdir: "", stateDir: "") }
-            store.watchdog = WatchdogSwitches(dir: "demo", dirExists: true, disabled: Array(bots), total: 6)
+            store.watchdog = WatchdogSwitches(dir: "demo", dirExists: true, disabled: Array(bots), odd: [], total: 6)
             store.header = HeaderStatus(watchdogOffFor: Array(names.prefix(6)), watchdogTotal: 6, lastPassAge: 12,
                                         telegramReachable: true)
             store.marks = [.watchdogOff]
@@ -1185,6 +1436,12 @@ struct PanelView: View {
     let close: () -> Void
     @FocusState private var headerFocused: Bool
 
+    /// The legend and the rows scroll once they would push the panel past the screen:
+    /// the visible height, less the header, the bottom group and the margins.
+    private var middleLimit: CGFloat {
+        max(240, (NSScreen.main?.visibleFrame.height ?? 800) - 330)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: Space.m) {
             // The header takes the first focus when the panel opens, so no row shows a
@@ -1193,10 +1450,14 @@ struct PanelView: View {
                 .focusable()
                 .focused($headerFocused)
                 .focusEffectDisabled()
-            if store.showLegend {
-                LegendV2(store: store)
+            BoundedScroll(limit: middleLimit) {
+                VStack(alignment: .leading, spacing: Space.m) {
+                    if store.showLegend {
+                        LegendV2(store: store)
+                    }
+                    RowsGroupV2(store: store)
+                }
             }
-            RowsGroupV2(store: store)
             FooterV2(store: store)
         }
         .padding(Space.l)
@@ -1204,6 +1465,38 @@ struct PanelView: View {
         .background(Palette.scrim, in: RoundedRectangle(cornerRadius: Radius.panel, style: .continuous))
         .defaultFocus($headerFocused, true)
         .onExitCommand(perform: close)
+    }
+}
+
+private struct ContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
+/// Its content at full height until that passes `limit`, then a scroll view of that
+/// height. The flat preview draws the content as it is (ImageRenderer cannot draw a
+/// scroll view).
+struct BoundedScroll<Content: View>: View {
+    let limit: CGFloat
+    @ViewBuilder var content: Content
+    @State private var height: CGFloat = 0
+    @Environment(\.flatPreview) private var flat
+
+    var body: some View {
+        if flat {
+            content
+        } else {
+            ScrollView(.vertical) {
+                content
+                    .background(GeometryReader { proxy in
+                        Color.clear.preference(key: ContentHeightKey.self, value: proxy.size.height)
+                    })
+            }
+            .scrollBounceBehavior(.basedOnSize)
+            .scrollIndicators(height > limit ? .automatic : .hidden)
+            .frame(height: min(max(height, 1), limit))
+            .onPreferenceChange(ContentHeightKey.self) { height = $0 }
+        }
     }
 }
 
@@ -1243,9 +1536,11 @@ enum Grid2 {
 }
 
 extension Palette {
-    /// Secondary text: the label color one step lighter. Measured on the real light
-    /// glass, 80% came out at 4.3:1, so it sits at 90% to keep 4.5:1 or better.
-    static let secondary = Color(nsColor: .labelColor).opacity(0.9)
+    /// Secondary text: the full label color, the same color as the names. Measured on
+    /// the real light glass, 80% of it came out at 4.29 to 4.37:1, under 4.5:1, while
+    /// the full color measured 6.99 and 7.34:1 on the same capture. So nothing is
+    /// lighter than the label color, and hierarchy comes from size and weight alone.
+    static let secondary = Color(nsColor: .labelColor)
     /// Labels on disabled buttons (the explicit label color would otherwise hide the
     /// system's dimming).
     static func label(enabled: Bool) -> Color {
@@ -1390,10 +1685,21 @@ struct LegendV2: View {
         }
         .font(.system(size: 11))
         .foregroundStyle(Palette.label)
-        .lineLimit(1)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Legend")
+        .fixedSize(horizontal: false, vertical: true)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Self.spokenLegend)
     }
+
+    /// The whole legend in words, since half of it is glyphs VoiceOver cannot name.
+    static let spokenLegend = "Legend. "
+        + "Menu bar dots: one per bot, filled when connected, hollow when down. "
+        + "A red count such as 5 of 6: a bot is not connected. "
+        + "A shield with a slash: auto-recovery is off. "
+        + "An antenna with a slash: Telegram is unreachable from this Mac. "
+        + "A pulse with seconds: the poller heartbeat, its liveness ping. "
+        + "ctx: the context window used by the session. "
+        + "restarts per hour: watchdog restarts in the last hour. "
+        + "stall: a message waited 10 or more minutes while the bot sat idle."
 }
 
 struct RowDivider: View {
@@ -1491,12 +1797,24 @@ struct RowV2: View {
                 .font(.system(size: 11))
                 .monospacedDigit()
                 .foregroundStyle(Palette.secondary)
-                .lineLimit(1)
+                .fixedSize(horizontal: false, vertical: true)
                 .padding(.leading, Grid2.textIndent)
                 .padding(.top, 3)
                 .help(row.detailTip + (row.stall
                       ? " Stall suspected: a message reached this bot over 10 minutes ago and nothing has happened since. The watchdog only flags this; it never restarts for it."
                       : ""))
+
+            if let note = store.notes[row.id] {
+                Text(store.noteText(note))
+                    .font(.system(size: 11, weight: note.isError ? .semibold : .regular))
+                    .foregroundStyle(note.isError ? Palette.alertText : Palette.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, Grid2.textIndent)
+                    .padding(.top, 3)
+                    .help(note.isError
+                          ? "What went wrong with the last action on \(row.name). It stays until \(row.name) is back or you try again; menubar.log has every step."
+                          : "What happened with the last action on \(row.name).")
+            }
 
             if expanded, let uptime = row.uptimeLine {
                 // One line and one button. When a long uptime cannot share the line with
@@ -1538,7 +1856,10 @@ struct RowV2: View {
         .onKeyPress(.return) { store.toggleExpanded(row.id); return .handled }
         .onKeyPress(.space) { store.toggleExpanded(row.id); return .handled }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("\(row.name), \(busy ? "reconnecting" : row.spokenStatus)")
+        .accessibilityLabel("\(row.name), \(busy ? "reconnecting" : row.spokenStatus)"
+                            + (store.notes[row.id].map { ", \($0.text)" } ?? ""))
+        .accessibilityValue(expanded ? "details shown" : "details hidden")
+        .accessibilityAction(named: Text(expanded ? "Hide details" : "Show details")) { store.toggleExpanded(row.id) }
     }
 
     private func uptimeText(_ uptime: String) -> some View {
@@ -1630,6 +1951,7 @@ struct FooterV2: View {
                         Text(store.watchdogCaption)
                             .font(.system(size: 11))
                             .foregroundStyle(store.watchdog?.isOn == false ? Palette.alertText : Palette.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     Spacer(minLength: Grid2.gap)
                     Toggle("", isOn: Binding(
@@ -1640,11 +1962,25 @@ struct FooterV2: View {
                     .modifier(SwitchStyleChoice())
                     .tint(Palette.mono)
                     .controlSize(.small)
-                    .disabled(store.watchdog?.dirExists != true)
-                    .help("Auto-recovery: when on, the watchdog restarts a bot that stays disconnected. Off pauses it for every bot.")
+                    .disabled(store.watchdog?.available != true)
+                    .help(store.watchdog?.available == false
+                          ? "Unavailable: there is no watchdog state folder, so nothing can say whether auto-recovery runs."
+                          : "Auto-recovery: when on, the watchdog restarts a bot that stays disconnected. Off pauses it for every bot.")
                     .accessibilityLabel("Auto-recovery")
+                    .accessibilityValue(store.watchdogCaption)
                 }
                 .padding(Grid2.inset)
+
+                if let note = store.footerNote {
+                    Text(store.noteText(note))
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Palette.alertText)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, Grid2.inset)
+                        .padding(.bottom, Grid2.inset)
+                        .help("It stays until that action works; menubar.log has every step.")
+                }
 
                 RowDivider(leading: Grid2.inset)
 
@@ -1718,15 +2054,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let openPanelAtLaunch: Bool
     let quitAfterPanel: Bool
     let forcedAppearance: NSAppearance?
+    let owner: String
     private var statusItem: NSStatusItem?
     private let popover = NSPopover()
     private var timer: Timer?
 
-    init(store: FleetStore, openPanelAtLaunch: Bool, quitAfterPanel: Bool, appearance: NSAppearance?) {
+    init(store: FleetStore, openPanelAtLaunch: Bool, quitAfterPanel: Bool, appearance: NSAppearance?, owner: String) {
         self.store = store
         self.openPanelAtLaunch = openPanelAtLaunch
         self.quitAfterPanel = quitAfterPanel
         self.forcedAppearance = appearance
+        self.owner = owner
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        store.stop()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -1743,12 +2085,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         host.sizingOptions = [.preferredContentSize]
         popover.contentViewController = host
         popover.behavior = .transient
-        popover.animates = true
+        popover.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         popover.delegate = self
         if let forcedAppearance { popover.appearance = forcedAppearance }
 
         store.onChange = { [weak self] in self?.updateStatusItem() }
-        store.logStartup()
+        store.logStartup(owner: owner)
         store.refresh()
 
         let refreshTimer = Timer(timeInterval: 15, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
@@ -1768,7 +2110,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     @objc private func tick() { store.refresh() }
 
-    @objc private func displayOptionsChanged() { store.refreshReduceMotion() }
+    @objc private func displayOptionsChanged() {
+        store.refreshReduceMotion()
+        popover.animates = !store.reduceMotion
+    }
 
     @objc private func togglePanel(_ sender: Any?) {
         if popover.isShown { closePanel() } else { showPanel() }
@@ -1777,6 +2122,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func showPanel() {
         guard let button = statusItem?.button else { return }
         store.refresh()
+        // The panel's own open and close animation follows Reduce Motion too.
+        store.refreshReduceMotion()
+        popover.animates = !store.reduceMotion
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         NSApp.activate()
         popover.contentViewController?.view.window?.makeKey()
@@ -1860,18 +2208,21 @@ enum CLI {
       --open-panel              open the panel once after launch, then close it (alias --open-menu)
       --demo [--appearance light|dark]
                                 a clearly labelled DEMO panel with made-up states, for previews only
+      --launchd                 set by install.sh's LaunchAgent: this copy is the supervised one
+                                and takes over from a copy started by hand
 
     Command line:
       --dump                    print the panel text for the fleet right now
-      --reconnect <bot>         reconnect one bot that is not connected (a connected bot
-                                needs the confirmation in the panel); add --dry-run to log
-                                the exact engine command instead of running it
+      --reconnect <bot>         reconnect one bot that is not connected, the way /fresh does it
+                                (its chat line first, the engine, Back and ready, the old window
+                                closed); --yes also restarts a connected bot, as the panel's
+                                confirmation does; --dry-run logs every step instead
+      --fresh-start <bot> --yes a new, empty conversation through the /fresh path (--yes is the
+                                panel's confirmation); --dry-run logs every step instead
       --toggle-watchdog         flip the watchdog kill switches; add --dry-run to log only
-      --fresh-start <bot> --dry-run
-                                log the exact /fresh engine command (a real fresh start is
-                                only offered in the panel, behind a confirmation)
       --snapshot                run the fleet snapshot engine; add --dry-run to log only
-      --restore                 run the fleet restore engine; add --dry-run to log only
+      --restore                 run the fleet restore engine, with the chat lines and window
+                                cleanup; add --dry-run to log only
       --render-preview <png>    render the panel (light and dark) and the status icon to PNGs;
                                 add --demo for the labelled demo states
       --render-icon <dir>       write the app icon PNGs into an .iconset folder
@@ -1897,54 +2248,70 @@ enum CLI {
     @MainActor static func dump() -> Int32 {
         ActionLog.shared.enabled = false
         let store = FleetStore(mode: .snapshot)
-        store.refresh()
+        store.refreshNow()
         print(store.dumpText())
         return store.problem == nil ? 0 : 1
     }
 
-    static func reconnect(_ key: String, dryRun: Bool) -> Int32 {
-        ActionLog.shared.echo = true
-        guard let cfg = loadOrExplain() else { return 2 }
+    static func findBot(_ key: String, _ cfg: FleetConfig) -> Bot? {
         guard let bot = cfg.bots.first(where: { $0.key == key || $0.name.lowercased() == key.lowercased() }) else {
             FileHandle.standardError.write(Data("telebots-bar: no bot '\(key)' in \(cfg.path)\n".utf8))
-            return 2
+            return nil
         }
+        return bot
+    }
+
+    static func reconnect(_ key: String, dryRun: Bool, confirmed: Bool) -> Int32 {
+        ActionLog.shared.echo = true
+        guard let cfg = loadOrExplain() else { return 2 }
+        guard let bot = findBot(key, cfg) else { return 2 }
         let health = FleetModel.evaluateOne(bot, cfg)
-        ActionLog.shared.write("cli: --reconnect \(bot.key)\(dryRun ? " --dry-run" : "") (\(health.statusLine))")
-        if !dryRun && health.state == .connected {
-            ActionLog.shared.write("reconnect \(bot.key): not run, it is connected (restarting a connected bot needs the confirmation in the panel)")
+        ActionLog.shared.write("cli: --reconnect \(bot.key)\(confirmed ? " --yes" : "")\(dryRun ? " --dry-run" : "") (\(health.statusLine))")
+        if !dryRun && !confirmed && health.state == .connected {
+            ActionLog.shared.write("reconnect \(bot.key): not run, it is connected (restarting a connected bot needs --yes, or the confirmation in the panel)")
             return 3
         }
-        let outcome = FleetModel.performReconnect(bot, cfg, allowConnected: false, dryRun: dryRun,
+        let outcome = FleetModel.performReconnect(bot, cfg, allowConnected: confirmed, dryRun: dryRun,
                                                   askForPermission: false, log: { ActionLog.shared.write($0) })
+        if let failure = outcome.failureText { ActionLog.shared.write("reconnect \(bot.key): \(failure)") }
         switch outcome {
         case .dryRun, .connected, .healedBeforeRun: return 0
         default: return 1
         }
     }
 
-    static func freshStart(_ key: String, dryRun: Bool) -> Int32 {
+    static func freshStart(_ key: String, dryRun: Bool, confirmed: Bool) -> Int32 {
         ActionLog.shared.echo = true
         guard let cfg = loadOrExplain() else { return 2 }
-        guard let bot = cfg.bots.first(where: { $0.key == key || $0.name.lowercased() == key.lowercased() }) else {
-            FileHandle.standardError.write(Data("telebots-bar: no bot '\(key)' in \(cfg.path)\n".utf8))
-            return 2
-        }
-        ActionLog.shared.write("cli: --fresh-start \(bot.key)\(dryRun ? " --dry-run" : "")")
-        guard dryRun else {
-            ActionLog.shared.write("fresh start \(bot.key): not run, a fresh start ends the conversation and is only offered in the panel, behind a confirmation")
+        guard let bot = findBot(key, cfg) else { return 2 }
+        ActionLog.shared.write("cli: --fresh-start \(bot.key)\(confirmed ? " --yes" : "")\(dryRun ? " --dry-run" : "")")
+        guard dryRun || confirmed else {
+            ActionLog.shared.write("fresh start \(bot.key): not run, a fresh start ends the conversation, so it needs --yes (the panel asks instead)")
             return 3
         }
-        let outcome = FleetModel.performReconnect(bot, cfg, allowConnected: true, dryRun: true, askForPermission: false,
+        let outcome = FleetModel.performReconnect(bot, cfg, allowConnected: true, dryRun: dryRun, askForPermission: false,
                                                   freshStart: true, log: { ActionLog.shared.write($0) })
-        if case .dryRun = outcome { return 0 }
-        return 1
+        if let failure = outcome.failureText { ActionLog.shared.write("fresh start \(bot.key): \(failure)") }
+        switch outcome {
+        case .dryRun, .connected: return 0
+        default: return 1
+        }
     }
 
     static func fleetEngine(_ action: FleetEngineAction, dryRun: Bool) -> Int32 {
         ActionLog.shared.echo = true
         guard let cfg = loadOrExplain() else { return 2 }
         ActionLog.shared.write("cli: --\(action.rawValue)\(dryRun ? " --dry-run" : "")")
+        if action == .restore {
+            let report = FleetModel.performRestore(cfg, dryRun: dryRun, askForPermission: false,
+                                                   log: { ActionLog.shared.write($0) })
+            guard let run = report.run, report.blocked == nil else { return 1 }
+            if !dryRun {
+                ActionLog.shared.write("restore: \(report.back.count) of \(report.wasDown.count) down bots back"
+                                       + (report.notBack.isEmpty ? "" : ", not back: " + report.notBack.joined(separator: ", ")))
+            }
+            return run.code == 0 && report.notBack.isEmpty ? 0 : 1
+        }
         guard let run = FleetModel.runFleetEngine(action, cfg, dryRun: dryRun, log: { ActionLog.shared.write($0) }) else { return 1 }
         return run.code == 0 ? 0 : 1
     }
@@ -1954,7 +2321,11 @@ enum CLI {
         guard let cfg = loadOrExplain() else { return 2 }
         let current = FleetModel.readWatchdog(cfg)
         ActionLog.shared.write("cli: --toggle-watchdog\(dryRun ? " --dry-run" : "") (\(current.label.lowercased()) now)")
-        return FleetModel.applyWatchdog(on: !current.isOn, cfg, dryRun: dryRun, log: { ActionLog.shared.write($0) }) ? 0 : 1
+        guard current.available else {
+            ActionLog.shared.write("watchdog: unavailable, there is no state folder at \(current.dir); nothing changed")
+            return 1
+        }
+        return FleetModel.applyWatchdog(on: !current.isOn, cfg, dryRun: dryRun, log: { ActionLog.shared.write($0) }).isEmpty ? 0 : 1
     }
 
     static func writePNG(_ rep: NSBitmapImageRep, _ path: String) -> Bool {
@@ -2071,7 +2442,7 @@ enum CLI {
             frames.append((FleetStore.demo(.snapshot), true, base + tag + "-snapshot-dark.png"))
         } else {
             let store = FleetStore(mode: .snapshot)
-            store.refresh()
+            store.refreshNow()
             frames.append((store, false, base + "-light.png"))
             frames.append((store, true, base + "-dark.png"))
         }
@@ -2127,14 +2498,14 @@ if hasFlag("--dump") {
 }
 if hasFlag("--reconnect") {
     guard let key = value(after: "--reconnect") else { usageExit("--reconnect needs a bot key") }
-    exit(CLI.reconnect(key, dryRun: dryRunRequested))
+    exit(CLI.reconnect(key, dryRun: dryRunRequested, confirmed: hasFlag("--yes")))
 }
 if hasFlag("--toggle-watchdog") {
     exit(CLI.toggleWatchdog(dryRun: dryRunRequested))
 }
 if hasFlag("--fresh-start") {
     guard let key = value(after: "--fresh-start") else { usageExit("--fresh-start needs a bot key") }
-    exit(CLI.freshStart(key, dryRun: dryRunRequested))
+    exit(CLI.freshStart(key, dryRun: dryRunRequested, confirmed: hasFlag("--yes")))
 }
 if hasFlag("--snapshot") {
     exit(CLI.fleetEngine(.snapshot, dryRun: dryRunRequested))
@@ -2147,25 +2518,111 @@ if hasFlag("--render-preview") {
     exit(MainActor.assumeIsolated { CLI.renderPreview(path, demo: hasFlag("--demo")) })
 }
 
-let guiFlags: Set<String> = ["--dry-run", "--open-panel", "--open-menu", "--demo", "--appearance", "light", "dark"]
+let guiFlags: Set<String> = ["--dry-run", "--open-panel", "--open-menu", "--demo", "--appearance", "light", "dark", "--launchd"]
 if let unknown = arguments.first(where: { !guiFlags.contains($0) }) {
     usageExit("unknown argument \(unknown)")
 }
 
+/// One running copy per user: an exclusive lock on a file only this user can reach.
+/// The kernel drops it when the process ends, crash or not, so it never goes stale.
+enum InstanceLock {
+    static var path: String { Env.home + "/Library/Application Support/Telebots Bar/instance.lock" }
+    private static var held: Int32 = -1
+
+    enum Outcome {
+        case acquired
+        case heldBy(pid: pid_t?, owner: String)
+        case failed(String)
+    }
+
+    static func acquire(owner: String) -> Outcome {
+        let dir = (path as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        let fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { return .failed("cannot open \(path) (\(String(cString: strerror(errno))))") }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            let holder = readHolder(fd)
+            close(fd)
+            return .heldBy(pid: holder.pid, owner: holder.owner)
+        }
+        let line = "\(getpid()) \(owner)\n"
+        _ = ftruncate(fd, 0)
+        _ = line.withCString { pwrite(fd, $0, strlen($0), 0) }
+        held = fd
+        return .acquired
+    }
+
+    /// Waits for another copy to let go of the lock, up to `seconds`.
+    static func waitAndAcquire(owner: String, seconds: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        repeat {
+            if case .acquired = acquire(owner: owner) { return true }
+            usleep(200_000)
+        } while Date() < deadline
+        return false
+    }
+
+    private static func readHolder(_ fd: Int32) -> (pid: pid_t?, owner: String) {
+        var buffer = [UInt8](repeating: 0, count: 64)
+        let count = pread(fd, &buffer, 63, 0)
+        let text = count > 0 ? String(decoding: buffer[0..<count], as: UTF8.self) : ""
+        let parts = text.split(whereSeparator: { $0 == " " || $0 == "\n" })
+        return (parts.first.flatMap { pid_t($0) }, parts.count > 1 ? String(parts[1]) : "unknown")
+    }
+}
+
+/// True only for this user's own Telebots Bar executable.
+func isTelebotsBar(_ pid: pid_t) -> Bool {
+    guard pid > 1, let basic = ProcessTable.basicsOnly().basics[pid], basic.uid == getuid() else { return false }
+    var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+    guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { return false }
+    return String(cString: buffer).hasSuffix("/Telebots Bar.app/Contents/MacOS/Telebots Bar")
+}
+
+/// SIGTERM (launchd stopping the job, or a supervised copy taking over) quits
+/// cleanly and says so in the log.
+var terminationSource: DispatchSourceSignal?
+
 @MainActor func runMenuBarApp() -> Never {
     let demoMode = hasFlag("--demo")
     let mode: FleetStore.Mode = demoMode ? .demo : (dryRunRequested ? .dryRun : .live)
+    let owner = hasFlag("--launchd") ? "launchd" : "manual"
     if demoMode {
         // A demo never writes the action log; its notes go to stdout.
         ActionLog.shared.enabled = false
         ActionLog.shared.echo = true
     } else {
-        let others = NSRunningApplication.runningApplications(withBundleIdentifier: appBundleID)
-            .filter { $0.processIdentifier != getpid() && !$0.isTerminated }
-        if let other = others.first {
-            ActionLog.shared.write("start: Telebots Bar is already running (pid \(other.processIdentifier)), this copy exits")
-            exit(0)
+        switch InstanceLock.acquire(owner: owner) {
+        case .acquired:
+            break
+        case .heldBy(let pid, let holder):
+            // The LaunchAgent's copy is the supervised one, so it takes over from a copy
+            // started by hand; any other second copy just leaves.
+            if owner == "launchd", holder != "launchd", let pid, isTelebotsBar(pid) {
+                ActionLog.shared.write("start (launchd): a copy started by hand is running (pid \(pid)); asking it to quit so launchd supervises this one")
+                kill(pid, SIGTERM)
+                guard InstanceLock.waitAndAcquire(owner: owner, seconds: 10) else {
+                    ActionLog.shared.write("start (launchd): pid \(pid) did not quit within 10s; this copy exits with an error so launchd tries again")
+                    exit(1)
+                }
+                ActionLog.shared.write("start (launchd): took over from pid \(pid)")
+            } else {
+                ActionLog.shared.write("start: Telebots Bar is already running (pid \(pid.map { String($0) } ?? "unknown"), started \(holder)), this copy exits")
+                exit(0)
+            }
+        case .failed(let why):
+            ActionLog.shared.write("start: cannot take the single-copy lock (\(why)); this copy exits")
+            exit(1)
         }
+        signal(SIGTERM, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        source.setEventHandler {
+            ActionLog.shared.write("stop: SIGTERM received (pid \(getpid())), quitting")
+            NSApp.terminate(nil)
+        }
+        source.resume()
+        terminationSource = source
     }
 
     var appearance: NSAppearance?
@@ -2180,7 +2637,8 @@ if let unknown = arguments.first(where: { !guiFlags.contains($0) }) {
     let delegate = AppDelegate(store: demoMode ? FleetStore.demo() : FleetStore(mode: mode),
                                openPanelAtLaunch: hasFlag("--open-panel") || hasFlag("--open-menu") || demoMode,
                                quitAfterPanel: demoMode,
-                               appearance: appearance)
+                               appearance: appearance,
+                               owner: owner)
     app.delegate = delegate
     app.run()
     exit(0)
