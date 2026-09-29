@@ -72,10 +72,21 @@ launchd (KeepAlive)  ->  watchdog-loop.sh  ->  watchdog.sh (one pass)  every ~60
    each pass, for each bot: check session PID, poller PID, and heartbeat freshness
      unhealthy past the grace window, not in cooldown, under the hourly breaker
        ->  fleet-fresh <pid> <workdir> [resume_uuid] quiet
-             ->  kill the stale session (PID plus workdir guarded)
+             ->  kill the stale session (PID, start time and workdir guarded;
+                 skipped when the bot is already back)
                    ->  open a new Terminal window running fleet-launch
                          ->  read model-state, exec claude --channels ... resumed
 ```
+
+Snapshot and Restore share a fleet transaction lock and a saved generation ID.
+An interrupted snapshot rolls back only switches whose inode still belongs to it.
+Restore archives only its processed generation after current health checks pass.
+The public engines reject duplicate bot keys and shared workdirs or state directories.
+Restart and Restore require fresh heartbeats. An omitted restart argument preserves the selected model;
+recognized idle-hook and mid-task `/fresh` requests still reset it. Explicit
+`fresh-reset` always resets, and launch dry-runs preserve model-state.
+Custom FLEET_HOME and FLEET_CONFIG paths are resolved once and carried into
+Terminal launches and child hooks, including paths containing spaces.
 
 The loop uses a KeepAlive wrapper rather than a launchd `StartInterval` timer on
 purpose: interval timers can stop firing after the machine sleeps, and a keepalive

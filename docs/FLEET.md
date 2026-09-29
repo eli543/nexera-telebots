@@ -95,3 +95,12 @@ reading logs, and the kill switches.
 
 A single bot is the default install. A fleet is simply two or more entries in the
 same file.
+
+Configured workdirs must use their physical absolute path after `~` expansion.
+`fleet-config validate` rejects symlink, dot-dot and trailing-slash spellings with
+the required path in the error. Caller lookup accepts an alias but resolves it to
+that validated workdir before any PID comparison or launch. Claude's transcript
+project directory is derived from the accepted launch path spelling, with `/`
+replaced by `-`. Existing transcripts are never moved automatically; migrating an
+older alias-based configuration requires deliberately retaining or moving its
+history before using the physical launch path.

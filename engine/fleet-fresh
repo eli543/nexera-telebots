@@ -1,39 +1,98 @@
 #!/bin/bash
 # fleet-fresh - detached kill + relaunch of one fleet bot's Claude session.
 #
-# The single restart primitive. /fresh, /resume, /model, and the watchdog all
-# funnel through here so kill+relaunch behaves identically everywhere. Config
-# driven: the bot is identified by its workdir via fleet-config, so there is no
-# hardcoded worktree list.
+# The single restart primitive. /fresh, /resume, /model, the watchdog and
+# fleet-restore all funnel through here so kill+relaunch behaves identically
+# everywhere. Config driven: the bot is identified by its workdir via
+# fleet-config, so there is no hardcoded worktree list.
 #
 # Args:
-#   $1  PID of the claude session to replace (999999 or a dead pid = just spawn)
+#   $1  PID of the claude session to replace: a plain positive number. A pid that
+#       is not running (the watchdog passes 999999) means "spawn one", unless the
+#       bot is already up again as another session (then it exits 7).
 #   $2  workdir of the bot (must be a workdir known to fleet.json)
-#   $3  resume id (optional): a session uuid | continue | fresh-keep | "" (fresh)
+#   $3  resume (optional): a session uuid | fresh-keep | fresh-reset.
+#       EMPTY preserves the model unless a verified /fresh caller requested reset.
 #   $4  "quiet" (optional): suppress the back-online ping (the caller notifies)
 #
-# Safety, preserved from the live restart script:
-#   - refuses unless the workdir is a known fleet bot (exit 2)
-#   - refuses unless the PID is a claude process whose lsof cwd == that workdir,
-#     so a sibling bot is never killed by mistake (exit 3 / exit 4)
-#   - SIGTERM, wait up to 8s, then SIGKILL only if it lingers
-#   - closes the old window strictly by the killed session's own tty, and only
-#     when that tab is the window's only tab (never a window holding a sibling)
-#   - process discovery is ps -axo + lsof cwd match, never pgrep -f / pkill
+# Env: FLEET_HOME (default ~/.claude/telegram-fleet); CC_FRESH_DRYRUN=1 prints the
+# decision and stops before any lock, kill or launch.
 #
 # macOS only (osascript / Terminal.app / lsof / ps -o tty). Logs to
 # $FLEET_HOME/logs/fresh.log.
+#
+# What it does:
+#   1. Validates every argument first: the pid must be a plain positive number,
+#      the workdir must belong to a bot in fleet.json (its canonical workdir and
+#      state dir are used from then on), the resume argument must be a session
+#      uuid or one of the words above, and the 4th argument empty or "quiet".
+#      Anything else exits 2 and touches nothing. These values end up on a shell
+#      command line in a new Terminal window, so nothing unchecked may reach it.
+#   2. Takes the bot's restart lock (a directory under /tmp whose file "pid" names
+#      the run holding it; fleet-restore takes the same lock). A second restart of
+#      the same bot while one is in flight exits 7 and touches nothing. A lock is
+#      taken over only from a run whose pid is dead, never from one still running.
+#   3. Finds the target again under that lock:
+#      - the pid is running: it must be a claude process whose cwd is the bot's
+#        workdir (a sibling bot is never killed by mistake), and its identity is
+#        recorded - pid, start time and command line - with its tty and the shell
+#        and login that host it on that tty (used in 6);
+#      - the pid is not running: if the bot is already up as another session
+#        (another restart or fleet-restore brought it back after the caller
+#        looked), the caller's plan is stale and the run exits 7 without
+#        signaling or launching anything; otherwise the bot is down and a new
+#        session is spawned. A pid that was not running here is never signaled.
+#   4. SIGTERM, wait up to 8s, SIGKILL only if it lingers. Right before each
+#      signal the recorded identity is read again; a pid whose start time or
+#      command line changed (its number was reused) is not signaled, and an
+#      identity that cannot be read exits 8.
+#   5. Opens a new Terminal window running fleet-launch (the command line is
+#      single-quoted for the shell and handed to osascript as an argument, never
+#      written into the AppleScript text), then waits for the new poller: bot.pid
+#      written since the launch and naming a live process, and a heartbeat since
+#      the launch. Install heartbeat patch 03 before using these engines.
+#   6. Closes the old window only on proof, the menu bar app's standard: every
+#      process still on the old tty is one of the recorded host processes (same
+#      pid and start time) and none is claude, and Terminal's own inspection
+#      succeeds, finds exactly one tab on that tty, finds it is its window's only
+#      tab, and reads that tab's processes without claude among them. Any error,
+#      timeout or doubt leaves the window open and the log says why.
+#
+# Exit codes (the caller's source of truth):
+#   0  restarted, and the new poller was confirmed live
+#   1  missing args
+#   2  an argument failed validation (unknown workdir, a pid that is not a plain
+#      positive number, a resume argument outside the list above, or a 4th
+#      argument other than "quiet"); nothing was touched
+#   3  target pid is not a claude process
+#   4  target pid's cwd is not the bot's workdir (sibling protection)
+#   5  launcher missing
+#   6  spawned, but the poller never came up inside POLLER_WAIT seconds
+#   7  skipped, nothing signaled and nothing launched: another restart of this bot
+#      is in flight, or the target is not running and the bot is already up as
+#      another session. A skip is not a restart; never report it as one.
+#   8  refused: the target's probes timed out or came back empty while it was
+#      alive, or its identity could not be read again right before a signal.
+#      Nothing (more) was signaled and no window was opened.
+#
+# Process discovery is ps -axo plus lsof or the TELEGRAM_STATE_DIR environment
+# match (the watchdog's own test), never pgrep -f / pkill.
 
+# Takeover audit: acquisition brackets cwd/comm with one process identity;
+# each signal rechecks cwd and identity, and every launch rechecks for a replacement.
+# Any tty inspection error or changed tab count leaves the old window open.
 set -uo pipefail
 
 usage() {
-  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
 }
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
 esac
 
-FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
+# Keep custom fleet paths stable across Terminal's new shell and hook children.
+FLEET_HOME="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "${FLEET_HOME:-$HOME/.claude/telegram-fleet}")" || exit 2
+export FLEET_HOME
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 resolve_bin() {  # $1 = tool name -> absolute path or bare name (PATH)
@@ -44,6 +103,10 @@ resolve_bin() {  # $1 = tool name -> absolute path or bare name (PATH)
 FC_BIN="$(resolve_bin fleet-config)"
 LAUNCHER="$(resolve_bin fleet-launch)"
 fc() { "$FC_BIN" "$@"; }
+# Reject duplicate keys and shared/invalid paths before any lookup can choose a bot.
+fc validate >/dev/null || { echo "Invalid fleet configuration; nothing acted on." >&2; exit 2; }
+FLEET_CONFIG="$(fc path)" || exit 2
+export FLEET_CONFIG
 
 TARGET_PID="${1:-}"
 TARGET_CWD="${2:-}"
@@ -53,6 +116,102 @@ LOG_DIR="$FLEET_HOME/logs"
 LOG="$LOG_DIR/fresh.log"
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 OLD_TTY=""
+LOCK_STALE=180       # seconds: a restart lock that records NO pid and is older than this belonged to a crashed run (a lock whose pid is alive is never taken over)
+POLLER_WAIT=60       # seconds to wait for the new session's poller before calling it a failure
+RC=0
+# Locks live under /tmp (cleared at boot, so a lock can never outlive a restart),
+# named for this fleet so parallel fleets or a test run never collide.
+LOCK_BASE="/tmp/nexera-telebots-$(printf '%s' "$FLEET_HOME" | cksum | awk '{print $1}')"
+# Every real invocation is appended to <key>.manual_restart_log here for
+# visibility. A ledger only: nothing reads it.
+MANUAL_LOG_DIR="$FLEET_HOME/watchdog-state"
+
+# Who called us, captured before anything else. Any token-shaped string is
+# redacted before it can reach a log line.
+CALLER_PID="$PPID"
+CALLER_CMD="$(ps -o command= -p "$PPID" 2>/dev/null | head -1 | sed -E 's/[0-9]{6,}:[A-Za-z0-9_-]{20,}/<redacted>/g' | cut -c1-200)"
+KEY=""
+STATE_DIR=""
+LOCK_DIR=""
+LOCK_HELD=0
+MANUAL_LOG=""
+# The target as found under the lock: whether it was running, its recorded
+# identity, and the processes that host it on its tty.
+TARGET_PRESENT=0
+TARGET_IDENT=""
+TARGET_HOSTS=""
+UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+KEY_RE='^[a-z0-9][a-z0-9-]{0,30}$'
+
+FRESH_INTERCEPT_LOG=""   # resolved to the bot's mid-task log after config validation
+PUBLIC_HOOK_LOG="$FLEET_HOME/logs/fresh-hook.log"
+FRESH_INTERCEPT_WINDOW=120
+SENTINEL_SOURCE="caller-supplied"
+RESUME_SENTINEL=""
+
+resume_sentinel_from_caller() {
+  _pid="$CALLER_PID"
+  _hop=0
+  while [ -n "$_pid" ] && [ "$_pid" != "0" ] && [ "$_pid" != "1" ] && [ "$_hop" -lt 4 ]; do
+    _cmd="$(ps -o command= -p "$_pid" 2>/dev/null | head -1)"
+    [ -z "$_cmd" ] && break
+    # argv[0] must BE bun AND server.ts must be one of its arguments. A loose
+    # substring match over the whole command line is not enough: any caller that
+    # merely mentions both words looks like the poller (measured 2026-09-05 - an
+    # agent shell running fleet work matched it).
+    _argv0="$(printf '%s' "$_cmd" | awk '{print $1}')"
+    case "$_argv0" in
+      bun|*/bun)
+        case "$_cmd" in
+          *server.ts*)
+            SENTINEL_SOURCE="fresh-intercept-ancestor"
+            RESUME_SENTINEL="fresh-reset"
+            return 0 ;;
+        esac ;;
+    esac
+    _pid="$(ps -o ppid= -p "$_pid" 2>/dev/null | tr -d '[:space:]')"
+    _hop=$(( _hop + 1 ))
+  done
+
+  if [ -f "$FRESH_INTERCEPT_LOG" ]; then
+    _line="$(grep -E "SERVER-FRESH.*(claudePid=${TARGET_PID}[[:space:]]|pid-arg=${TARGET_PID}[[:space:]])" "$FRESH_INTERCEPT_LOG" 2>/dev/null \
+             | TARGET_MATCH_CWD="$TARGET_CWD" awk 'index($0, "cwd=" ENVIRON["TARGET_MATCH_CWD"] " ") || substr($0, length($0) - length("cwd-arg=" ENVIRON["TARGET_MATCH_CWD"]) + 1) == "cwd-arg=" ENVIRON["TARGET_MATCH_CWD"] {last=$0} END {print last}')"
+    if [ -n "$_line" ]; then
+      _ts="$(printf '%s' "$_line" | awk '{print $1}')"
+      _ts="${_ts%%.*}"
+      _ts_epoch="$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%S" "$_ts" "+%s" 2>/dev/null)"
+      if [ -n "$_ts_epoch" ]; then
+        _age=$(( $(date +%s) - _ts_epoch ))
+        if [ "$_age" -ge 0 ] && [ "$_age" -le "$FRESH_INTERCEPT_WINDOW" ]; then
+          SENTINEL_SOURCE="fresh-intercept-marker-${_age}s"
+          RESUME_SENTINEL="fresh-reset"
+          return 0
+        fi
+      fi
+    fi
+  fi
+
+  # The public idle hook logs this exact engine pid after it detaches us.
+  # Matching our pid and full cwd preserves /fresh without resetting manual calls.
+  if [ -f "$PUBLIC_HOOK_LOG" ]; then
+    _line=$(grep -F " restart spawned for $TARGET_CWD (bg pid=$$)" "$PUBLIC_HOOK_LOG" | tail -1)
+    if [ -n "$_line" ]; then
+      _stamp="$(printf '%s' "$_line" | cut -c1-19)"
+      _epoch=$(date -j -f '%Y-%m-%d %H:%M:%S' "$_stamp" '+%s' 2>/dev/null)
+      if [[ "$_epoch" =~ ^[0-9]+$ ]]; then
+        _age=$(( $(date +%s) - _epoch ))
+        if [ "$_age" -ge 0 ] && [ "$_age" -le "$FRESH_INTERCEPT_WINDOW" ]; then
+          SENTINEL_SOURCE="fresh-idle-hook-engine-pid"
+          RESUME_SENTINEL="fresh-reset"
+          return 0
+        fi
+      fi
+    fi
+  fi
+
+  SENTINEL_SOURCE="not-the-fresh-intercept"
+  RESUME_SENTINEL="fresh-keep"
+}
 
 # token from a bot's state-dir .env (never inlined, never logged)
 token_of_state() {
@@ -73,102 +232,751 @@ except Exception:
 PY
 }
 
+# One EXIT handler for both jobs: release the lock if it still names this run, and
+# write this invocation's ledger line.
+on_exit() {
+  _rc="${1:-0}"
+  if [ "$LOCK_HELD" = "1" ] && [ -n "$LOCK_DIR" ]; then
+    if lock_release "$LOCK_DIR"; then
+      echo "$(date "+%F %T") restart lock released ($KEY)" >> "$LOG"
+    else
+      echo "$(date "+%F %T") restart lock left in place ($KEY): its pid file no longer names this run (pid $$), so it is not this run's to remove" >> "$LOG"
+    fi
+  fi
+  if [ -n "$MANUAL_LOG" ] && [ "${CC_FRESH_DRYRUN:-}" != "1" ]; then
+    mkdir -p "$MANUAL_LOG_DIR" 2>/dev/null || true
+    printf '%s pid=%s cwd=%s resume=%s quiet=%s caller_pid=%s caller=%s exit=%s\n' \
+      "$(date '+%F %T')" "$TARGET_PID" "$TARGET_CWD" "${RESUME_ID:-}" "${QUIET:-none}" \
+      "$CALLER_PID" "${CALLER_CMD:-unknown}" "$_rc" \
+      >> "$MANUAL_LOG" 2>/dev/null || true
+  fi
+}
+
+# One-shot Telegram notice FROM this bot, into its own chat. Best effort: a failed
+# send never changes what the restart does. The token is read only here.
+tg_notice() {   # tg_notice <text>
+  local tok chat
+  tok="$(token_of_state "$STATE_DIR")"
+  chat="$(chat_id_of_state "$STATE_DIR")"
+  if [ -z "$tok" ] || [ -z "$chat" ]; then
+    echo "$(date '+%F %T') notice skipped: no token/chat for $KEY"
+    return 1
+  fi
+  curl -s -o /dev/null --max-time 10 -X POST "https://api.telegram.org/bot${tok}/sendMessage" \
+    --data-urlencode "chat_id=${chat}" \
+    --data-urlencode "text=$1" \
+    && echo "$(date '+%F %T') notice sent: $1" \
+    || echo "$(date '+%F %T') notice curl failed"
+}
+
+# ---- bash-native command timeout ---------------------------------------------
+# macOS ships NO timeout/gtimeout binary, and ps/lsof can hang indefinitely on a
+# wedged process. run_with_timeout DEADLINE OUTVAR CMD... runs CMD in the
+# background with stdout captured to a temp file, polls kill -0 in 0.5s steps, and
+# kill -9s the child at the deadline. Returns RC_TIMEOUT (124) on timeout, 125 if
+# the temp file could not be made, otherwise CMD's own exit status. Captured
+# stdout lands in the variable named by OUTVAR (empty on timeout).
+RC_TIMEOUT=124
+run_with_timeout() {
+  _rwt_deadline="$1"; shift
+  _rwt_outvar="$1"; shift
+  _rwt_out=$(mktemp "${TMPDIR:-/tmp}/fleet-fresh-probe.XXXXXX") || return 125
+  "$@" > "$_rwt_out" 2>/dev/null &
+  _rwt_child=$!
+  _rwt_steps=$(( _rwt_deadline * 2 ))
+  _rwt_waited=0
+  while kill -0 "$_rwt_child" 2>/dev/null && [ "$_rwt_waited" -lt "$_rwt_steps" ]; do
+    sleep 0.5
+    _rwt_waited=$(( _rwt_waited + 1 ))
+  done
+  if kill -0 "$_rwt_child" 2>/dev/null; then
+    kill -9 "$_rwt_child" 2>/dev/null
+    disown "$_rwt_child" 2>/dev/null
+    rm -f "$_rwt_out"
+    printf -v "$_rwt_outvar" '%s' ""
+    return "$RC_TIMEOUT"
+  fi
+  wait "$_rwt_child" 2>/dev/null
+  _rwt_rc=$?
+  printf -v "$_rwt_outvar" '%s' "$(cat "$_rwt_out" 2>/dev/null)"
+  rm -f "$_rwt_out"
+  return "$_rwt_rc"
+}
+
+# ---- restart and fleet locks: one protocol, three copies ---------------------
+# fleet-fresh, fleet-restore and fleet-snapshot all carry this block word for
+# word; change one and change the others. A bot's restart lock is the directory
+# <LOCK_BASE>-fresh-lock-<key>; the fleet transaction lock, held from start to
+# finish by a real fleet-snapshot and by a real fleet-restore, is the directory
+# <LOCK_BASE>-fleet-lock. In either one the file "pid" names the run that holds
+# it. LOCK_STALE is set by each script.
+#  - Taking it: mkdir the directory, then record this run's pid. The pid is
+#    written to a private file and hard-linked into place, so a pid file is
+#    always complete and never overwrites another run's; it is then read back.
+#  - A lock whose recorded pid is alive is never taken over, however old: taking
+#    over by age alone once let a long restart lose its lock and a third run in.
+#  - A lock is taken over only when its recorded pid is dead, or when it records
+#    no pid and is older than LOCK_STALE. The takeover makes its own mkdir
+#    first (<lock>/takeover), so only one run at a time can take a lock over;
+#    under that claim it re-checks that the lock still records what was judged
+#    stale, then replaces the pid file in one atomic rename. No run ever moves
+#    or deletes a pid file it did not write. A claim left by a run that died
+#    mid-takeover (a takeover takes milliseconds) is cleared after 60 seconds.
+#  - Releasing it: only while its pid file still names this run.
+# PID/start ownership is changed only under a stable, kernel-held flock gate.
+# The gate lives beside the directory and is never unlinked. Crashes release it.
+LOCK_NOTE=""
+lock_pid_in() {
+  local p
+  p=$(head -1 "$1" 2>/dev/null | tr -d '[:space:]')
+  [[ "$p" =~ ^[1-9][0-9]*$ ]] || p=""
+  printf '%s' "$p"
+}
+lock_start() { LC_ALL=C TZ=UTC ps -p "$1" -o lstart= 2>/dev/null | awk '{$1=$1; print}'; }
+LOCK_SELF_START=$(lock_start "$$")
+if [[ "${CC_FLEET_MANAGED_GROUP:-}" == 1 ]]; then
+  CC_FLEET_ENGINE_PGID=$(ps -p "$$" -o pgid= | tr -d '[:space:]')
+  [[ "$CC_FLEET_ENGINE_PGID" =~ ^[1-9][0-9]*$ ]] || exit 8
+  CC_FLEET_GROUP_START=${CC_FLEET_GROUP_START:-$(lock_start "$CC_FLEET_ENGINE_PGID")}
+  [[ -n "$CC_FLEET_GROUP_START" ]] || exit 8
+  export CC_FLEET_ENGINE_PGID CC_FLEET_GROUP_START
+fi
+lock_op() {
+  python3 - "$1" "$2" "$$" "$LOCK_SELF_START" "$LOCK_STALE" "${CC_FLEET_ENGINE_PGID:-}" "${CC_FLEET_GROUP_START:-}" <<'LOCKPY'
+import fcntl, os, shutil, subprocess, sys, time
+from pathlib import Path
+op, raw, pid, started, stale, group, group_start = sys.argv[1:]
+dir = Path(raw)
+file = dir / 'pid'
+def start(p):
+    try:
+        r = subprocess.run(['/bin/ps', '-p', str(p), '-o', 'lstart='], capture_output=True, text=True,
+                           env=dict(os.environ, TZ='UTC', LC_ALL='C'), timeout=3)
+        return ' '.join(r.stdout.split()) if r.returncode == 0 else ''
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+def exists(p):
+    try: os.kill(p, 0); return True
+    except ProcessLookupError: return False
+    except PermissionError: return True
+
+def read():
+    try: return file.read_text().splitlines()
+    except FileNotFoundError: return []
+
+def live(record):
+    if record and record[0].isdigit() and int(record[0]) > 0 and exists(int(record[0])):
+        now = start(record[0])
+        if len(record) < 2 or not record[1] or not now or now == record[1]: return True
+    if len(record) >= 4 and record[2].isdigit() and int(record[2]) > 1:
+        # A reused group leader PID does not inherit its predecessor's lease.
+        now = start(record[2])
+        if now and now != record[3]: return False
+        if exists(-int(record[2])): return True
+    return False
+
+try:
+    if op == 'live': sys.exit(0 if live(read()) else 1)
+    fd = os.open(raw + '.gate', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    if dir.is_symlink(): raise RuntimeError('lock directory is a symlink')
+    record = read()
+    if op == 'release':
+        if record[:2] != [pid, started]: sys.exit(1)
+        # The app supervises the whole group, including children after shell exit.
+        # Preserve the lease until a later caller proves the group is gone.
+        if not group: shutil.rmtree(dir)
+    else:
+        if not started: raise RuntimeError('cannot read this process start time')
+        if live(record): raise RuntimeError('owner PID/start or its engine process group is live')
+        if dir.exists() and not record and time.time() - dir.stat().st_mtime < int(stale):
+            raise RuntimeError('owner identity has not been published yet')
+        dir.mkdir(mode=0o700, exist_ok=True)
+        tmp = dir / ('pid.new.' + pid)
+        with open(tmp, 'w') as f:
+            f.write('\n'.join([pid, started, group, group_start]) + '\n')
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, file)
+        print('PID/start identity admitted under the kernel gate')
+except (OSError, RuntimeError) as error:
+    print(str(error)); sys.exit(1)
+LOCKPY
+}
+lock_owner_live() { lock_op live "${1%/pid}"; }
+lock_take() { LOCK_NOTE=$(lock_op take "$1"); }
+lock_release() { lock_op release "$1"; }
+
+# ---- arguments, target identity and window proof -----------------------------
+# One line of printable text for the log: a refused argument can hold anything.
+printable() { printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-160; }
+
+# shq <word>: the word single-quoted for the Terminal window's shell (sh, bash or
+# zsh all read it back byte for byte).
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# ident_of <pid> [seconds]: the pid's start time, program name and command line as
+# ps prints them, time-boxed, into IDENT_OUT (empty when the pid is gone or the
+# probe failed). A pid plus its start time names one process for good.
+IDENT_OUT=""
+ident_of() {
+  run_with_timeout "${2:-10}" IDENT_OUT ps -p "$1" -o lstart= -o comm= -o command=
+}
+
+# same_target: is TARGET_PID still the process recorded under the lock?
+# 0 = yes; 1 = no (it is gone, or that number now names another process);
+# 2 = unknown (the probe timed out or came back empty while the pid is alive).
+same_target() {
+  local rc current_cwd
+  kill -0 "$TARGET_PID" 2>/dev/null || return 1
+  ident_of "$TARGET_PID" 5
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$IDENT_OUT" ]; then
+    kill -0 "$TARGET_PID" 2>/dev/null && return 2
+    return 1
+  fi
+  [ "$IDENT_OUT" = "$TARGET_IDENT" ] || return 1
+  run_with_timeout 5 PROBE_OUT lsof -a -p "$TARGET_PID" -d cwd -Fn
+  rc=$?
+  current_cwd=$(printf '%s\n' "$PROBE_OUT" | sed -n 's/^n//p')
+  if [ "$rc" -ne 0 ] || [ "$current_cwd" != "$TARGET_CWD" ]; then
+    kill -0 "$TARGET_PID" 2>/dev/null && return 2
+    return 1
+  fi
+  ident_of "$TARGET_PID" 5
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$IDENT_OUT" ]; then
+    kill -0 "$TARGET_PID" 2>/dev/null && return 2
+    return 1
+  fi
+  [ "$IDENT_OUT" = "$TARGET_IDENT" ]
+}
+
+# Discover this bot by canonical cwd. Keep comm as the final ps field so an
+# executable path containing spaces is not split or column-truncated. macOS
+# pgrep excludes the caller's ancestors, so inspect ps candidates explicitly.
+bot_sessions() {
+  local p candidate_comm listing candidate_cwd rc out=""
+  listing=$(ps -axo pid=,comm= 2>/dev/null) || return 2
+  [ -n "$listing" ] || return 2
+  while read -r p candidate_comm; do
+    case "$candidate_comm" in claude|*/claude) ;; *) continue ;; esac
+    run_with_timeout 5 PROBE_OUT ps -p "$p" -o command=
+    rc=$?
+    if [ "$rc" -ne 0 ] || [ -z "$PROBE_OUT" ]; then
+      kill -0 "$p" 2>/dev/null && return 2
+      continue
+    fi
+    case "$PROBE_OUT" in *"--channels plugin:telegram"*) ;; *) continue ;; esac
+    run_with_timeout 5 PROBE_OUT lsof -a -p "$p" -d cwd -Fn
+    rc=$?
+    candidate_cwd=$(printf '%s\n' "$PROBE_OUT" | sed -n 's/^n//p')
+    if [ "$rc" -ne 0 ] || [ -z "$candidate_cwd" ]; then
+      kill -0 "$p" 2>/dev/null && return 2
+      continue
+    fi
+    [ "$candidate_cwd" = "$TARGET_CWD" ] && out="$out $p"
+  done < <(printf '%s\n' "$listing")
+  printf '%s' "${out# }"
+}
+
+poller_belongs_to() {   # <poller pid> <session pid>, bounded parent-chain proof
+  local child="$1" parent="$2" hops=0
+  while [[ "$child" =~ ^[1-9][0-9]*$ ]] && [ "$child" -gt 1 ] && [ "$hops" -lt 16 ]; do
+    [ "$child" = "$parent" ] && return 0
+    child=$(ps -o ppid= -p "$child" 2>/dev/null | tr -d '[:space:]') || return 1
+    hops=$((hops + 1))
+  done
+  return 1
+}
+
+# Optional app admission: the target and permission belong to one confirmed
+# PID/start pair. Check under the lock and again immediately before SIGTERM.
+app_admission() {
+  [[ -n "${CC_FRESH_EXPECT_PID:-}" ]] || return 0
+  local start seconds wp hb now max_age
+  [[ "$CC_FRESH_EXPECT_PID" == "$TARGET_PID" && "${CC_FRESH_ALLOW_CONNECTED:-}" =~ ^[01]$ ]] || return 8
+  start=$(LC_ALL=C ps -p "$TARGET_PID" -o lstart= 2>/dev/null | awk '{$1=$1; print}')
+  if [[ "${CC_FRESH_EXPECT_START:-}" == absent ]]; then
+    [[ -z "$start" ]] || return 7
+  else
+    [[ "${CC_FRESH_EXPECT_START:-}" =~ ^[0-9]+$ && -n "$start" ]] || return 8
+    seconds=$(LC_ALL=C date -j -f '%a %b %e %T %Y' "$start" +%s 2>/dev/null) || return 8
+    [[ "$seconds" == "$CC_FRESH_EXPECT_START" ]] || return 7
+  fi
+  if [[ "$CC_FRESH_ALLOW_CONNECTED" == 0 ]]; then
+    wp=$(head -1 "$STATE_DIR/bot.pid" 2>/dev/null | tr -d '[:space:]')
+    hb=$(head -1 "$STATE_DIR/poller.heartbeat" 2>/dev/null | tr -d '[:space:]')
+    max_age=${CC_FRESH_HEARTBEAT_MAX_AGE:-180}
+    [[ "$max_age" =~ ^[0-9]+$ ]] || return 8
+    now=$(date +%s)
+    if [[ "$wp" =~ ^[1-9][0-9]*$ && "$hb" =~ ^[0-9]+$ ]] && kill -0 "$wp" 2>/dev/null && poller_belongs_to "$wp" "$TARGET_PID" && (( hb > 0 && hb <= now && now - hb <= max_age )); then
+      echo "SKIP bot became connected after admission; no confirmed restart of this connected identity"
+      return 7
+    fi
+  fi
+  return 0
+}
+require_app_admission() {
+  local admission_rc
+  app_admission; admission_rc=$?
+  if [[ $admission_rc -ne 0 ]]; then
+    echo "App admission refused or skipped (exit=$admission_rc): expected PID/start or connected authorization changed; nothing signaled"
+    exit "$admission_rc"
+  fi
+}
+
+# proc_key <pid>: "<pid>|<start time>" with the start time's blanks as "_".
+proc_key() {
+  ps -o pid= -o lstart= -p "$1" 2>/dev/null | awk 'NF >= 6 {print $1 "|" $2 "_" $3 "_" $4 "_" $5 "_" $6}'
+}
+
+# The processes that host the target on its tty: its shell, then the login above
+# it - the same record the menu bar app keeps in menubar-windows.json. Walks up
+# from the target while the parent is still on OLD_TTY, at most 8 hops.
+record_hosts() {
+  local p="$TARGET_PID" hop=0 pp ptty k
+  TARGET_HOSTS=""
+  while [ "$hop" -lt 8 ]; do
+    pp=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d '[:space:]')
+    case "$pp" in ''|0|1|*[!0-9]*) break ;; esac
+    ptty=$(ps -o tty= -p "$pp" 2>/dev/null | tr -d '[:space:]')
+    [ "$ptty" = "$OLD_TTY" ] || break
+    k=$(proc_key "$pp")
+    [ -n "$k" ] || break
+    TARGET_HOSTS="$TARGET_HOSTS $k"
+    p="$pp"
+    hop=$((hop + 1))
+  done
+  TARGET_HOSTS="${TARGET_HOSTS# }"
+}
+
+# Close the killed session's old window only on proof; otherwise leave it open and
+# say why. Fails closed: every error, timeout or doubt means "leave it".
+close_old_window() {
+  local tty_rc line key rest strangers="" hosts_seen="" claude_seen="" close_result osa_rc
+  if ! [[ "$OLD_TTY" =~ ^ttys[0-9]+$ ]]; then
+    echo "$(date '+%F %T') skip old-window close: implausible tty '$OLD_TTY'"
+    return 0
+  fi
+  if [ -z "$TARGET_HOSTS" ]; then
+    echo "$(date '+%F %T') old window: left /dev/$OLD_TTY alone - no shell hosting the old session was recorded on it, so it cannot be proven to be $KEY's"
+    return 0
+  fi
+  sleep 2
+  echo "$(date '+%F %T') checking old window tty=/dev/$OLD_TTY (recorded hosts: $TARGET_HOSTS)"
+  run_with_timeout 10 TTY_PS ps -t "$OLD_TTY" -o pid= -o lstart= -o comm=
+  tty_rc=$?
+  if [ "$tty_rc" -ne 0 ]; then
+    echo "$(date '+%F %T') old window: left /dev/$OLD_TTY open - listing its processes failed or timed out"
+    return 0
+  fi
+  if [ -z "$TTY_PS" ]; then
+    echo "$(date '+%F %T') old window: left /dev/$OLD_TTY as it is - nothing runs on it any more (its tab is closed or its shell exited), so it cannot be proven to be $KEY's"
+    return 0
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    key="${line%% *}"
+    rest="${line#* }"
+    case " $TARGET_HOSTS " in
+      *" $key "*) hosts_seen="$hosts_seen, $rest ${key%%|*}" ;;
+      *)          strangers="$strangers, $rest ${key%%|*}" ;;
+    esac
+    case "$rest" in *claude*) claude_seen="$claude_seen, $rest ${key%%|*}" ;; esac
+  done < <(printf '%s\n' "$TTY_PS" | awk 'NF >= 7 {k = $1 "|" $2 "_" $3 "_" $4 "_" $5 "_" $6; $1 = $2 = $3 = $4 = $5 = $6 = ""; sub(/^ +/, ""); print k " " $0}')
+  if [ -n "$claude_seen" ]; then
+    echo "$(date '+%F %T') old window: left /dev/$OLD_TTY open - a claude process still runs on it (${claude_seen#, })"
+    return 0
+  fi
+  if [ -n "$strangers" ]; then
+    echo "$(date '+%F %T') old window: left /dev/$OLD_TTY open - it runs ${strangers#, } now, not only the shell that hosted $KEY's old session"
+    return 0
+  fi
+  if [ -z "$hosts_seen" ]; then
+    echo "$(date '+%F %T') old window: left /dev/$OLD_TTY open - its process list could not be read"
+    return 0
+  fi
+  # Terminal's own inspection, with the tty passed as an argument (never written
+  # into the script text). The script returns "closed window ..." only when it did
+  # close one; every other answer, and any error, leaves the window open.
+  close_result=$(/usr/bin/osascript - "$OLD_TTY" 2>>"$LOG" <<'OSA'
+on run argv
+  set wanted to "/dev/" & (item 1 of argv)
+  tell application "Terminal"
+    set matchCount to 0
+    set wid to missing value
+    set tabCount to 0
+    repeat with w in windows
+      set tabList to tabs of w
+      repeat with t in tabList
+        set tabTTY to ""
+        try
+          set tabTTY to tty of t
+        on error errText
+          return "left all windows open: a tab tty could not be read (" & errText & ")"
+        end try
+        if tabTTY is wanted then
+          set matchCount to matchCount + 1
+          set wid to id of w
+          set tabCount to count of tabList
+        end if
+      end repeat
+    end repeat
+    if matchCount is 0 then return "no tab on " & wanted & ", nothing to close"
+    if matchCount is not 1 then return "left it alone: " & matchCount & " tabs report " & wanted
+    if tabCount is not 1 then return "left window " & wid & " open: the tab on " & wanted & " shares it with " & (tabCount - 1) & " other tab(s), and Terminal cannot close a single tab by script"
+    try
+      set procList to processes of tab 1 of window id wid
+    on error errText
+      return "left window " & wid & " open: the processes in its tab could not be read (" & errText & ")"
+    end try
+    if procList contains "claude" then return "left window " & wid & " open: a claude process still runs in its tab on " & wanted
+    if (tty of tab 1 of window id wid) is not wanted then return "left window " & wid & " open: its tab changed while it was being checked"
+    if (count of tabs of window id wid) is not 1 then return "left window " & wid & " open: its tab count changed while it was being checked"
+    close (window id wid) saving no
+    return "closed window " & wid & " (its only tab was on " & wanted & ")"
+  end tell
+end run
+OSA
+)
+  osa_rc=$?
+  if [ "$osa_rc" -ne 0 ]; then
+    echo "$(date '+%F %T') old window: left /dev/$OLD_TTY open - the Terminal check failed (osascript exit $osa_rc)"
+    return 0
+  fi
+  case "$close_result" in
+    "closed window "*) echo "$(date '+%F %T') old-window close: $close_result; it held only ${hosts_seen#, }" ;;
+    *)                 echo "$(date '+%F %T') old-window close: ${close_result:-osascript returned nothing, so nothing was closed}" ;;
+  esac
+}
+
 {
   echo ""
-  echo "=== $(date '+%F %T') restart pid=$TARGET_PID cwd=$TARGET_CWD ==="
+  echo "=== $(date '+%F %T') restart pid=$(printable "$TARGET_PID") cwd=$(printable "$TARGET_CWD") ==="
 
   if [ -z "$TARGET_PID" ] || [ -z "$TARGET_CWD" ]; then
     echo "ERROR missing args (need: pid, workdir)"
     exit 1
   fi
 
-  # Gate: the workdir must belong to a known fleet bot. Replaces the live six
-  # worktree whitelist with a config lookup.
-  BOT_KEY="$(fc bot-by-workdir "$TARGET_CWD" key 2>/dev/null || true)"
-  if [ -z "$BOT_KEY" ]; then
-    echo "REFUSE unknown workdir (not in fleet.json): $TARGET_CWD"
+  # ---- entry checks ------------------------------------------------------------
+  # Every argument is checked before anything is locked, signaled or launched.
+  if ! [[ "$TARGET_PID" =~ ^[1-9][0-9]{0,9}$ ]]; then
+    echo "REFUSE pid '$(printable "$TARGET_PID")' is not a plain positive number"
     exit 2
   fi
-  STATE_DIR="$(fc bot-by-workdir "$TARGET_CWD" state_dir 2>/dev/null || true)"
+
+  # The workdir must belong to a bot in fleet.json. From here on the bot's own
+  # canonical workdir and state dir are used, never the caller's spelling.
+  KEY="$(fc bot-by-workdir "$TARGET_CWD" key 2>/dev/null || true)"
+  if [ -z "$KEY" ] || ! [[ "$KEY" =~ $KEY_RE ]]; then
+    echo "REFUSE unknown workdir (not in fleet.json): $(printable "$TARGET_CWD")"
+    exit 2
+  fi
+  WORKDIR="$(fc bot "$KEY" workdir 2>/dev/null || true)"
+  STATE_DIR="$(fc bot "$KEY" state_dir 2>/dev/null || true)"
+  [ "${#WORKDIR}" -gt 1 ] && WORKDIR="${WORKDIR%/}"   # lsof reports a cwd with no trailing slash
+  if [[ "$WORKDIR" != /* || "$STATE_DIR" != /* || "$WORKDIR" == *[[:cntrl:]]* || "$STATE_DIR" == *[[:cntrl:]]* ]]; then
+    echo "REFUSE fleet.json gives $KEY an unusable workdir or state dir (it must be an absolute path with no control characters)"
+    exit 2
+  fi
+  TARGET_CWD="$WORKDIR"
+  FRESH_INTERCEPT_LOG="$STATE_DIR/logs/fresh.log"
+
+  # Resolve omitted arguments exactly like the live engine: only /fresh resets.
+  if [ -z "$RESUME_ID" ]; then
+    resume_sentinel_from_caller
+    RESUME_ID="$RESUME_SENTINEL"
+    echo "$(date '+%F %T') empty resume argument -> $RESUME_ID (source=$SENTINEL_SOURCE)"
+  fi
+  if ! [[ "$RESUME_ID" =~ $UUID_RE || "$RESUME_ID" == "fresh-keep" || "$RESUME_ID" == "fresh-reset" ]]; then
+    echo "REFUSE resume argument '$(printable "$RESUME_ID")' is not a session uuid, fresh-keep or fresh-reset - nothing locked, signaled or launched"
+    exit 2
+  fi
+  if [ -n "$QUIET" ] && [ "$QUIET" != "quiet" ]; then
+    echo "REFUSE 4th argument '$(printable "$QUIET")' is not \"quiet\" - nothing locked, signaled or launched"
+    exit 2
+  fi
+
+  MANUAL_LOG="$MANUAL_LOG_DIR/$KEY.manual_restart_log"
+  trap 'on_exit $?' EXIT
+
+  # Verification seam: print the decision and stop, before any lock, kill or launch.
+  if [ "${CC_FRESH_DRYRUN:-}" = "1" ]; then
+    echo "$(date '+%F %T') DRYRUN key=$KEY cwd=$TARGET_CWD state=$STATE_DIR pid=$TARGET_PID resume=$RESUME_ID quiet=${QUIET:-none} caller_pid=$CALLER_PID caller='${CALLER_CMD:-unknown}'"
+    echo "$(date '+%F %T') DRYRUN nothing locked, nothing killed, nothing launched"
+    exit 0
+  fi
+
+  # A restart already in flight for this bot gets a visible answer, not silence.
+  fresh_inflight_notice() {
+    if [ "$QUIET" = "quiet" ]; then
+      echo "$(date '+%F %T') in-flight notice suppressed (quiet mode - the caller reports its own skips)"
+      return 0
+    fi
+    tg_notice "another restart of $KEY is already in flight; your /fresh was not applied, resend it in a minute"
+  }
+
+  # The caller's target is gone and the bot is already back as another session:
+  # the plan is stale, so this run does nothing, and says so.
+  stale_target_notice() {
+    if [ "$QUIET" = "quiet" ]; then
+      echo "$(date '+%F %T') skip notice suppressed (quiet mode - the caller reports its own skips)"
+      return 0
+    fi
+    tg_notice "$KEY is already back up from another restart, so this restart was skipped"
+  }
+
+  # ---- per-bot restart lock ----------------------------------------------------
+  LOCK_DIR="$LOCK_BASE-fresh-lock-$KEY"
+  if ! lock_take "$LOCK_DIR"; then
+    echo "$(date '+%F %T') SKIP restart already in flight for $KEY ($LOCK_NOTE)"
+    fresh_inflight_notice
+    echo "=== done (exit=7, skipped) ==="
+    exit 7
+  fi
+  # LOCK_HELD is only ever set once WE hold the lock, so the exit-7 path above can
+  # never touch somebody else's lock, and the EXIT handler removes it only while
+  # its pid file still names this run.
+  LOCK_HELD=1
+  [ -n "$LOCK_NOTE" ] && echo "$(date '+%F %T') stale restart lock for $KEY ($LOCK_NOTE) - taken over"
+  echo "$(date '+%F %T') restart lock held for $KEY (pid $$)"
 
   if [ ! -x "$LAUNCHER" ] && ! command -v "$LAUNCHER" >/dev/null 2>&1; then
     echo "ERROR launcher not found: $LAUNCHER"
     exit 5
   fi
 
+  require_app_admission
+
   if kill -0 "$TARGET_PID" 2>/dev/null; then
-    cmd=$(ps -p "$TARGET_PID" -o comm= 2>/dev/null | tr -d '[:space:]')
-    cwd=$(lsof -a -p "$TARGET_PID" -d cwd 2>/dev/null | awk 'NR>1 {print $NF}')
-    OLD_TTY=$(ps -p "$TARGET_PID" -o tty= 2>/dev/null | tr -d '[:space:]')
-    echo "target check: pid=$TARGET_PID comm=$cmd cwd=$cwd tty=$OLD_TTY"
-    case "$cmd" in
-      *claude*) : ;;
-      *) echo "REFUSE target is not claude (comm=$cmd)"; exit 3 ;;
-    esac
-    if [ "$cwd" != "$TARGET_CWD" ]; then
-      echo "REFUSE target cwd '$cwd' != expected '$TARGET_CWD' (protecting sibling bot)"
-      exit 4
+    # Bracket cwd/comm acquisition with one unchanged start identity.
+    ident_of "$TARGET_PID" 10
+    acquire_rc=$?
+    ACQUIRE_IDENT="$IDENT_OUT"
+    if [ "$acquire_rc" -ne 0 ] || [ -z "$ACQUIRE_IDENT" ]; then
+      echo "REFUSE target identity could not be captured before inspection"
+      exit 8
     fi
-  else
-    echo "WARN target $TARGET_PID not running; will still spawn a fresh one in $TARGET_CWD"
+    # Single-target probes, each time-boxed at 10s: ps/lsof against a wedged
+    # process can hang indefinitely.
+    run_with_timeout 10 PROBE_OUT ps -p "$TARGET_PID" -o comm=
+    comm_rc=$?
+    cmd=$(printf '%s' "$PROBE_OUT" | tr -d '[:space:]')
+    run_with_timeout 10 PROBE_OUT lsof -a -p "$TARGET_PID" -d cwd -Fn
+    cwd_rc=$?
+    cwd=$(printf '%s\n' "$PROBE_OUT" | sed -n 's/^n//p')
+    run_with_timeout 10 PROBE_OUT ps -p "$TARGET_PID" -o tty=
+    tty_rc=$?
+    OLD_TTY=$(printf '%s' "$PROBE_OUT" | tr -d '[:space:]')
+    if [ "$tty_rc" -ne 0 ]; then
+      OLD_TTY=""
+      echo "$(date '+%F %T') WARN tty probe timed out - proceeding with OLD_TTY empty (old window will not be auto-closed)"
+    fi
+    echo "$(date '+%F %T') target check: pid=$TARGET_PID comm=$cmd cwd=$cwd tty=$OLD_TTY"
+    if ! kill -0 "$TARGET_PID" 2>/dev/null; then
+      # Gone while it was being checked: handled as "not running" just below.
+      echo "$(date '+%F %T') target $TARGET_PID exited while it was being checked"
+    else
+      # An unverifiable target is NEVER killed: a timed-out or empty comm/cwd probe
+      # on a pid that is still alive means we cannot prove it is our bot.
+      if [ "$comm_rc" -ne 0 ] || [ -z "$cmd" ] || [ "$cwd_rc" -ne 0 ] || [ -z "$cwd" ]; then
+        echo "$(date '+%F %T') REFUSE probe timeout/unverifiable (protecting siblings) comm_rc=$comm_rc cwd_rc=$cwd_rc comm='$cmd' cwd='$cwd'"
+        exit 8
+      fi
+      if [[ "$cmd" != *"claude"* ]]; then
+        echo "REFUSE target is not claude (comm=$cmd)"
+        exit 3
+      fi
+      if [ "$cwd" != "$TARGET_CWD" ]; then
+        echo "REFUSE target cwd '$cwd' != expected '$TARGET_CWD' (protecting sibling bot)"
+        exit 4
+      fi
+      # Identity, recorded under the lock: pid + start time + command line. Every
+      # signal below goes out only while the pid still carries exactly this.
+      ident_of "$TARGET_PID" 10
+      ident_rc=$?
+      if [ "$ident_rc" -eq 0 ] && [ -n "$IDENT_OUT" ] && [ "$IDENT_OUT" = "$ACQUIRE_IDENT" ]; then
+        TARGET_PRESENT=1
+        TARGET_IDENT="$IDENT_OUT"
+        [[ "$OLD_TTY" =~ ^ttys[0-9]+$ ]] && record_hosts
+        echo "$(date '+%F %T') target identity recorded: pid=$TARGET_PID started '$(printf '%s' "$TARGET_IDENT" | awk '{print $1, $2, $3, $4, $5}')' tty=${OLD_TTY:-none} hosts='${TARGET_HOSTS:-none}'"
+      elif kill -0 "$TARGET_PID" 2>/dev/null; then
+        echo "$(date '+%F %T') REFUSE identity probe timeout/unverifiable (rc=$ident_rc) - nothing signaled, nothing launched"
+        exit 8
+      else
+        echo "$(date '+%F %T') target $TARGET_PID exited while it was being checked"
+      fi
+    fi
+  fi
+
+  # Not running: the pid is never signaled from here on. If this bot is already up
+  # as another session, whoever called us planned against a state that no longer
+  # exists, so this run is skipped (exit 7), not turned into a second launch.
+  if [ "$TARGET_PRESENT" != "1" ]; then
+    others=$(bot_sessions) || { echo "REFUSE current sessions could not be inspected; nothing launched"; exit 8; }
+    if [ -n "$others" ]; then
+      echo "$(date '+%F %T') SKIP target $TARGET_PID is not running and $KEY is already up as session pid(s) $others - another restart brought it back after the caller looked; nothing signaled, nothing launched"
+      stale_target_notice
+      echo "=== done (exit=7, skipped) ==="
+      exit 7
+    fi
+    echo "WARN target $TARGET_PID not running and no other $KEY session is up; will spawn a fresh one in $TARGET_CWD (pid $TARGET_PID is never signaled)"
   fi
 
   # Let the calling hook exit cleanly before its parent dies.
   sleep 2
 
-  if kill -0 "$TARGET_PID" 2>/dev/null; then
-    echo "$(date '+%F %T') SIGTERM -> $TARGET_PID"
-    kill -TERM "$TARGET_PID" 2>/dev/null || true
-    for _ in 1 2 3 4 5 6 7 8; do
-      sleep 1
-      if ! kill -0 "$TARGET_PID" 2>/dev/null; then
-        echo "$(date '+%F %T') target exited"
-        break
+  if [ "$TARGET_PRESENT" = "1" ]; then
+    same_target
+    st=$?
+    if [ "$st" -eq 2 ]; then
+      echo "$(date '+%F %T') REFUSE could not read target $TARGET_PID's identity again right before SIGTERM - nothing signaled, nothing launched"
+      exit 8
+    fi
+    if [ "$st" -eq 1 ]; then
+      echo "$(date '+%F %T') target $TARGET_PID exited before SIGTERM (or that pid now names another process) - not signaled"
+      others=$(bot_sessions) || { echo "REFUSE current sessions could not be inspected; nothing launched"; exit 8; }
+      if [ -n "$others" ]; then
+        echo "$(date '+%F %T') SKIP $KEY is already up as session pid(s) $others - another launch brought it back; nothing launched"
+        stale_target_notice
+        echo "=== done (exit=7, skipped) ==="
+        exit 7
       fi
-    done
-    if kill -0 "$TARGET_PID" 2>/dev/null; then
-      echo "$(date '+%F %T') SIGKILL -> $TARGET_PID (graceful timeout)"
-      kill -KILL "$TARGET_PID" 2>/dev/null || true
-      sleep 1
+    else
+      require_app_admission
+      echo "$(date '+%F %T') SIGTERM -> $TARGET_PID"
+      kill -TERM "$TARGET_PID" 2>/dev/null || true
+      gone=0
+      for _ in 1 2 3 4 5 6 7 8; do
+        sleep 1
+        same_target
+        if [ $? -eq 1 ]; then
+          echo "$(date '+%F %T') target exited"
+          gone=1
+          break
+        fi
+      done
+      if [ "$gone" = "0" ]; then
+        same_target
+        st=$?
+        if [ "$st" -eq 0 ]; then
+          echo "$(date '+%F %T') SIGKILL -> $TARGET_PID (graceful timeout; identity re-checked)"
+          kill -KILL "$TARGET_PID" 2>/dev/null || true
+          sleep 1
+        elif [ "$st" -eq 1 ]; then
+          echo "$(date '+%F %T') target exited (its pid is gone or now names another process) - no SIGKILL"
+        else
+          echo "$(date '+%F %T') REFUSE could not read target $TARGET_PID's identity again right before SIGKILL - not signaled again, no new session launched"
+          exit 8
+        fi
+      fi
     fi
   fi
 
-  echo "$(date '+%F %T') opening Terminal -> $LAUNCHER $TARGET_CWD ${RESUME_ID:+resume=$RESUME_ID}"
+  if [ "$TARGET_PRESENT" = "1" ]; then
+    same_target
+    remaining=$?
+    if [ "$remaining" -ne 1 ]; then
+      echo "REFUSE old target is still present or unverifiable after shutdown; nothing launched"
+      exit 8
+    fi
+  fi
 
-  /usr/bin/osascript <<OSA
-tell application "Terminal"
-  activate
-  do script "$LAUNCHER $TARGET_CWD $RESUME_ID"
-end tell
+  # Re-discover immediately before every launch, including the initially absent
+  # target path. A replacement or a target that survived is never duplicated.
+  others=$(bot_sessions) || { echo "REFUSE current sessions could not be inspected; nothing launched"; exit 8; }
+  if [ -n "$others" ]; then
+    echo "$(date '+%F %T') SKIP $KEY has session pid(s) $others immediately before launch; nothing launched"
+    stale_target_notice
+    echo "=== done (exit=7, skipped) ==="
+    exit 7
+  fi
+
+  # The launcher command line, single-quoted for the new window's shell and handed
+  # to osascript as an argument: the arguments are never interpreted as shell or
+  # AppleScript text, whatever they hold.
+  LAUNCH_CMD="/usr/bin/env $(shq "FLEET_HOME=$FLEET_HOME") $(shq "FLEET_CONFIG=$FLEET_CONFIG") $(shq "$LAUNCHER") $(shq "$TARGET_CWD") $(shq "$RESUME_ID")"
+  echo "$(date '+%F %T') opening Terminal -> $LAUNCH_CMD"
+
+  # Everything the new session writes must be NEWER than this stamp, which is what
+  # makes the liveness check below immune to the previous poller's leftover files.
+  LAUNCH_EPOCH=$(date +%s)
+
+  /usr/bin/osascript - "$LAUNCH_CMD" <<'OSA'
+on run argv
+  tell application "Terminal"
+    activate
+    do script (item 1 of argv)
+  end tell
+end run
 OSA
   rc=$?
   echo "$(date '+%F %T') osascript exit=$rc"
 
-  # Wait for the freshly launched session to actually come up, then confirm it is
-  # back. The new session carries the '--channels plugin:telegram' signature; match
-  # on that + its cwd via lsof and exclude the just-killed pid. ps -axo (never
-  # pgrep -f, which on macOS omits the caller's own ancestor and could false-miss).
+  # Wait for the freshly launched session to come up. It carries the
+  # '--channels plugin:telegram' signature; match on that + its cwd via lsof and
+  # exclude the just-killed pid. ps -axo, never pgrep -f.
   NEW_PID=""
   for _ in $(seq 1 45); do
     sleep 1
-    # ps -axo + grep, deliberately not pgrep: macOS pgrep omits the caller's own
-    # ancestor, which would false-miss the session we just launched.
     # shellcheck disable=SC2009
     while read -r p _rest; do
       [ -z "$p" ] && continue
       [ "$p" = "$TARGET_PID" ] && continue
-      pcwd=$(lsof -a -p "$p" -d cwd 2>/dev/null | awk 'NR>1 {print $NF}')
+      pcwd=$(lsof -a -p "$p" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
       if [ "$pcwd" = "$TARGET_CWD" ]; then NEW_PID="$p"; break; fi
     done < <(ps -axo pid=,command= 2>/dev/null | grep -F -- "--channels plugin:telegram@claude-plugins-official" | grep -v grep)
     [ -n "$NEW_PID" ] && break
   done
 
+  # A claude pid is NOT proof of a working bot: a session can start fine and never
+  # load its telegram plugin, so it reads nothing and answers nothing. Real proof
+  # is the poller's own files, written after LAUNCH_EPOCH: bot.pid (written once at
+  # poller startup) naming a live process, and a heartbeat since the launch
+  # carrying a fresh epoch. Missing heartbeat never counts as confirmed ready.
+  POLLER_OK=0
+  POLLER_PID=""
+  WAITED=0
   if [ -n "$NEW_PID" ]; then
-    echo "$(date '+%F %T') new session up (pid=$NEW_PID)"
+    echo "$(date '+%F %T') new claude pid=$NEW_PID; waiting up to ${POLLER_WAIT}s for its poller"
+    for _ in $(seq 1 "$POLLER_WAIT"); do
+      sleep 1
+      WAITED=$(( WAITED + 1 ))
+      [ -f "$STATE_DIR/bot.pid" ] || continue
+      bp_mt=$(stat -f %m "$STATE_DIR/bot.pid" 2>/dev/null || echo 0)
+      [ "$bp_mt" -ge "$LAUNCH_EPOCH" ] || continue
+      bp=$(head -1 "$STATE_DIR/bot.pid" 2>/dev/null | tr -cd '0-9')
+      [ -n "$bp" ] || continue
+      kill -0 "$bp" 2>/dev/null || continue
+      kill -0 "$NEW_PID" 2>/dev/null || continue
+      [ -f "$STATE_DIR/poller.heartbeat" ] || continue
+      hb_mt=$(stat -f %m "$STATE_DIR/poller.heartbeat" 2>/dev/null || echo 0)
+      [ "$hb_mt" -ge "$LAUNCH_EPOCH" ] || continue
+      hb_ts=$(head -1 "$STATE_DIR/poller.heartbeat" 2>/dev/null | tr -cd '0-9')
+      [ -n "$hb_ts" ] || continue
+      [ "$hb_ts" -ge "$LAUNCH_EPOCH" ] || continue
+      now=$(date +%s)
+      [[ "$hb_ts" =~ ^[0-9]{1,12}$ ]] || continue
+      [ "$hb_ts" -le "$((now + 2))" ] || continue
+      [ "$((now - hb_ts))" -le 60 ] || continue
+      kill -0 "$NEW_PID" 2>/dev/null || continue
+      kill -0 "$bp" 2>/dev/null || continue
+      poller_belongs_to "$bp" "$NEW_PID" || continue
+      POLLER_OK=1
+      POLLER_PID="$bp"
+      break
+    done
+  fi
+
+  if [ "$POLLER_OK" = "1" ]; then
+    echo "$(date '+%F %T') poller live (pid=$POLLER_PID, waited ${WAITED}s)"
     if [ "$QUIET" = "quiet" ]; then
       echo "$(date '+%F %T') back-online ping suppressed (quiet mode; caller will notify)"
     else
-      sleep 4   # small buffer for the plugin to finish connecting
+      # The bot token is read only here, on the path that sends the ping: a quiet
+      # run - every watchdog restart - never opens the .env.
       BOT_TOKEN="$(token_of_state "$STATE_DIR")"
       CHAT_ID="$(chat_id_of_state "$STATE_DIR")"
       if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ]; then
@@ -178,58 +986,25 @@ OSA
           && echo "$(date '+%F %T') back-online ping sent" \
           || echo "$(date '+%F %T') back-online ping curl failed"
       else
-        echo "$(date '+%F %T') back-online ping skipped: no token/chat for $BOT_KEY"
+        echo "$(date '+%F %T') back-online ping skipped: no token/chat for $KEY"
       fi
     fi
+  elif [ -n "$NEW_PID" ]; then
+    echo "$(date '+%F %T') *** POLLER DID NOT COME UP within ${POLLER_WAIT}s (claude pid=$NEW_PID is running but its telegram poller is not) - NO ping sent, exiting 6 ***"
+    RC=6
   else
-    echo "$(date '+%F %T') new session not detected within timeout; back-online ping skipped"
+    echo "$(date '+%F %T') *** POLLER DID NOT COME UP within ${POLLER_WAIT}s (no new claude session was detected at all) - NO ping sent, exiting 6 ***"
+    RC=6
   fi
 
-  # Close the old, now-dead window strictly by its old controlling tty so a
-  # sibling bot window is never closed. The match is one TAB, and closing its
-  # window would also close every other tab in that window, which can hold a
-  # sibling bot. So the window is closed only when the matched tab is its only
-  # tab and no claude process still runs in it; otherwise it is left open and the
-  # reason is logged. Terminal cannot close a single tab by script.
-  if [[ "$OLD_TTY" =~ ^ttys[0-9]+$ ]]; then
-    sleep 2
-    echo "$(date '+%F %T') closing old window tty=/dev/$OLD_TTY"
-    close_result=$(/usr/bin/osascript 2>>"$LOG" <<OSA
-set wanted to "/dev/$OLD_TTY"
-tell application "Terminal"
-  set wid to missing value
-  set tabCount to 0
-  set hasClaude to false
-  repeat with w in windows
-    set tabList to tabs of w
-    repeat with t in tabList
-      set tabTTY to ""
-      try
-        set tabTTY to tty of t
-      end try
-      if tabTTY is wanted then
-        set wid to id of w
-        set tabCount to count of tabList
-        try
-          set hasClaude to ((processes of t) contains "claude")
-        end try
-        exit repeat
-      end if
-    end repeat
-    if wid is not missing value then exit repeat
-  end repeat
-  if wid is missing value then return "no tab on " & wanted & ", nothing to close"
-  if hasClaude then return "left window " & wid & " open: a claude process still runs in its tab on " & wanted
-  if tabCount is not 1 then return "left window " & wid & " open: the tab on " & wanted & " shares it with " & (tabCount - 1) & " other tab(s), and Terminal cannot close a single tab by script"
-  close (window id wid) saving no
-  return "closed window " & wid & " (its only tab was on " & wanted & ")"
-end tell
-OSA
-)
-    echo "$(date '+%F %T') old-window close: ${close_result:-osascript returned nothing}"
-  else
-    echo "$(date '+%F %T') skip old-window close: implausible tty '$OLD_TTY'"
-  fi
+  # Close the old, now-dead window, matched on the old controlling tty so a sibling
+  # bot window is never closed, and only on proof (close_old_window above): the
+  # tab is its window's only tab, everything still on that tty is the shell and
+  # login that hosted the old session, no claude runs there, and Terminal's own
+  # inspection succeeds. This runs even on the exit-6 path: the old session is
+  # dead either way. Terminal cannot close a single tab by script.
+  close_old_window
 
-  echo "=== done ==="
+  echo "=== done (exit=$RC) ==="
+  exit $RC
 } >> "$LOG" 2>&1

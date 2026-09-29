@@ -132,7 +132,14 @@ mix. The first three restart the session process; `/esc` does not.
 
 Rebooting the Mac: `/telegram-fleet:snapshot` before, `/telegram-fleet:restore`
 after login, and every bot comes back in its exact prior conversation. The
-watchdog also parks itself during a snapshot so it cannot fight the restore.
+watchdog also parks itself during a snapshot so it cannot fight the restore;
+`fleet-snapshot --keep-watchdog` takes the same snapshot without parking it, for
+a save point that is not a reboot. The restore archives the snapshot only once
+every bot is confirmed back (its session running, its own Telegram poller alive,
+and a fresh heartbeat from patch 03). Otherwise it keeps the snapshot and says
+which bots are still pending. Restore validates the entire snapshot before acting;
+invalid or empty snapshots stay available for correction. Both snapshot flags can
+be combined in either order.
 
 Honest wiring note: `/fresh`, `/resume`, and `/model` work out of the box via
 idle-path hooks, and gain mid-task handling with the optional patches. `/esc`,

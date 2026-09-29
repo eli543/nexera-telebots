@@ -156,6 +156,53 @@ enum PhoneServerTests {
         ]
         for raw in invalidRequests { check("unsafe HTTP rejected", parse(raw) == nil) }
 
+        // Owner verdicts: reads may reuse one for ten minutes, every action asks whois
+        // again. A fake whois and clock stand in for Tailscale; nothing live is called.
+        var whoisAnswer: Data? = json(whois)
+        var whoisCalls = 0
+        var clock: TimeInterval = 1_000
+        let owners = PhoneOwnerCheck(whois: { _ in whoisCalls += 1; return whoisAnswer }, clock: { clock })
+        check("first state read asks whois", owners.check(peerIP, identity: identity, mutation: false).allowed && whoisCalls == 1)
+        check("state read inside ten minutes uses the cache", owners.check(peerIP, identity: identity, mutation: false).allowed && whoisCalls == 1)
+        check("an action always asks whois", owners.check(peerIP, identity: identity, mutation: true).allowed && whoisCalls == 2)
+        check("the next action asks whois again", owners.check(peerIP, identity: identity, mutation: true).allowed && whoisCalls == 3)
+        whoisAnswer = json(["Node": goodNode, "UserProfile": ["ID": userID, "LoginName": "other@example.test"]])
+        clock += 60
+        check("state still cached after the owner was revoked", owners.check(peerIP, identity: identity, mutation: false).allowed && whoisCalls == 3)
+        check("a revoked owner is denied on the next action", !owners.check(peerIP, identity: identity, mutation: true).allowed && whoisCalls == 4)
+        check("that denial also replaces the cached state verdict", !owners.check(peerIP, identity: identity, mutation: false).allowed && whoisCalls == 4)
+        whoisAnswer = json(whois)
+        check("the owner back: the next action is allowed", owners.check(peerIP, identity: identity, mutation: true).allowed && whoisCalls == 5)
+        whoisAnswer = nil
+        check("a whois that did not complete denies the action", !owners.check(peerIP, identity: identity, mutation: true).allowed && whoisCalls == 6)
+        check("a failed action lookup leaves the state verdict cached", owners.check(peerIP, identity: identity, mutation: false).allowed && whoisCalls == 6)
+        clock += PhoneOwnerCheck.readCacheSeconds + 1
+        whoisAnswer = json(whois)
+        check("state asks whois again after ten minutes", owners.check(peerIP, identity: identity, mutation: false).allowed && whoisCalls == 7)
+        check("a non-tailnet source never reaches whois", !owners.check("127.0.0.1", identity: identity, mutation: true).allowed && whoisCalls == 7)
+        clock += 3
+        check("an action's verdict time is when whois answered", owners.check(peerIP, identity: identity, mutation: true).at == clock)
+        owners.clear()
+        check("a cleared cache asks whois for state again", owners.check(peerIP, identity: identity, mutation: false).allowed && whoisCalls == 9)
+
+        // Admissions: an action starts once, inside its owner check's window, while the
+        // link it was checked against is still current; otherwise it never runs.
+        let admitted = PhoneAdmission(verifiedAt: 100, stillAuthorized: { true })
+        check("an admission starts inside its window", admitted.start(now: 104.9))
+        check("an admission starts only once", !admitted.start(now: 104.95))
+        check("a started admission is not reported as never run", !admitted.expire())
+        let queued = PhoneAdmission(verifiedAt: 100, stillAuthorized: { true })
+        check("a queued admission expires after its window", !queued.start(now: 100 + PhoneAdmission.window + 0.1))
+        check("the expired admission reports it never ran", queued.expire())
+        let waiting = PhoneAdmission(verifiedAt: 100, stillAuthorized: { true })
+        check("the reply timeout expires a pending admission", waiting.expire())
+        check("an admission expired at the reply timeout never starts later", !waiting.start(now: 101))
+        var linkCurrent = true
+        let rotated = PhoneAdmission(verifiedAt: 100, stillAuthorized: { linkCurrent })
+        linkCurrent = false
+        check("an admission does not start after the token or identity changed", !rotated.start(now: 100.5))
+        check("an admission never starts before its check", !PhoneAdmission(verifiedAt: 100, stillAuthorized: { true }).start(now: 99))
+
         var gate = PhoneActionGate()
         check("fresh gate allows bot", gate.remaining(["one"], now: 0) == 0)
         gate.record(["one"], now: 100)
@@ -177,6 +224,16 @@ enum PhoneServerTests {
             check("unsafe action rejected", PhoneActionRequest.parse(json(object)) == nil)
         }
         check("malformed action rejected", PhoneActionRequest.parse(Data("{".utf8)) == nil)
+        check("skipped engine request is never success", ReconnectOutcome.skipped("engine exit 7").failureText?.hasPrefix("skipped:") == true)
+        // Offline owned children only: a shell exiting early must not detach its
+        // TERM-resistant child from the engine deadline or leave its group alive.
+        do {
+            var group: pid_t = 0
+            let result = try Subprocess.run("/bin/bash", ["-c", "(trap '' TERM; sleep 30) & exit 0"],
+                                            processGroup: true, deadline: 0.2, started: { group = $0 })
+            check("deadline covers child after shell exit", result.timedOut)
+            check("deadline removes whole engine group", group > 0 && kill(-group, 0) != 0 && errno == ESRCH)
+        } catch { check("engine group fixture launched", false) }
         for failure in failed { print("FAIL: \(failure)") }
         print("phone self-test: \(passed) passed, \(failed.count) failed; no live files or actions touched")
         return failed.isEmpty ? 0 : 1

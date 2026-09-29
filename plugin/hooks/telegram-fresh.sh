@@ -123,7 +123,7 @@ fi
 #   disown    - drop from the shell job table so the parent's exit does not wait
 # The child reparents to the init/launchd process once claude dies.
 if [ -x "$RESTART_ENGINE" ]; then
-  nohup "$RESTART_ENGINE" "$target_pid" "$workdir" </dev/null >>"$LOG" 2>&1 &
+  nohup "$RESTART_ENGINE" "$target_pid" "$workdir" fresh-reset </dev/null >>"$LOG" 2>&1 &
   disown 2>/dev/null || true
   log "restart spawned for $workdir (bg pid=$!)"
 else

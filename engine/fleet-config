@@ -20,7 +20,7 @@
 #   bot-by-workdir <dir> [field]      key (or field) of the bot whose workdir matches
 #   option <name>                     an options.<name> value (true/false/string)
 #   project-dir <key>                 full path to the bot's Claude Code project dir
-#   path                              the resolved config file path
+#   path                              the absolute resolved config file path
 #   validate                          exit 0 if the config is well-formed, else 1
 #
 # Python 3.9+, standard library only. No secrets are ever read or printed here;
@@ -54,11 +54,11 @@ def die(msg, code=1):
 def config_path():
     p = os.environ.get("FLEET_CONFIG")
     if p:
-        return os.path.expanduser(p)
+        return os.path.abspath(os.path.expanduser(p))
     home = os.environ.get("FLEET_HOME")
     if home:
-        return os.path.join(os.path.expanduser(home), "fleet.json")
-    return os.path.expanduser("~/.claude/telegram-fleet/fleet.json")
+        return os.path.abspath(os.path.join(os.path.expanduser(home), "fleet.json"))
+    return os.path.abspath(os.path.expanduser("~/.claude/telegram-fleet/fleet.json"))
 
 
 def load():
@@ -131,20 +131,34 @@ def validate(data):
         problems.append("bots must be a non-empty array")
         return problems
     seen = set()
+    path_owners = {field: {} for field in PATH_FIELDS}
     for i, bot in enumerate(bl):
         if not isinstance(bot, dict):
             problems.append("bot #%d is not an object" % (i + 1))
             continue
         key = bot.get("key", "")
-        if not KEY_RE.match(str(key)):
+        if not isinstance(key, str) or not KEY_RE.fullmatch(key):
             problems.append("bot #%d has an invalid key %r" % (i + 1, key))
         elif key in seen:
             problems.append("duplicate bot key %r" % key)
         else:
             seen.add(key)
         for req in ("workdir", "state_dir"):
-            if not bot.get(req):
+            value = bot.get(req)
+            if not isinstance(value, str) or not value:
                 problems.append("bot %r missing %s" % (key, req))
+                continue
+            path = norm_dir(value)
+            if not os.path.isabs(path) or any(ord(c) < 32 or ord(c) == 127 for c in path):
+                problems.append("bot %r has an invalid %s path" % (key, req))
+                continue
+            canonical = os.path.realpath(path)
+            if req == "workdir" and expand(value) != canonical:
+                problems.append("bot %r workdir must use its physical path %r, not %r; keep Claude transcript paths consistent" % (key, canonical, expand(value)))
+            if canonical in path_owners[req]:
+                problems.append("bots %r and %r share %s" % (path_owners[req][canonical], key, req))
+            else:
+                path_owners[req][canonical] = key
     return problems
 
 
@@ -156,9 +170,10 @@ def find_bot(data, key):
 
 
 def find_by_dir(data, field, wanted):
-    target = norm_dir(wanted)
+    target = os.path.realpath(norm_dir(wanted)) if field == "workdir" else norm_dir(wanted)
     for bot in bots(data):
-        if norm_dir(bot.get(field, "")) == target:
+        candidate = norm_dir(bot.get(field, ""))
+        if (os.path.realpath(candidate) if field == "workdir" else candidate) == target:
             return bot
     return None
 

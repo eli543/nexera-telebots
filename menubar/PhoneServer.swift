@@ -170,6 +170,109 @@ enum PhoneTailscale {
     static func run(_ arguments: [String], limit: Int) throws -> Subprocess.Result {
         try Subprocess.run(executable, arguments, environment: environment(), limit: limit, deadline: 4)
     }
+
+    /// `tailscale whois --json <address>`: its output, or nil when the command did not
+    /// complete (could not start, timed out, was interrupted or exited non-zero).
+    static func whois(_ source: String) -> Data? {
+        guard let result = try? run(["whois", "--json", source], limit: 65_536),
+              result.code == 0, !result.signaled, !result.timedOut else { return nil }
+        return Data(result.output.utf8)
+    }
+}
+
+/// Who may use the phone link, by source address. A read (the page, its manifest and
+/// icons, GET /api/state) may reuse a verdict for up to ten minutes. A mutation
+/// (POST /api/action) never does: it asks whois again every time, so a device that
+/// stopped being the owner's is refused on its very next action. A fresh verdict
+/// replaces the cached one only when the whois command completed, so a failed lookup
+/// refuses the action without also locking the owner out of the page.
+final class PhoneOwnerCheck: @unchecked Sendable {
+    typealias Whois = (String) -> Data?
+    static let readCacheSeconds: TimeInterval = 600
+    private struct Entry { let allowed: Bool; let owner: String; let expires: TimeInterval }
+    private let lock = NSLock()
+    private let slots = DispatchSemaphore(value: 2)
+    private let whois: Whois
+    private let clock: () -> TimeInterval
+    private var cache: [String: Entry] = [:]
+
+    init(whois: @escaping Whois = PhoneTailscale.whois,
+         clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        self.whois = whois
+        self.clock = clock
+    }
+
+    /// The verdict, and the moment it was established on `clock`: for a mutation, the
+    /// moment whois answered, which starts the window its admission may run in.
+    func check(_ source: String, identity: PhoneTailnetIdentity, mutation: Bool) -> (allowed: Bool, at: TimeInterval) {
+        guard PhoneSecurity.isTailnetIPv4(source) else { return (false, clock()) }
+        if !mutation {
+            lock.lock()
+            let cached = cache[source]
+            lock.unlock()
+            if let cached, cached.owner == identity.cacheIdentity, cached.expires > clock() { return (cached.allowed, clock()) }
+        }
+        guard slots.wait(timeout: .now() + 5) == .success else { return (false, clock()) }
+        let output = whois(source)
+        slots.signal()
+        let allowed = PhoneSecurity.sameOwner(source: source, whois: output, identity: identity)
+        let now = clock()
+        if !mutation || output != nil {
+            lock.lock()
+            if cache.count >= 256 { cache = cache.filter { $0.value.expires > now } }
+            if cache.count >= 256 { cache.removeAll() }
+            cache[source] = Entry(allowed: allowed, owner: identity.cacheIdentity, expires: now + Self.readCacheSeconds)
+            lock.unlock()
+        }
+        return (allowed, now)
+    }
+
+    func clear() {
+        lock.lock()
+        cache.removeAll()
+        lock.unlock()
+    }
+}
+
+/// One phone action admitted by a fresh owner check. It may start once: only within
+/// `window` seconds of that check (inside the eight-second reply wait) and only while
+/// the phone token and the Mac's identity are the ones that were checked. When the
+/// reply wait ends first, it expires, so a request that sat in a queue never runs late.
+final class PhoneAdmission: @unchecked Sendable {
+    static let window: TimeInterval = 5
+    private enum State { case pending, started, expired }
+    let verifiedAt: TimeInterval
+    private let stillAuthorized: () -> Bool
+    private let lock = NSLock()
+    private var state = State.pending
+
+    init(verifiedAt: TimeInterval, stillAuthorized: @escaping () -> Bool) {
+        self.verifiedAt = verifiedAt
+        self.stillAuthorized = stillAuthorized
+    }
+
+    /// Called as the action starts. True only for a pending admission inside its window
+    /// whose token and identity still hold; anything else expires it for good.
+    func start(now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard state == .pending else { return false }
+        if now >= verifiedAt, now - verifiedAt <= Self.window, stillAuthorized() {
+            state = .started
+            return true
+        }
+        state = .expired
+        return false
+    }
+
+    /// Called when the reply wait ends: a pending admission can no longer start.
+    /// True when the action never started.
+    func expire() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if state == .pending { state = .expired }
+        return state == .expired
+    }
 }
 
 enum PhoneTokenError: Error, LocalizedError {
@@ -321,17 +424,15 @@ final class PhoneServer {
     private let page: Data
     private let icons: [Int: Data]
     private let state: (@escaping (Data) -> Void) -> Void
-    private let action: (Data, @escaping (PhoneResponse) -> Void) -> Void
+    private let action: (Data, PhoneAdmission, @escaping (PhoneResponse) -> Void) -> Void
     private let status: (String, String?) -> Void
     private let queue = DispatchQueue(label: "com.nexera.telebots.phone")
     private let workers = DispatchQueue(label: "com.nexera.telebots.phone.requests", attributes: .concurrent)
     private let securityLock = NSLock()
-    private let whoisSlots = DispatchSemaphore(value: 2)
+    private let owners = PhoneOwnerCheck()
     private let tokenStore = PhoneTokenStore()
     private var token: String?
     private var identity: PhoneTailnetIdentity?
-    private struct PeerCache { let allowed: Bool; let owner: String; let expires: Date }
-    private var peerCache: [String: PeerCache] = [:]
     private var listener: DispatchSourceRead?
     private var listenAddress: String?
     private var connections: [Int32: UUID] = [:]
@@ -340,7 +441,7 @@ final class PhoneServer {
     private var lastStatus = ""
 
     init(page: Data, icons: [Int: Data], state: @escaping (@escaping (Data) -> Void) -> Void,
-         action: @escaping (Data, @escaping (PhoneResponse) -> Void) -> Void,
+         action: @escaping (Data, PhoneAdmission, @escaping (PhoneResponse) -> Void) -> Void,
          status: @escaping (String, String?) -> Void) {
         self.page = page; self.icons = icons; self.state = state; self.action = action; self.status = status
     }
@@ -444,7 +545,7 @@ final class PhoneServer {
         }
         securityLock.lock()
         let old = identity
-        if old != found { peerCache.removeAll() }
+        if old != found { owners.clear() }
         identity = found
         securityLock.unlock()
         if old?.cacheIdentity != found.cacheIdentity {
@@ -464,7 +565,7 @@ final class PhoneServer {
         listener?.cancel(); listener = nil; listenAddress = nil
         for fd in connections.keys { _ = shutdown(fd, SHUT_RDWR) }
         if clearIdentity {
-            securityLock.lock(); identity = nil; peerCache.removeAll(); securityLock.unlock()
+            securityLock.lock(); identity = nil; owners.clear(); securityLock.unlock()
         }
     }
 
@@ -554,23 +655,11 @@ final class PhoneServer {
         throw PhoneHTTPError.timedOut
     }
 
-    private func ownerAllows(_ source: String, identity: PhoneTailnetIdentity) -> Bool {
-        guard PhoneSecurity.isTailnetIPv4(source) else { return false }
+    /// The Mac's identity and the phone token are still the ones a request was checked against.
+    private func stillCurrent(identity own: PhoneTailnetIdentity, token expected: String) -> Bool {
         securityLock.lock()
-        let cached = peerCache[source]
-        securityLock.unlock()
-        if let cached, cached.owner == identity.cacheIdentity, cached.expires > Date() { return cached.allowed }
-        guard whoisSlots.wait(timeout: .now() + 5) == .success else { return false }
-        defer { whoisSlots.signal() }
-        let result = try? PhoneTailscale.run(["whois", "--json", source], limit: 65_536)
-        let output = result.flatMap { $0.code == 0 && !$0.signaled && !$0.timedOut ? Data($0.output.utf8) : nil }
-        let allowed = PhoneSecurity.sameOwner(source: source, whois: output, identity: identity)
-        securityLock.lock()
-        if peerCache.count >= 256 { peerCache = peerCache.filter { $0.value.expires > Date() } }
-        if peerCache.count >= 256 { peerCache.removeAll() }
-        peerCache[source] = PeerCache(allowed: allowed, owner: identity.cacheIdentity, expires: Date().addingTimeInterval(600))
-        securityLock.unlock()
-        return allowed
+        defer { securityLock.unlock() }
+        return identity == own && token == expected
     }
 
     private func denied(_ status: Int, _ reason: String, fd: Int32, source: String) {
@@ -590,8 +679,11 @@ final class PhoneServer {
         guard let own, let expected else {
             denied(403, "This device is not the Mac owner's Tailscale peer", fd: fd, source: source); return
         }
+        // An action asks whois afresh; everything else may use a verdict up to ten minutes old.
+        let mutation = request.method == "POST" && request.path == "/api/action"
+        let owner = owners.check(source, identity: own, mutation: mutation)
         let access = PhoneSecurity.accessStatus(method: request.method, path: request.path,
-            ownerVerified: ownerAllows(source, identity: own), authorization: request.headers["authorization"], expectedToken: expected)
+            ownerVerified: owner.allowed, authorization: request.headers["authorization"], expectedToken: expected)
         guard access != 403 else {
             denied(403, "This device is not the Mac owner's Tailscale peer", fd: fd, source: source); return
         }
@@ -604,6 +696,8 @@ final class PhoneServer {
                 denied(401, "Open the current phone link from Telebots Bar", fd: fd, source: source); return
             }
         }
+        // The bearer token and identity again, right after the owner check: a link
+        // rotated or an identity change while whois ran refuses the request.
         securityLock.lock()
         let stillAuthorized = identity == own && (ownerOnly || token == expected)
         securityLock.unlock()
@@ -620,7 +714,16 @@ final class PhoneServer {
         case ("GET", "/api/state"):
             response = waitForResponse { done in self.state { done(PhoneResponse(status: 200, body: $0)) } }
         case ("POST", "/api/action"):
-            response = waitForResponse { done in self.action(request.body, done) }
+            let admission = PhoneAdmission(verifiedAt: owner.at, stillAuthorized: { [weak self] in
+                self?.stillCurrent(identity: own, token: expected) ?? false
+            })
+            response = waitForResponse { done in
+                self.action(request.body, admission, done)
+            } timedOut: {
+                admission.expire()
+                    ? .json(503, ["error": "The app was busy, so the action did not run. Try again."])
+                    : .json(503, ["error": "The app is busy. Refresh to check progress."])
+            }
         default:
             denied(400, "Unknown route or method", fd: fd, source: source); return
         }
@@ -630,10 +733,11 @@ final class PhoneServer {
         send(response, to: fd)
     }
 
-    private func waitForResponse(_ work: (@escaping (PhoneResponse) -> Void) -> Void) -> PhoneResponse {
+    private func waitForResponse(_ work: (@escaping (PhoneResponse) -> Void) -> Void,
+                                 timedOut: () -> PhoneResponse = { .json(503, ["error": "The app is busy. Refresh to check progress."]) }) -> PhoneResponse {
         let result = PhoneReplyBox()
         work { result.finish($0) }
-        return result.wait() ?? .json(503, ["error": "The app is busy. Refresh to check progress."])
+        return result.wait() ?? timedOut()
     }
 
     private func send(_ response: PhoneResponse, to fd: Int32) {

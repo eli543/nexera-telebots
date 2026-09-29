@@ -60,7 +60,7 @@ ALERT_STATE="$(fc bot "$ALERT_KEY" state_dir 2>/dev/null || true)"
 LOCK="/tmp/nexera-telebots-watchdog-$(printf '%s' "$FLEET_HOME" | cksum | awk '{print $1}').lock"
 
 log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null || true; }
-say() { log "$*"; [ $DRY_RUN -eq 1 ] && printf '%s\n' "$*"; }
+say() { log "$*"; [ $DRY_RUN -eq 1 ] && printf '%s\n' "$*"; return 0; }
 
 token_of_state() {
   [ -f "$1/.env" ] || return 0
@@ -78,7 +78,7 @@ except Exception:
 PY
 }
 state_of_pid() {
-  ps eww -p "$1" 2>/dev/null | tr ' ' '\n' | grep -m1 '^TELEGRAM_STATE_DIR=' | cut -d= -f2-
+  ps eww -p "$1" 2>/dev/null | python3 -c 'import re,sys; m=re.search(r"(?:^| )TELEGRAM_STATE_DIR=(.*?)(?= [A-Za-z_][A-Za-z0-9_]*=|$)", sys.stdin.read().rstrip("\n")); print(m.group(1) if m else "")'
 }
 # first pid whose command matches $1 and whose state dir env matches $2
 first_pid_matching() {
@@ -122,7 +122,7 @@ restart_count_1h() {
 
 RESTART_RESULT=""
 restart_channel() {
-  local key="$1" sdir proj cwd sid latest b sage spid up=""
+  local key="$1" sdir proj cwd sid latest b sage spid
   sdir=$(fc bot "$key" state_dir)
   proj=$(fc project-dir "$key")
   cwd=$(fc bot "$key" workdir)
@@ -143,23 +143,15 @@ restart_channel() {
   spid=$(first_pid_matching "--channels plugin:telegram@claude-plugins-official" "$sdir")
   [ -z "$spid" ] && spid=999999
   log "RESTART $key via fleet-fresh (pid=$spid resume=${sid:-none})"
-  /bin/bash "$FRESH" "$spid" "$cwd" "$sid" quiet >/dev/null 2>&1
-
-  for _ in $(seq 1 40); do
-    sleep 1
-    [ -n "$(first_pid_matching "server.ts" "$sdir")" ] && { up=1; break; }
-  done
-  if [ -n "$up" ]; then
-    RESTART_RESULT=$([ -n "$sid" ] && echo "resumed" || echo "fresh")
-  else
-    log "  recovery did not come up; FRESH fallback"
-    spid=$(first_pid_matching "--channels plugin:telegram@claude-plugins-official" "$sdir")
-    [ -z "$spid" ] && spid=999999
-    /bin/bash "$FRESH" "$spid" "$cwd" "" quiet >/dev/null 2>&1
-    for _ in $(seq 1 40); do sleep 1; [ -n "$(first_pid_matching "server.ts" "$sdir")" ] && { up=1; break; }; done
-    RESTART_RESULT=$([ -n "$up" ] && echo "fresh-fallback" || echo "failed")
-  fi
-  log "  result: $RESTART_RESULT"
+  local engine_rc
+  /bin/bash "$FRESH" "$spid" "$cwd" "${sid:-fresh-keep}" quiet >/dev/null 2>&1
+  engine_rc=$?
+  case "$engine_rc" in
+    0) RESTART_RESULT=$([ -n "$sid" ] && echo resumed || echo fresh) ;;
+    7) RESTART_RESULT=skipped ;;
+    *) RESTART_RESULT=failed ;;
+  esac
+  log "  result: $RESTART_RESULT (engine exit $engine_rc)"
 }
 
 # Mode (b): a bot got a message but has written nothing since, for a long time.
@@ -280,14 +272,15 @@ for key in $(fc bots); do
   fi
 
   restart_channel "$key"
+  [ "$RESTART_RESULT" = skipped ] && continue  # No retry, cooldown or breaker entry.
   printf '%s\n' "$now" >> "$rl"
   printf '%s\n' "$now" > "$lr"
   rm -f "$us"
-  acted_n=$((acted_n+1))
+  [ "$RESTART_RESULT" != failed ] && acted_n=$((acted_n+1))
   # Reconnect chatter is intentionally silent (a blip that auto-recovers needs no
   # ping). Only a genuine "could not recover" alert is sent.
   case "$RESTART_RESULT" in
-    resumed|fresh|fresh-fallback) : ;;
+    resumed|fresh) : ;;
     failed)
       alert "My Telegram link dropped and the watchdog could not bring me back automatically. I need a manual hand: /mcp reconnect (keeps my conversation) or /fresh." "$botok" "$botcid" ;;
   esac

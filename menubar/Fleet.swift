@@ -19,8 +19,10 @@
 //     its session ran on, still held by exactly the shell that hosted it, as the
 //     window's only tab, with no claude process in it. Otherwise it is left open and
 //     the reason is logged;
-//   - the watchdog switch is the per-bot <key>.disabled file that the snapshot and
-//     restore engines create and remove.
+//   - the watchdog switch is the per-bot <key>.disabled file (the manual kill
+//     switch, which the snapshot engine also sets unless it runs --keep-watchdog);
+//     the watchdog's crash-loop breaker marker, <key>.disabled-auto, is shown
+//     separately and is only ever read, never created or removed.
 // Processes are read natively (sysctl KERN_PROCARGS2, the data `ps eww` prints);
 // nothing here shells out to the watchdog. A bot's token is read from
 // <state_dir>/.env only when an action sends that bot's chat line, and it is never
@@ -196,6 +198,8 @@ struct MenubarSettings {
     var freshStartArg: String
     var serve: Bool? = nil
     var freshEngineLog: String? = nil
+    /// Snapshot passes --keep-watchdog, so taking a snapshot preserves auto-recovery settings.
+    var snapshotKeepWatchdog: Bool = true
 }
 
 struct FleetConfig {
@@ -219,7 +223,7 @@ enum FleetModel {
     private static let menubarKeys: Set<String> = [
         "fresh_engine", "watchdog_state_dir", "watchdog_log", "heartbeat_max_age", "resume_source", "time_zone",
         "snapshot_engine", "restore_engine", "snapshot_file", "fresh_start_arg",
-        "serve", "fresh_engine_log",
+        "serve", "fresh_engine_log", "snapshot_keep_watchdog",
     ]
 
     static func loadConfig() -> ConfigLoad {
@@ -303,6 +307,13 @@ enum FleetModel {
                         settings.serve = n.boolValue
                     } else {
                         warnings.append("menubar.serve must be true or false; default kept")
+                    }
+                }
+                if let v = mb["snapshot_keep_watchdog"] {
+                    if let n = v as? NSNumber, CFGetTypeID(n) == CFBooleanGetTypeID() {
+                        settings.snapshotKeepWatchdog = n.boolValue
+                    } else {
+                        warnings.append("menubar.snapshot_keep_watchdog must be true or false; default kept (true: Snapshot preserves auto-recovery settings)")
                     }
                 }
                 if let v = mb["heartbeat_max_age"] {
@@ -912,8 +923,12 @@ enum Subprocess {
     }
 
     static func run(_ executable: String, _ arguments: [String], environment: [String: String]? = nil,
-                    input: Data? = nil, capture: Bool = true, limit: Int = 65_536,
+                    input: Data? = nil, capture: Bool = true, limit: Int = 65_536, processGroup: Bool = false,
                     deadline: TimeInterval, started: (pid_t) -> Void = { _ in }) throws -> Result {
+        if processGroup {
+            return try runGroup(executable, arguments, environment: environment, capture: capture,
+                                limit: limit, deadline: deadline, started: started)
+        }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -980,6 +995,89 @@ enum Subprocess {
         let signaled = ended && process.terminationReason == .uncaughtSignal
         return Result(code: code, signaled: signaled, timedOut: timedOut, output: tail.text)
     }
+
+    /// Engines and all their control children share a new process group. A shell
+    /// exiting early cannot spare a child from the deadline's TERM/KILL sequence.
+    private static func runGroup(_ executable: String, _ arguments: [String],
+                                 environment: [String: String]?, capture: Bool, limit: Int,
+                                 deadline: TimeInterval, started: (pid_t) -> Void) throws -> Result {
+        var attrs: posix_spawnattr_t?
+        var actions: posix_spawn_file_actions_t?
+        posix_spawnattr_init(&attrs)
+        posix_spawn_file_actions_init(&actions)
+        defer { posix_spawnattr_destroy(&attrs); posix_spawn_file_actions_destroy(&actions) }
+        posix_spawnattr_setflags(&attrs, Int16(POSIX_SPAWN_SETPGROUP))
+        posix_spawnattr_setpgroup(&attrs, 0)
+        let tail = OutputTail(limit: limit)
+        let output = Pipe()
+        let null = open("/dev/null", O_RDWR)
+        guard null >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        defer { close(null) }
+        let outFD = capture ? output.fileHandleForWriting.fileDescriptor : null
+        posix_spawn_file_actions_adddup2(&actions, null, STDIN_FILENO)
+        posix_spawn_file_actions_adddup2(&actions, outFD, STDOUT_FILENO)
+        posix_spawn_file_actions_adddup2(&actions, outFD, STDERR_FILENO)
+        posix_spawn_file_actions_addclose(&actions, output.fileHandleForReading.fileDescriptor)
+        posix_spawn_file_actions_addclose(&actions, output.fileHandleForWriting.fileDescriptor)
+        posix_spawn_file_actions_addchdir_np(&actions, "/")
+        var env = environment ?? ProcessInfo.processInfo.environment
+        env["CC_FLEET_MANAGED_GROUP"] = "1"
+        let argv = ([executable] + arguments).map { strdup($0) } + [nil]
+        let envp = env.map { strdup("\($0.key)=\($0.value)") } + [nil]
+        defer { argv.forEach { free($0) }; envp.forEach { free($0) } }
+        var pid: pid_t = 0
+        let rc = argv.withUnsafeBufferPointer { av in
+            envp.withUnsafeBufferPointer { ep in
+                posix_spawn(&pid, executable, &actions, &attrs, av.baseAddress!, ep.baseAddress!)
+            }
+        }
+        guard rc == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(rc)) }
+        try? output.fileHandleForWriting.close()
+        if capture {
+            output.fileHandleForReading.readabilityHandler = { handle in
+                let bytes = handle.availableData
+                if bytes.isEmpty { handle.readabilityHandler = nil; tail.finish() }
+                else { tail.append(bytes) }
+            }
+        }
+        started(pid)
+        var status: Int32 = 0
+        var ended = false
+        func reap() {
+            if !ended { ended = waitpid(pid, &status, WNOHANG) == pid }
+        }
+        let end = Date().addingTimeInterval(deadline)
+        func groupAlive() -> Bool { kill(-pid, 0) == 0 || errno == EPERM }
+        repeat {
+            reap()
+            if ended && !groupAlive() { break }
+            Thread.sleep(forTimeInterval: 0.05)
+        } while Date() < end
+        let timedOut = !ended || groupAlive()
+        if timedOut {
+            kill(-pid, SIGTERM)
+            let grace = Date().addingTimeInterval(5)
+            repeat {
+                reap()
+                if kill(-pid, 0) != 0 && errno == ESRCH { break }
+                Thread.sleep(forTimeInterval: 0.05)
+            } while Date() < grace
+            // Always address the group, even when its original shell has exited.
+            if kill(-pid, 0) == 0 || errno == EPERM { kill(-pid, SIGKILL) }
+            let killed = Date().addingTimeInterval(5)
+            repeat {
+                reap()
+                if kill(-pid, 0) != 0 && errno == ESRCH { break }
+                Thread.sleep(forTimeInterval: 0.05)
+            } while Date() < killed
+        }
+        if capture { tail.waitForEnd(ended ? 1 : 0) }
+        output.fileHandleForReading.readabilityHandler = nil
+        let signal = status & 0x7f
+        return Result(code: ended ? (signal == 0 ? (status >> 8) & 0xff : signal) : -1,
+                      signaled: ended && signal != 0, timedOut: timedOut, output: tail.text)
+    }
+
 }
 
 // MARK: - Terminal windows
@@ -1040,139 +1138,6 @@ enum WindowRecords {
             return false
         }
         return true
-    }
-}
-
-/// Closing a bot's old Terminal window, only ever by proof: its recorded tty, held
-/// by nothing but the shell that hosted the bot's old session, as its window's only
-/// tab, with no claude process in it. Never by position, never "the frontmost
-/// window". When the proof fails, the window stays open and the reason is logged.
-enum WindowCleanup {
-    /// The engines' own rule (claude-channels-fresh.sh and engine/fleet-fresh). The
-    /// tty arrives as an argument, never written into the script text.
-    static let closeScript = """
-    on run argv
-        set wanted to "/dev/" & (item 1 of argv)
-        tell application "Terminal"
-            set wid to missing value
-            set tabCount to 0
-            set hasClaude to false
-            repeat with w in windows
-                set tabList to tabs of w
-                repeat with t in tabList
-                    set tabTTY to ""
-                    try
-                        set tabTTY to tty of t
-                    end try
-                    if tabTTY is wanted then
-                        set wid to id of w
-                        set tabCount to count of tabList
-                        try
-                            set hasClaude to ((processes of t) contains "claude")
-                        end try
-                        exit repeat
-                    end if
-                end repeat
-                if wid is not missing value then exit repeat
-            end repeat
-            if wid is missing value then return "no tab on " & wanted & ", nothing to close"
-            if hasClaude then return "left window " & wid & " open: a claude process still runs in its tab on " & wanted
-            if tabCount is not 1 then return "left window " & wid & " open: the tab on " & wanted & " shares it with " & (tabCount - 1) & " other tab(s), and Terminal cannot close a single tab by script"
-            close (window id wid) saving no
-            return "closed window " & wid & " (its only tab was on " & wanted & ")"
-        end tell
-    end run
-    """
-
-    /// Read-only: is any tab still on that tty?
-    static let probeScript = """
-    on run argv
-        set wanted to "/dev/" & (item 1 of argv)
-        tell application "Terminal"
-            repeat with w in windows
-                repeat with t in tabs of w
-                    set tabTTY to ""
-                    try
-                        set tabTTY to tty of t
-                    end try
-                    if tabTTY is wanted then return "open in window " & (id of w)
-                end repeat
-            end repeat
-        end tell
-        return "none"
-    end run
-    """
-
-    static func runScript(_ script: String, _ tty: String) -> (ok: Bool, text: String) {
-        guard isTTYName(tty) else { return (false, "implausible tty '\(tty)'") }
-        do {
-            let result = try Subprocess.run("/usr/bin/osascript", ["-", tty], input: Data(script.utf8), deadline: 30)
-            let text = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
-            if result.timedOut { return (false, "osascript did not answer within 30s") }
-            if result.code != 0 || result.signaled { return (false, "osascript failed (\(result.code)): \(redactTokens(text))") }
-            return (true, text)
-        } catch {
-            return (false, "could not start osascript")
-        }
-    }
-
-    enum Verdict: Equatable {
-        case closed, gone, leftOpen
-    }
-
-    /// Closes the window a bot's old session ran in, when and only when it can be
-    /// proven to be that window. `note` receives one line saying what happened.
-    @discardableResult
-    static func closeOldWindow(_ record: WindowRecord, _ bot: Bot, dryRun: Bool, note: (String) -> Void) -> Verdict {
-        guard isTTYName(record.tty) else {
-            note("old window: left alone, the recorded tty '\(record.tty)' is not a Terminal tty")
-            return .leftOpen
-        }
-        var st = stat()
-        let device: dev_t? = stat("/dev/" + record.tty, &st) == 0 ? st.st_rdev : nil
-        let running = device.map { ProcessTable.basicsOnly().processes(onTTY: $0) } ?? []
-        if running.isEmpty {
-            // Nothing runs on that tty: the window is closed, or its tab has ended.
-            let probe = runScript(probeScript, record.tty)
-            if probe.ok && probe.text == "none" {
-                note("old window: \(bot.name)'s tab on \(record.tty) is closed")
-                return .gone
-            }
-            if !probe.ok {
-                note("old window: could not check \(record.tty) (\(probe.text)), so it was left as it is")
-                return .leftOpen
-            }
-            note("old window: left \(record.tty) open (\(probe.text)): nothing runs in it any more, so it cannot be proven to be \(bot.name)'s")
-            return .leftOpen
-        }
-        let strangers = running.filter { process in
-            !record.hosts.contains { $0.pid == process.pid && abs($0.started - process.started) < 0.01 }
-        }
-        if !strangers.isEmpty {
-            let names = strangers.prefix(4).map { "\($0.name) \($0.pid)" }.joined(separator: ", ")
-            note("old window: left \(record.tty) open, it runs \(names) now, not only the shell that hosted \(bot.name)'s old session (\(record.hostList))")
-            return .leftOpen
-        }
-        let hosts = running.map { "\($0.name) \($0.pid)" }.joined(separator: ", ")
-        if dryRun {
-            note("old window: would close \(bot.name)'s window on \(record.tty), where only the shell that hosted its old session runs (\(hosts)), if it is that window's only tab")
-            return .leftOpen
-        }
-        let result = runScript(closeScript, record.tty)
-        guard result.ok else {
-            note("old window: could not close \(record.tty) (\(result.text))")
-            return .leftOpen
-        }
-        if result.text.hasPrefix("closed") {
-            note("old window: \(result.text); it held only \(hosts)")
-            return .closed
-        }
-        if result.text.hasPrefix("no tab") {
-            note("old window: \(bot.name)'s tab on \(record.tty) is closed")
-            return .gone
-        }
-        note("old window: \(result.text)")
-        return .leftOpen
     }
 }
 
@@ -1386,6 +1351,7 @@ enum ReconnectOutcome {
     case noEngine(String)
     case permissionBlocked(AutomationStatus)
     case engineRefused(Int32, String)
+    case skipped(String)
     case engineTimedOut(Int)
     case connected
     case stillDown(BotState)
@@ -1395,6 +1361,7 @@ enum ReconnectOutcome {
     var failureText: String? {
         switch self {
         case .healedBeforeRun, .dryRun, .connected: return nil
+        case .skipped(let why): return "skipped: \(why); this request was not applied"
         case .changedBeforeRun(let why): return "did not run: \(why)"
         case .noEngine(let note): return "did not run: \(note)"
         case .permissionBlocked(let status): return "did not run: Terminal automation is \(status.text)"
@@ -1484,17 +1451,6 @@ extension FleetModel {
         return nil
     }
 
-    /// The window this restart should leave closed: the live session's own tab, or,
-    /// for a session that is already down, the tab recorded while it ran.
-    static func windowToClean(_ health: BotHealth, _ table: ProcessTable) -> (record: WindowRecord?, source: String) {
-        if let pid = health.sessionPIDs.first {
-            if let record = table.windowRecord(session: pid) { return (record, "its session's own tab") }
-            return (nil, "its session \(pid) has no Terminal tab")
-        }
-        if let record = WindowRecords.load()[health.bot.key] { return (record, "recorded while its last session ran") }
-        return (nil, "no window was recorded for its last session")
-    }
-
     /// Whether this app may drive Terminal (the engines open the new bot window with
     /// osascript). askUser false never shows a dialog.
     static func terminalAutomation(askUser: Bool) -> AutomationStatus {
@@ -1549,16 +1505,19 @@ extension FleetModel {
 
     /// One reconnect or fresh start, start to finish, the way /fresh does it: the
     /// bot's first line in its chat, the engine (which sends "Back and ready" and
-    /// closes the old window), then the app closes a window only it knows about.
+    /// owns old-window cleanup). Unproven or already-orphaned windows stay open.
     /// Runs off the main thread. Never restarts a connected bot unless the caller
     /// confirmed it, and re-checks everything right before the engine runs.
     static func performReconnect(_ bot: Bot, _ config: FleetConfig, allowConnected: Bool, dryRun: Bool,
-                                 askForPermission: Bool, freshStart: Bool = false,
+                                 askForPermission: Bool, freshStart: Bool = false, expected: BotHealth? = nil,
                                  log: (String) -> Void) -> ReconnectOutcome {
         let action = freshStart ? "fresh start" : "reconnect"
         let spoken = freshStart ? "Fresh start" : "Reconnect"
         let table0 = ProcessTable.snapshot()
         let health0 = evaluateOne(bot, config, table: table0)
+        if let expected, (expected.sessionPIDs != health0.sessionPIDs || expected.sessionStarted != health0.sessionStarted) {
+            return .changedBeforeRun("the PID/start identity changed after confirmation or while queued")
+        }
         if health0.state == .connected && !allowConnected && !dryRun {
             log("\(action) \(bot.key): connected again before the restart ran, nothing to do")
             return .healedBeforeRun
@@ -1585,16 +1544,7 @@ extension FleetModel {
             log("[DRY-RUN] \(action) \(bot.key): would run: \(plan0.commandLine)")
             log("[DRY-RUN]   resume \(plan0.resumeArg.isEmpty ? "\"\" (empty)" : plan0.resumeArg) (from \(plan0.resumeNote)); PATH=\(FleetPaths.enginePATH)")
             log("[DRY-RUN]   the engine then sends \"\(BotChat.backAndReady)\" from \(bot.name) once the new poller is up")
-            let window = windowToClean(health0, table0)
-            if let record = window.record {
-                if health0.sessionPIDs.isEmpty {
-                    WindowCleanup.closeOldWindow(record, bot, dryRun: true, note: { log("[DRY-RUN]   \($0)") })
-                } else {
-                    log("[DRY-RUN]   old window: \(bot.name)'s tab on \(record.tty) (hosted by \(record.hostList)); the engine closes it when it is its window's only tab with no claude left in it, and the app checks it is gone")
-                }
-            } else {
-                log("[DRY-RUN]   old window: \(window.source), so none would be closed")
-            }
+            log("[DRY-RUN]   old-window cleanup belongs only to the engine; unproven windows stay open")
             return .dryRun(plan0)
         }
 
@@ -1622,7 +1572,9 @@ extension FleetModel {
         if pidBefore != pidNow {
             change = "its session changed from \(pidBefore.map { String($0) } ?? "none") to \(pidNow.map { String($0) } ?? "none") while waiting"
         } else if let pid = pidNow {
-            if let s0 = health0.sessionStarted, let s1 = health1.sessionStarted, abs(s0 - s1) > 0.01 {
+            if health0.sessionStarted == nil || health1.sessionStarted == nil {
+                change = "the session start time cannot be verified"
+            } else if let s0 = health0.sessionStarted, let s1 = health1.sessionStarted, abs(s0 - s1) > 0.01 {
                 change = "pid \(pid) now belongs to a different process"
             } else if !(table1.argv(of: pid)?.joined(separator: " ").contains(ProcessTable.sessionSignature) ?? false) {
                 change = "pid \(pid) no longer carries the session signature"
@@ -1641,7 +1593,6 @@ extension FleetModel {
             log("\(action) \(bot.key): refused before anything ran, \(problem)")
             return .engineRefused(-2, problem)
         }
-        let window = windowToClean(health1, table1)
 
         // Like /fresh: the bot first says, in its own chat, that a restart is coming.
         let first = BotChat.send(bot, BotChat.line(spoken))
@@ -1649,6 +1600,25 @@ extension FleetModel {
             ? "said in its chat \"\(BotChat.line(spoken))\" (\(first.detail))"
             : "chat line not sent: \(first.detail)"))
 
+        // The network request can outlast recovery. Recheck health and the confirmed
+        // identity after it, then bind this admission to the engine's locked check.
+        let health2 = evaluateOne(bot, config)
+        if health2.state == .connected && !allowConnected {
+            log("\(action) \(bot.key): connected during the chat request; restart skipped")
+            return .healedBeforeRun
+        }
+        guard health2.sessionPIDs == health1.sessionPIDs,
+              health2.sessionStarted == health1.sessionStarted else {
+            return .changedBeforeRun("the session identity changed during the chat request")
+        }
+        if !health2.sessionPIDs.isEmpty && health2.sessionStarted == nil {
+            return .changedBeforeRun("the session start time cannot be verified")
+        }
+        var admission = engineEnvironment()
+        admission["CC_FRESH_EXPECT_PID"] = plan.targetPID
+        admission["CC_FRESH_EXPECT_START"] = health2.sessionStarted.map { String(Int($0)) } ?? "absent"
+        admission["CC_FRESH_ALLOW_CONNECTED"] = allowConnected ? "1" : "0"
+        admission["CC_FRESH_HEARTBEAT_MAX_AGE"] = String(config.settings.heartbeatMaxAge)
         log("\(action) \(describe(health1)): running \(plan.commandLine) (resume from \(plan.resumeNote))")
         let deadline = engineDeadline(300)
         let engineLogOffset: UInt64? = config.settings.freshEngineLog.flatMap { path in
@@ -1658,7 +1628,7 @@ extension FleetModel {
         }
         let result: Subprocess.Result
         do {
-            result = try Subprocess.run("/bin/bash", plan.arguments, environment: engineEnvironment(), capture: false,
+            result = try Subprocess.run("/bin/bash", plan.arguments, environment: admission, capture: false, processGroup: true,
                                         deadline: deadline, started: { log("\(action) \(bot.key): engine started as pid \($0)") })
         } catch {
             log("\(action) \(bot.key): could not start /bin/bash (\(error.localizedDescription))")
@@ -1667,7 +1637,7 @@ extension FleetModel {
             return .engineRefused(-1, "could not start the engine")
         }
         if result.timedOut {
-            log("\(action) \(bot.key): the engine ran past \(Int(deadline))s and was stopped (exit \(result.code)); its restart lock clears itself within 3 minutes")
+            log("\(action) \(bot.key): the engine ran past \(Int(deadline))s and was stopped (exit \(result.code)); its entire engine process group was stopped; a later engine invocation reclaims a departed owner's lock after checking its PID, start time and process group")
             return .engineTimedOut(Int(deadline))
         }
         let code = result.code
@@ -1678,16 +1648,8 @@ extension FleetModel {
                 ?? "Back and ready could not be verified in the engine log"))
         }
 
-        // The engine closes a live session's window itself (the app then checks it is
-        // gone); a session that was already down left a window only the app knows of.
-        if !result.signaled && (code == 0 || code == 6) {
-            if let record = window.record {
-                WindowCleanup.closeOldWindow(record, bot, dryRun: false, note: { log("\(action) \(bot.key): \($0)") })
-            } else {
-                log("\(action) \(bot.key): old window: \(window.source), so none was closed")
-            }
-        }
-        guard !result.signaled, [0, 6, 7].contains(code) else { return .engineRefused(code, meaning) }
+        if code == 7 && !result.signaled { return .skipped(meaning) }
+        guard !result.signaled, [0, 6].contains(code) else { return .engineRefused(code, meaning) }
 
         // The shipped engine returns as soon as the window opens; wait for the poller.
         let wait = Date().addingTimeInterval(45)
@@ -1731,17 +1693,29 @@ extension FleetModel {
         action == .snapshot ? config.settings.snapshotEngine : config.settings.restoreEngine
     }
 
-    static func engineCommandLine(_ action: FleetEngineAction, _ config: FleetConfig) -> String {
-        ["/bin/bash", enginePath(action, config)].map(shellQuote).joined(separator: " ")
+    /// The engine and its arguments, for /bin/bash. Snapshot adds --keep-watchdog
+    /// unless menubar.snapshot_keep_watchdog is false, so a snapshot from the panel,
+    /// the phone or the command line never switches auto-recovery off.
+    static func engineArguments(_ action: FleetEngineAction, _ config: FleetConfig) -> [String] {
+        let path = enginePath(action, config)
+        if action == .snapshot && config.settings.snapshotKeepWatchdog { return [path, "--keep-watchdog"] }
+        return [path]
     }
 
-    /// What a real run does, in one line, for the dry-run log and the tooltips.
+    static func engineCommandLine(_ action: FleetEngineAction, _ config: FleetConfig) -> String {
+        (["/bin/bash"] + engineArguments(action, config)).map(shellQuote).joined(separator: " ")
+    }
+
+    /// What a real run does, in one line, for the dry-run log.
     static func engineEffect(_ action: FleetEngineAction, _ config: FleetConfig) -> String {
         switch action {
         case .snapshot:
-            return "records every bot's current session in \(config.settings.snapshotFile) and pauses auto-recovery (a <key>.disabled file for each bot not already off) until Restore; it kills and launches nothing"
+            if config.settings.snapshotKeepWatchdog {
+                return "records every bot's current session in \(config.settings.snapshotFile) and keeps your auto-recovery settings as they are (--keep-watchdog: bots already off or paused stay that way); it kills and launches nothing"
+            }
+            return "records every bot's current session in \(config.settings.snapshotFile) and switches auto-recovery off (a <key>.disabled file for each bot not already off) until Restore switches it on again, because menubar.snapshot_keep_watchdog is false; it kills and launches nothing"
         case .restore:
-            return "reopens every bot that is not running, resumed into its saved session in a new Terminal window, skips bots that are running, then turns auto-recovery back on and archives the snapshot"
+            return "reopens every bot that is not running, resumed into its saved session in a new Terminal window, also restarts a running session whose poller is missing; it switches on again only the watchdog switches a snapshot itself switched off (a --keep-watchdog snapshot switches none off), and archives the snapshot once every bot it reopened is back"
         }
     }
 
@@ -1772,8 +1746,8 @@ extension FleetModel {
         let deadline = engineDeadline(action == .snapshot ? 120 : 300)
         let result: Subprocess.Result
         do {
-            result = try Subprocess.run("/bin/bash", [path], environment: engineEnvironment(), capture: true,
-                                        deadline: deadline)
+            result = try Subprocess.run("/bin/bash", engineArguments(action, config), environment: engineEnvironment(),
+                                        capture: true, processGroup: true, deadline: deadline)
         } catch {
             log("\(action.rawValue): could not start /bin/bash (\(error.localizedDescription))")
             return nil
@@ -1798,22 +1772,18 @@ extension FleetModel {
         let now0 = Int(Date().timeIntervalSince1970)
         let trust0 = heartbeatTrust(config, now: now0, probe: nil)
         let down = config.bots.filter {
-            evaluate($0, table: table0, now: now0, maxAge: config.settings.heartbeatMaxAge, trust: trust0).state == .down
+            let state = evaluate($0, table: table0, now: now0, maxAge: config.settings.heartbeatMaxAge, trust: trust0).state
+            return state == .down || state == .noPoller
         }
-        let records = WindowRecords.load()
         var report = RestoreReport(wasDown: down.map(\.key))
         if dryRun {
             report.run = runFleetEngine(.restore, config, dryRun: true, log: log)
             if down.isEmpty {
-                log("[DRY-RUN]   no bot is down right now, so a real run would reopen nothing and send nothing")
+                log("[DRY-RUN]   no bot is down or missing its poller right now, so a real run would reopen nothing and send nothing")
             }
             for bot in down {
                 log("[DRY-RUN]   \(bot.name) is down: it would first say \"\(BotChat.line("Restore"))\" (\(BotChat.readiness(bot))), then \"\(BotChat.backAndReady)\" once its poller is up")
-                if let record = records[bot.key] {
-                    WindowCleanup.closeOldWindow(record, bot, dryRun: true, note: { log("[DRY-RUN]   \($0)") })
-                } else {
-                    log("[DRY-RUN]   \(bot.name): no window was recorded for its last session, so none would be closed")
-                }
+
             }
             return report
         }
@@ -1863,11 +1833,7 @@ extension FleetModel {
                 log("restore \(bot.key): connected (\(describe(health))); " + (sent.ok
                     ? "said \"\(BotChat.backAndReady)\" (\(sent.detail))"
                     : "back-online line not sent: \(sent.detail)"))
-                if let record = records[bot.key] {
-                    WindowCleanup.closeOldWindow(record, bot, dryRun: false, note: { log("restore \(bot.key): \($0)") })
-                } else {
-                    log("restore \(bot.key): old window: no window was recorded for its last session, so none was closed")
-                }
+
             }
             pending = still
         }
@@ -1881,24 +1847,40 @@ extension FleetModel {
 
 // MARK: - Watchdog kill switches
 
+/// The watchdog's own crash-loop breaker for one bot: <key>.disabled-auto. The live
+/// watchdog writes it after too many restarts in an hour (its first line the epoch,
+/// its second when and why), skips that bot until the file is removed, and reminds
+/// every 6 hours meanwhile. It is not the manual switch, and this app never removes it.
+struct AutoBreaker: Equatable {
+    let bot: Bot
+    let path: String
+    let since: TimeInterval?     // the first line as an epoch, else (a marker made by hand) its mtime
+    let reason: String?          // "5 restarts in the last hour (limit 4)", from line 2
+}
+
 struct WatchdogSwitches {
     let dir: String
     let dirExists: Bool
     let disabled: [Bot]      // bots whose <key>.disabled is a regular file, the watchdog's own -f test
     let odd: [String]        // marker paths that exist but are not regular files; the watchdog ignores them
     let total: Int
+    var autoPaused: [AutoBreaker] = []   // bots whose <key>.disabled-auto is a regular file
 
     /// With no state folder nothing can say whether auto-recovery runs, so the switch
     /// is unavailable rather than on.
     var available: Bool { dirExists }
+    /// The manual switch alone: the crash-loop breaker is not a switch the app flips.
     var isOn: Bool { available && disabled.isEmpty }
     var isFullyOff: Bool { available && total > 0 && disabled.count == total }
+    /// Bots the breaker paused that the manual switch has not already turned off.
+    var pausedOnly: [AutoBreaker] { autoPaused.filter { breaker in !disabled.contains { $0.key == breaker.bot.key } } }
 
     var label: String {
         if !available { return "Watchdog: unavailable (no state folder)" }
-        if isOn { return "Watchdog: on" }
+        let paused = pausedOnly.isEmpty ? "" : ", auto-recovery paused for " + pausedOnly.map(\.bot.name).joined(separator: ", ")
+        if isOn { return "Watchdog: on" + paused }
         if isFullyOff { return "Watchdog: off" }
-        return "Watchdog: off for " + disabled.map(\.name).joined(separator: ", ")
+        return "Watchdog: off for " + disabled.map(\.name).joined(separator: ", ") + paused
     }
 }
 
@@ -1914,6 +1896,7 @@ extension FleetModel {
         let exists = isDirectory(dir)
         var disabled: [Bot] = []
         var odd: [String] = []
+        var paused: [AutoBreaker] = []
         if exists {
             for bot in config.bots {
                 let file = dir + "/" + bot.key + ".disabled"
@@ -1922,9 +1905,44 @@ extension FleetModel {
                 } else if somethingAt(file) {
                     odd.append(file)
                 }
+                let auto = dir + "/" + bot.key + ".disabled-auto"
+                if isRegularFile(auto) {
+                    paused.append(readAutoBreaker(bot, path: auto))
+                } else if somethingAt(auto) {
+                    odd.append(auto)
+                }
             }
         }
-        return WatchdogSwitches(dir: dir, dirExists: exists, disabled: disabled, odd: odd, total: config.bots.count)
+        return WatchdogSwitches(dir: dir, dirExists: exists, disabled: disabled, odd: odd, total: config.bots.count,
+                                autoPaused: paused)
+    }
+
+    /// The breaker's own record, read the way the watchdog reads it: line 1 the epoch
+    /// it tripped (a marker made by hand has none, so its mtime), line 2 when and why.
+    static func readAutoBreaker(_ bot: Bot, path: String) -> AutoBreaker {
+        var since: TimeInterval?
+        var reason: String?
+        if let handle = FileHandle(forReadingAtPath: path), let data = try? handle.read(upToCount: 1024) {
+            try? handle.close()
+            let lines = String(decoding: data, as: UTF8.self)
+                .split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            if let first = lines.first?.trimmingCharacters(in: .whitespaces), !first.isEmpty,
+               first.allSatisfy({ $0 >= "0" && $0 <= "9" }), let epoch = Int(first), epoch > 1_000_000_000 {
+                since = TimeInterval(epoch)
+            }
+            if lines.count > 1 {
+                // "2026-09-29 13:05:00 crash-loop breaker: 5 restarts in the last hour (limit 4)"
+                // reads "5 restarts in the last hour (limit 4)": its local date stamp and
+                // label dropped, control characters removed, at most 160 characters.
+                var text = lines[1].trimmingCharacters(in: .whitespaces)
+                if let range = text.range(of: "crash-loop breaker:") {
+                    text = String(text[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+                }
+                text = String(String.UnicodeScalarView(text.unicodeScalars.filter { $0.value >= 32 && $0.value != 127 }).prefix(160))
+                if !text.isEmpty { reason = text }
+            }
+        }
+        return AutoBreaker(bot: bot, path: path, since: since ?? modificationTime(path), reason: reason)
     }
 
     /// Off: create <key>.disabled for every bot that lacks one (what the snapshot

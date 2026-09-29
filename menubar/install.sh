@@ -1,13 +1,14 @@
 #!/bin/bash
 # install.sh - build Telebots Bar and keep it in the menu bar for good.
 #
-# 1. builds and verifies the new app in the staging folder (build.sh --no-install);
-#    nothing installed is touched yet
+# 1. builds and verifies the new app in the staging folder (build.sh, which only
+#    stages); nothing installed is touched yet
 # 2. stops the running copy: unloads the LaunchAgent, then stops a copy started by
 #    hand by its exact pid, only if that pid is this user's Telebots Bar executable,
 #    and waits until it is really gone (if it will not stop, nothing is replaced)
-# 3. swaps the new app into ~/Applications (build.sh --swap-only): the old one is
-#    moved aside and kept for a rollback, the new one renamed into place
+# 3. swaps the new app into ~/Applications (build.sh --swap, which refuses while
+#    any copy still runs): the old one is moved aside to .build.noindex/previous and
+#    kept for a rollback (README.md has the steps), the new one renamed into place
 # 4. writes ~/Library/LaunchAgents/com.claude-fleet.menubar.plist: RunAtLoad, so it
 #    starts at every login, and KeepAlive on a crash (SuccessfulExit false), so it
 #    comes back if it dies but Quit in the panel still quits it. The agent passes
@@ -52,7 +53,7 @@ running_copies() {
   for pid in $(pgrep -x -u "$UID_NUM" "$APP_NAME" 2>/dev/null || true); do
     cmd="$(ps -o command= -p "$pid" 2>/dev/null || true)"
     case "$cmd" in
-      "$EXE"*) echo "$pid" ;;
+      "$EXE"|"$EXE "*) echo "$pid" ;;
     esac
   done
 }
@@ -129,12 +130,12 @@ launchd_pid() {
 
 if [ "$DRY_RUN" = "1" ]; then
   echo "install.sh --dry-run: nothing is built, stopped, written or loaded."
-  echo "1. would run $HERE/build.sh --no-install (build and verify in $HERE/.build.noindex)"
+  echo "1. would run $HERE/build.sh (build and verify in $HERE/.build.noindex/staged)"
   echo "2. would unload gui/$UID_NUM/$LABEL if loaded, stop a running $APP_NAME whose executable is $EXE, and wait until it is gone"
   if [ -n "$(running_copies)" ]; then
     echo "   running now: pid $(running_copies | tr '\n' ' ')"
   fi
-  echo "3. would run $HERE/build.sh --swap-only (the old app kept in $HERE/.build.noindex/previous)"
+  echo "3. would run $HERE/build.sh --swap (the old app kept in $HERE/.build.noindex/previous)"
   echo "4. would write $PLIST:"
   render_plist
   echo "5. would run: launchctl bootstrap gui/$UID_NUM $PLIST"
@@ -142,50 +143,86 @@ if [ "$DRY_RUN" = "1" ]; then
   exit 0
 fi
 
-"$HERE/build.sh" --no-install
+# No installed bytes change before the build and rollback backup are complete.
+"$HERE/build.sh"
+PREVIOUS="$HERE/.build.noindex/previous-install"
+WAS_LOADED=0
+JOB_STATE="$(python3 "$HERE/app-lock.py" --job-state)"
+if [ "$JOB_STATE" = loaded ]; then
+  WAS_LOADED=1
+  [ -f "$PLIST" ] && [ -d "$APP" ] || { echo "install.sh: cannot preserve the loaded service's bundle and plist; nothing stopped." >&2; exit 1; }
+fi
+if [ -f "$PLIST" ]; then python3 "$HERE/app-lock.py" --plist-command "$PLIST" "$EXE" >/dev/null; fi
+rm -rf "$PREVIOUS"
+mkdir -p "$PREVIOUS"
+[ ! -e "$APP" ] || ditto "$APP" "$PREVIOUS/$APP_NAME.app"
+[ ! -f "$PLIST" ] || cp -p "$PLIST" "$PREVIOUS/agent.plist"
+printf '%s\n' "$WAS_LOADED" > "$PREVIOUS/was-loaded"
+touch "$PREVIOUS/complete"
+TRANSACTION=1
+SUCCESS=0
+
+verify_service() {
+  local pid cmd copies expected holder_check=--verify-holder
+  [ "${2:-}" != rollback ] || holder_check=--verify-rollback-holder
+  expected="$(python3 "$HERE/app-lock.py" --plist-command "${1:-$PLIST}" "$EXE")" || return 1
+  for _ in $(seq 1 30); do
+    pid="$(launchd_pid || true)"
+    if [ -n "$pid" ]; then
+      cmd="$(ps -o command= -p "$pid" 2>/dev/null || true)"
+      copies="$(running_copies)"
+      if [ "$cmd" = "$expected" ] && [ "$copies" = "$pid" ] && python3 "$HERE/app-lock.py" "$holder_check" "$pid" >/dev/null 2>&1; then
+        echo "Telebots Bar verified under launchd (pid $pid)."
+        return 0
+      fi
+    fi
+    sleep 0.5
+  done
+  echo "install.sh: the service did not pass PID, start-time and instance-lock verification." >&2
+  return 1
+}
+
+rollback_install() {
+  local rc="$1" restored=0
+  trap - EXIT INT TERM
+  [ "$TRANSACTION" = 1 ] && [ "$SUCCESS" = 0 ] || exit "$rc"
+  echo "install.sh: installation failed; restoring the previous app and LaunchAgent plist." >&2
+  launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true
+  # Run in a subshell so a stop failure does not bypass the final failure message.
+  if (stop_running_copies); then
+    if python3 "$HERE/app-lock.py" python3 "$HERE/app-lock.py" --restore-files "$PREVIOUS" "$APP" "$PLIST"; then
+      restored=1
+    fi
+  fi
+  if [ "$restored" = 1 ]; then
+    if [ "$WAS_LOADED" = 1 ]; then
+      if launchctl bootstrap "gui/$UID_NUM" "$PLIST" && verify_service "$PREVIOUS/agent.plist" rollback; then
+        echo "install.sh: previous bundle and plist restored; previous service restarted. Installation failed." >&2
+      else
+        echo "install.sh: previous files restored, but restarting the previous service failed. Installation failed; see $LOG_HOME/menubar.stdout.log." >&2
+      fi
+    else
+      echo "install.sh: previous bundle and plist restored; the service remains unloaded as before. Installation failed." >&2
+    fi
+  else
+    echo "install.sh: automatic rollback could not finish; the previous bundle and plist remain in $PREVIOUS. Installation failed." >&2
+  fi
+  exit 1
+}
+trap 'rollback_install $?' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true
 stop_running_copies
-
-"$HERE/build.sh" --swap-only
-
+"$HERE/build.sh" --swap
 mkdir -p "$HOME/Library/LaunchAgents" "$LOG_HOME"
 render_plist > "$PLIST.tmp"
 plutil -lint "$PLIST.tmp" >/dev/null
 mv "$PLIST.tmp" "$PLIST"
-
 launchctl bootstrap "gui/$UID_NUM" "$PLIST"
-
-pid=""
-for _ in $(seq 1 20); do
-  pid="$(launchd_pid)"
-  [ -n "$pid" ] && break
-  sleep 0.5
-done
-if [ -z "$pid" ]; then
-  echo "install.sh: the agent loaded but launchd reports no running pid for $LABEL; see $LOG_HOME/menubar.stdout.log" >&2
-  exit 1
-fi
-cmd="$(ps -o command= -p "$pid" 2>/dev/null || true)"
-case "$cmd" in
-  "$EXE --launchd --serve") ;;
-  *) echo "install.sh: launchd's pid $pid runs '$cmd', not $EXE --launchd --serve" >&2; exit 1 ;;
-esac
-holder=""
-for _ in $(seq 1 20); do
-  holder="$(head -1 "$LOCK" 2>/dev/null || true)"
-  [ "$holder" = "$pid launchd" ] && break
-  sleep 0.5
-done
-if [ "$holder" != "$pid launchd" ]; then
-  echo "install.sh: pid $pid is running but does not hold the single-copy lock ($LOCK says '${holder:-nothing}')" >&2
-  exit 1
-fi
-copies="$(running_copies)"
-if [ "$copies" != "$pid" ]; then
-  echo "install.sh: expected only launchd pid $pid, found: $copies" >&2
-  exit 1
-fi
-echo "Telebots Bar is running under launchd (pid $pid, $EXE) and will start at every login."
+verify_service
+SUCCESS=1
+printf 'Telebots Bar installed. Previous bundle and plist retained in %s\n' "$PREVIOUS"
 echo "agent: $PLIST"
-echo "log:   $LOG_HOME/menubar.log"
+echo "log: $LOG_HOME/menubar.log"

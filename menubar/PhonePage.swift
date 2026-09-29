@@ -120,6 +120,8 @@ h1 { margin: 0 0 3px; font-size: 14px; line-height: 1.2; font-weight: 750; lette
 .reconnect { flex: 0 0 auto; min-width: 92px; }
 .detail, .row-note { margin: 0 0 0 16px; font-size: 12px; line-height: 1.5; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .row-note { margin-top: 4px; }
+.auto-paused { font-weight: 650; }
+.auto-note { flex: 1 0 100%; margin: 0; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 .row-note.error { color: var(--red); font-weight: 600; }
 .expanded { margin: 9px 0 0 16px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
 .uptime { margin: 0; font-size: 12px; line-height: 1.5; font-variant-numeric: tabular-nums; }
@@ -191,7 +193,8 @@ dialog p { font-size: 14px; line-height: 1.55; margin: 0 0 20px; }
       <dt>ctx</dt><dd>Context window used by this conversation.</dd>
       <dt>restarts/h</dt><dd>Watchdog restarts in the last hour.</dd>
       <dt>stall</dt><dd>A message waited 10+ minutes while the bot was idle.</dd>
-      <dt>Snapshot</dt><dd>Saves the fleet's conversations and pauses auto-recovery until Restore.</dd>
+      <dt>paused</dt><dd>Auto-recovery paused: the watchdog stopped restarting that bot after too many restarts in an hour. Tap the row for details.</dd>
+      <dt>Snapshot</dt><dd id="legend-snapshot">Saves every bot's current conversation so Restore can bring each one back later. Snapshot keeps your auto-recovery settings as they are. Bots already off or paused stay that way.</dd>
     </dl>
   </aside>
   <section id="rows" class="rows glass" aria-label="Bots"></section>
@@ -381,6 +384,7 @@ dialog p { font-size: 14px; line-height: 1.55; margin: 0 0 20px; }
     const note = node('p', 'row-note');
     const extra = node('div', 'expanded');
     extra.id = 'details-' + nextRowID++;
+    const autoNote = node('p', 'auto-note');
     const uptime = node('p', 'uptime');
     const fresh = node('button', 'capsule fresh', 'Fresh start');
     fresh.type = 'button';
@@ -388,13 +392,13 @@ dialog p { font-size: 14px; line-height: 1.55; margin: 0 0 20px; }
       const current = state.bots.find(item => item.key === bot.key);
       if (current) confirm('fresh', current, fresh);
     });
-    extra.append(uptime, fresh);
+    extra.append(autoNote, uptime, fresh);
     row.append(top, detail, note, extra);
     row.addEventListener('click', event => {
       if (!event.target.closest('button')) toggleRow(bot.key);
     });
     toggle.setAttribute('aria-controls', extra.id);
-    return { row, toggle, dot, name, status, reconnect, detail, note, extra, uptime, fresh };
+    return { row, toggle, dot, name, status, reconnect, detail, note, extra, autoNote, uptime, fresh };
   }
 
   function updateRow(view, bot) {
@@ -405,7 +409,7 @@ dialog p { font-size: 14px; line-height: 1.55; margin: 0 0 20px; }
     view.name.textContent = bot.name;
     view.dot.classList.toggle('down', !bot.connected);
     view.toggle.setAttribute('aria-expanded', String(open));
-    view.toggle.setAttribute('aria-label', bot.name + ', ' + (busy ? 'reconnecting' : bot.status_text) + '. ' + (open ? 'Hide' : 'Show') + ' details');
+    view.toggle.setAttribute('aria-label', bot.name + ', ' + (busy ? 'reconnecting' : bot.status_text) + (bot.auto_paused ? ', auto-recovery paused' : '') + '. ' + (open ? 'Hide' : 'Show') + ' details');
     view.reconnect.disabled = busy || fleetBusy || !!state.problem;
     view.reconnect.setAttribute('aria-label', 'Reconnect ' + bot.name);
     view.fresh.disabled = busy || fleetBusy || !!state.problem;
@@ -419,8 +423,20 @@ dialog p { font-size: 14px; line-height: 1.55; margin: 0 0 20px; }
       if (bot.connected && bot.heartbeat_age_seconds !== null) view.status.append(icon('pulse'));
       view.status.append(document.createTextNode(bot.status_text || 'Unknown'));
     }
-    view.detail.textContent = (bot.detail_line || '') + (bot.stall ? ' · stall suspected' : '');
+    // The watchdog's crash-loop breaker: a quiet marker on the detail line, and its
+    // explanation in the expanded row (a phone has no hover for a tooltip).
+    const detailText = (bot.detail_line || '') + (bot.stall ? ' · stall suspected' : '');
+    view.detail.replaceChildren();
+    if (detailText) view.detail.append(document.createTextNode(detailText));
+    if (bot.auto_paused) {
+      if (detailText) view.detail.append(document.createTextNode(' · '));
+      const marker = node('span', 'auto-paused', 'auto-recovery paused');
+      marker.title = bot.auto_paused_tip || 'Auto-recovery paused by the watchdog\'s crash-loop breaker.';
+      view.detail.append(marker);
+    }
     view.detail.hidden = !view.detail.textContent;
+    view.autoNote.textContent = bot.auto_paused ? (bot.auto_paused_tip || 'Auto-recovery paused by the watchdog\'s crash-loop breaker.') : '';
+    view.autoNote.hidden = !view.autoNote.textContent;
     view.note.textContent = bot.note || bot.last_error || '';
     view.note.classList.toggle('error', !!bot.last_error);
     view.note.hidden = !view.note.textContent;
@@ -437,7 +453,7 @@ dialog p { font-size: 14px; line-height: 1.55; margin: 0 0 20px; }
 
   function snapshotLine(snapshot) {
     if (!snapshot.present) return '';
-    if (snapshot.tip && snapshot.tip.startsWith('Snapshot saved')) return snapshot.tip.split('. Restore')[0];
+    if (snapshot.line) return snapshot.line;
     let time = 'time unknown';
     if (typeof snapshot.time === 'number') {
       time = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', weekday: 'long', hour: 'numeric', minute: '2-digit', hour12: true })
@@ -452,6 +468,7 @@ dialog p { font-size: 14px; line-height: 1.55; margin: 0 0 20px; }
     app.hidden = false;
     $('summary').textContent = state.summary || '';
     setText('header-problem', state.header_problem);
+    $('header-problem').title = state.header_problem_tip || '';
     mark(state.bots);
     const rows = $('rows');
     if (state.problem) {
@@ -480,13 +497,15 @@ dialog p { font-size: 14px; line-height: 1.55; margin: 0 0 20px; }
     $('reconnect-all').disabled = !!state.problem || snapshotBusy || restoreBusy || localPending.has('reconnect_all_down') || !down.some(bot => !bot.in_flight && !localPending.has(bot.key));
     const watchdog = state.watchdog;
     $('watchdog-caption').textContent = watchdog.caption;
-    $('watchdog-caption').classList.toggle('alert', watchdog.state !== 'on');
+    $('watchdog-caption').classList.toggle('alert', watchdog.state !== 'on' || watchdog.alert === true);
     $('watchdog').setAttribute('aria-checked', String(watchdog.state === 'on'));
     $('watchdog').disabled = watchdog.state === 'unavailable' || botBusy || snapshotBusy || restoreBusy || localPending.has('watchdog_on') || localPending.has('watchdog_off') || !!state.problem;
     labeledButton('snapshot', 'Snapshot', 'camera', snapshotBusy);
     labeledButton('restore', 'Restore', 'restore', restoreBusy);
     $('snapshot').disabled = snapshotBusy || restoreBusy || botBusy || !!state.problem;
-    $('snapshot').title = 'Save every bot\'s conversation. Auto-recovery pauses until Restore.';
+    const snapshotHelp = state.snapshot.button_tip || 'Save every bot\'s current conversation so Restore can bring each one back later. Snapshot keeps your auto-recovery settings as they are. Bots already off or paused stay that way.';
+    $('snapshot').title = snapshotHelp;
+    $('legend-snapshot').textContent = snapshotHelp;
     $('restore').disabled = !state.snapshot.present || snapshotBusy || restoreBusy || botBusy || !!state.problem;
     $('restore').title = state.snapshot.tip || 'No snapshot saved';
     setText('footer-note', localError || state.footer_note);

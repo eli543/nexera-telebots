@@ -107,7 +107,7 @@ enum MenuMark: Equatable {
 
     var meaning: String {
         switch self {
-        case .watchdogOff: return "Auto-recovery is off: the watchdog will not restart a bot that drops"
+        case .watchdogOff: return "Auto-recovery is off or paused for a bot: the watchdog will not restart that bot if it drops"
         case .telegramDown: return "Telegram is unreachable from this Mac: bots cannot hear or reply until the network is back"
         }
     }
@@ -275,6 +275,9 @@ struct FleetRow: Identifiable, Equatable {
     var restartsLastHour: Int = 0
     var sessionStarted: TimeInterval? = nil
     var launchMode: String = "not running"
+    /// The watchdog's crash-loop breaker (<key>.disabled-auto) paused this bot.
+    var autoPaused: Bool = false
+    var autoTip: String? = nil
     var connected: Bool { state == .connected }
 }
 
@@ -285,6 +288,18 @@ struct HeaderStatus: Equatable {
     var watchdogAvailable: Bool = true
     var lastPassAge: Int?             // seconds since the watchdog's last pass
     var telegramReachable: Bool?      // nil when unknown
+    var autoPausedFor: [String] = []  // names the crash-loop breaker paused, switch still on for them
+}
+
+/// Button help shared by the panel and the phone page, so both say the same thing.
+enum PanelCopy {
+    static let restoreHelp = "Reopen every bot that is not running, resumed into its saved conversation. Bots that are running are left alone."
+
+    /// menubar.snapshot_keep_watchdog decides whether Snapshot leaves auto-recovery on.
+    static func snapshotHelp(keepsWatchdog: Bool) -> String {
+        "Save every bot's current conversation so Restore can bring each one back later. "
+            + (keepsWatchdog ? "Snapshot keeps your auto-recovery settings as they are. Bots already off or paused stay that way." : "Auto-recovery switches off until Restore, because menubar.snapshot_keep_watchdog is false.")
+    }
 }
 
 /// A line under a row (or under the bottom group) that stays until it no longer
@@ -307,6 +322,7 @@ struct RefreshResult {
     var marks: [MenuMark] = []
     var snapshotAvailable = false
     var snapshotTip = "No snapshot saved"
+    var snapshotLine: String?
     var reachable: Bool?
     var windowNote: String?
     var signals: FleetSignals?
@@ -394,19 +410,32 @@ final class RefreshWorker: @unchecked Sendable {
         }
         let switches = FleetModel.readWatchdog(cfg)
         result.watchdog = switches
+        for breaker in switches.autoPaused {
+            guard let i = result.rows.firstIndex(where: { $0.id == breaker.bot.key }) else { continue }
+            result.rows[i].autoPaused = true
+            result.rows[i].autoTip = autoTip(breaker)
+        }
         let status = HeaderStatus(watchdogOffFor: switches.disabled.map(\.name), watchdogTotal: cfg.bots.count,
                                   watchdogAvailable: switches.available,
                                   lastPassAge: signals.lastPass.map { max(0, now - Int($0)) },
-                                  telegramReachable: reachable)
+                                  telegramReachable: reachable,
+                                  autoPausedFor: switches.pausedOnly.map(\.bot.name))
         result.header = status
-        if !status.watchdogOffFor.isEmpty || !status.watchdogAvailable || (status.lastPassAge ?? 0) > 180 {
+        // One shield for every way the watchdog is not restarting a bot: a manual
+        // switch, its own crash-loop breaker, no state folder, or no recent pass.
+        if !status.watchdogOffFor.isEmpty || !switches.autoPaused.isEmpty || !status.watchdogAvailable
+            || (status.lastPassAge ?? 0) > 180 {
             result.marks.append(.watchdogOff)
         }
         if status.telegramReachable == false { result.marks.append(.telegramDown) }
         result.snapshotAvailable = signals.snapshotExists
-        result.snapshotTip = signals.snapshotExists
-            ? "Snapshot saved · \(signals.snapshotSessions) sessions · \(signals.snapshotSaved.map { clockTime($0) + " ET" } ?? "time unknown"). Restore reopens each bot that is not running in its saved conversation and turns auto-recovery back on."
-            : "No snapshot saved"
+        if signals.snapshotExists {
+            let line = "Snapshot saved · \(signals.snapshotSessions) sessions · \(signals.snapshotSaved.map { clockTime($0) + " ET" } ?? "time unknown")"
+            result.snapshotLine = line
+            result.snapshotTip = line + ". " + PanelCopy.restoreHelp
+        } else {
+            result.snapshotTip = "No snapshot saved"
+        }
         if recordWindows { result.windowNote = recordWindowsIfChanged(healths, table) }
         return result
     }
@@ -473,6 +502,19 @@ final class RefreshWorker: @unchecked Sendable {
 
     func clockTime(_ epoch: TimeInterval) -> String {
         timeOfDay.string(from: Date(timeIntervalSince1970: epoch))
+    }
+
+    /// The row marker's tooltip, from the breaker's own record, in the words of the
+    /// watchdog's header: it stops restarting a bot that keeps dropping, messages
+    /// instead, and reminds every 6 hours until its marker is removed.
+    private func autoTip(_ breaker: AutoBreaker) -> String {
+        let name = breaker.bot.name
+        let file = (breaker.path as NSString).lastPathComponent
+        let since = breaker.since.map { " since \(clockTime($0)) ET" } ?? ""
+        let why = breaker.reason.map {
+            "the watchdog restarted \(name) too often (\($0)), so its crash-loop breaker stopped restarting it and messaged you instead"
+        } ?? "the watchdog's crash-loop breaker marker is set for \(name), so the watchdog skips it and does not restart it"
+        return "Auto-recovery paused\(since): \(why). It stays paused until \(file) is removed from the watchdog's state folder, and the watchdog reminds you every 6 hours while its manual Watchdog switch is on. A manual disable suppresses those reminders. Reconnect still restarts \(name) by hand. The Watchdog switch does not change this."
     }
 
     private func uptime(_ seconds: Int) -> String {
@@ -576,6 +618,7 @@ final class FleetStore: ObservableObject {
     @Published var showLegend = false
     @Published private(set) var snapshotAvailable = false
     @Published private(set) var snapshotTip = "No snapshot saved"
+    @Published private(set) var snapshotLine: String?
     @Published private(set) var snapshotBusy = false
     @Published private(set) var restoreBusy = false
     @Published private(set) var confirmation: String?
@@ -637,12 +680,25 @@ final class FleetStore: ObservableObject {
         default: return nil
         }
     }
+    /// The switch's own state, plus the bots the watchdog's crash-loop breaker paused
+    /// while the switch is on for them (the switch cannot clear that marker).
     var watchdogCaption: String {
         guard let w = watchdog else { return "Unavailable" }
         if !w.available { return "Unavailable: no watchdog state folder" }
-        if w.isOn { return "Auto-recovery on" }
+        let paused = w.pausedOnly.isEmpty ? "" : " · paused for " + w.pausedOnly.map(\.bot.name).joined(separator: ", ")
+        if w.isOn { return "Auto-recovery on" + paused }
         if w.isFullyOff { return "Auto-recovery off" }
-        return "Auto-recovery off for " + w.disabled.map(\.name).joined(separator: ", ")
+        return "Auto-recovery off for " + w.disabled.map(\.name).joined(separator: ", ") + paused
+    }
+
+    /// Whether anything keeps the watchdog from restarting a bot: the caption turns red.
+    var watchdogAlert: Bool {
+        guard let w = watchdog else { return false }
+        return !w.isOn || !w.pausedOnly.isEmpty
+    }
+
+    var snapshotButtonTip: String {
+        PanelCopy.snapshotHelp(keepsWatchdog: config?.settings.snapshotKeepWatchdog ?? true)
     }
 
     /// The one short red header line, only when self-healing or Telegram is broken.
@@ -653,13 +709,42 @@ final class FleetStore: ObservableObject {
             parts.append("Auto-recovery unavailable")
         } else if let age = h.lastPassAge, age > 180 {
             parts.append("Watchdog not running")
-        } else if !h.watchdogOffFor.isEmpty {
-            parts.append(h.watchdogOffFor.count >= h.watchdogTotal
-                         ? "Auto-recovery off"
-                         : "Auto-recovery off for " + h.watchdogOffFor.joined(separator: ", "))
+        } else {
+            if !h.watchdogOffFor.isEmpty {
+                parts.append(h.watchdogOffFor.count >= h.watchdogTotal
+                             ? "Auto-recovery off"
+                             : "Auto-recovery off for " + h.watchdogOffFor.joined(separator: ", "))
+            }
+            if !h.autoPausedFor.isEmpty && h.watchdogOffFor.count < h.watchdogTotal {
+                parts.append((h.watchdogOffFor.isEmpty ? "Auto-recovery paused for " : "paused for ")
+                             + h.autoPausedFor.joined(separator: ", "))
+            }
         }
         if h.telegramReachable == false { parts.append("Telegram unreachable") }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// The header line's tooltip: one plain sentence for each part it shows.
+    var headerProblemTip: String {
+        guard let h = header else { return "" }
+        var tips: [String] = []
+        if !h.watchdogAvailable {
+            tips.append("There is no watchdog state folder, so nothing can say whether the watchdog restarts dropped bots.")
+        } else if let age = h.lastPassAge, age > 180 {
+            tips.append("The watchdog has not checked the bots for \(RefreshWorker.spokenAge(age)), so it is not restarting dropped bots (the Mac was asleep, or the watchdog is stopped).")
+        } else {
+            if !h.watchdogOffFor.isEmpty {
+                tips.append("The watchdog is not restarting dropped bots while Auto-recovery is off. Turn it back on with the switch below.")
+            }
+            if !h.autoPausedFor.isEmpty && h.watchdogOffFor.count < h.watchdogTotal {
+                tips.append("The watchdog's crash-loop breaker paused auto-recovery for " + h.autoPausedFor.joined(separator: ", ")
+                            + " after too many restarts in an hour; the row says since when. It stays paused until its marker is removed, and the switch does not change it.")
+            }
+        }
+        if h.telegramReachable == false {
+            tips.append("Telegram's API does not answer from this Mac, so no bot can hear or reply. Nothing is restarted for a network outage.")
+        }
+        return tips.joined(separator: " ")
     }
 
     private func log(_ message: String) {
@@ -790,6 +875,7 @@ final class FleetStore: ObservableObject {
         marks = result.marks
         snapshotAvailable = result.snapshotAvailable
         snapshotTip = result.snapshotTip
+        snapshotLine = result.snapshotLine
         latestSignals = result.signals
         if let note = result.windowNote { log(note) }
         if let odd = result.watchdog?.odd, !odd.isEmpty, didFirstRefresh == false {
@@ -881,9 +967,15 @@ final class FleetStore: ObservableObject {
                 self.phoneStateWaiters.append(reply)
                 self.refresh()
             }
-        }, action: { [weak self] body, reply in
+        }, action: { [weak self] body, admission, reply in
             Task { @MainActor in
                 guard let self else { return reply(Self.phoneResponse(503, error: "App is stopping")) }
+                // Admitted by a fresh owner check: it runs only if it starts within that
+                // check's window and the phone link is still the one checked.
+                guard admission.start() else {
+                    ActionLog.shared.writePhone("phone action not run: it waited past its \(Int(PhoneAdmission.window))s owner check, or the phone link changed, before it could start")
+                    return reply(Self.phoneResponse(503, error: "The app was busy, so the action did not run. Try again."))
+                }
                 reply(self.phoneAction(body))
             }
         }, status: { [weak self] text, url in
@@ -931,16 +1023,20 @@ final class FleetStore: ObservableObject {
                     "uptime_seconds": nullable(row.sessionStarted.map { max(0, Int(now - $0)) }),
                     "launch_mode": row.launchMode, "last_error": nullable(note?.isError == true ? note?.text : nil),
                     "note": nullable(note.map { noteText($0) }), "detail_line": row.detailLine,
-                    "uptime_line": nullable(row.uptimeLine), "status_text": row.statusText, "status_tip": row.statusTip]
+                    "uptime_line": nullable(row.uptimeLine), "status_text": row.statusText, "status_tip": row.statusTip,
+                    "auto_paused": row.autoPaused, "auto_paused_tip": nullable(row.autoTip)]
         }
         let object: [String: Any] = [
-            "server_time": now, "summary": summary, "header_problem": nullable(headerProblem), "problem": nullable(problem),
+            "server_time": now, "summary": summary, "header_problem": nullable(headerProblem),
+            "header_problem_tip": nullable(headerProblem == nil ? nil : headerProblemTip), "problem": nullable(problem),
             "bots": bots,
             "watchdog": ["state": watchdog?.available != true ? "unavailable" : watchdog?.isOn == true ? "on" : "off",
-                         "last_pass_age_seconds": nullable(header?.lastPassAge), "caption": watchdogCaption],
+                         "last_pass_age_seconds": nullable(header?.lastPassAge), "caption": watchdogCaption,
+                         "alert": watchdogAlert, "auto_paused": watchdog?.autoPaused.map(\.bot.key) ?? []],
             "telegram_reachable": nullable(header?.telegramReachable),
             "snapshot": ["present": snapshotAvailable, "time": nullable(latestSignals?.snapshotSaved),
-                         "sessions": latestSignals?.snapshotSessions ?? 0, "tip": snapshotTip, "busy": snapshotBusy],
+                         "sessions": latestSignals?.snapshotSessions ?? 0, "tip": snapshotTip, "busy": snapshotBusy,
+                         "line": nullable(snapshotLine), "button_tip": snapshotButtonTip],
             "restore_busy": restoreBusy, "confirmation": nullable(confirmation),
             "footer_note": nullable(footerNote.map { noteText($0) }), "actions": phoneActions,
         ]
@@ -1062,7 +1158,7 @@ final class FleetStore: ObservableObject {
                     }
                     confirmed = true
                 }
-                self.startReconnect(bot, cfg, allowConnected: confirmed, freshStart: false, origin: "Reconnect \(bot.name)")
+                self.startReconnect(bot, cfg, allowConnected: confirmed, freshStart: false, origin: "Reconnect \(bot.name)", expected: health)
             }
         }
     }
@@ -1074,6 +1170,7 @@ final class FleetStore: ObservableObject {
         NSApp.activate()
         let alert = NSAlert()
         alert.alertStyle = .warning
+        let expected = FleetModel.evaluateOne(bot, cfg)
         alert.messageText = "Start \(bot.name) fresh?"
         alert.informativeText = "This ends \(bot.name)'s current conversation and starts a new, empty one (the /fresh path). Reconnect keeps the conversation instead."
         alert.addButton(withTitle: "Cancel")
@@ -1084,7 +1181,7 @@ final class FleetStore: ObservableObject {
         }
         inFlight.insert(key)
         notes[key] = nil
-        startReconnect(bot, cfg, allowConnected: true, freshStart: true, origin: "Fresh start \(bot.name)")
+        startReconnect(bot, cfg, allowConnected: true, freshStart: true, origin: "Fresh start \(bot.name)", expected: expected)
     }
 
     func reconnectAllDown() {
@@ -1101,7 +1198,7 @@ final class FleetStore: ObservableObject {
         }
     }
 
-    private func startReconnect(_ bot: Bot, _ cfg: FleetConfig, allowConnected: Bool, freshStart: Bool, origin: String, phone: Bool = false) {
+    private func startReconnect(_ bot: Bot, _ cfg: FleetConfig, allowConnected: Bool, freshStart: Bool, origin: String, phone: Bool = false, expected: BotHealth? = nil) {
         let remaining = actionGate.remaining([bot.key])
         guard remaining == 0 else {
             inFlight.remove(bot.key)
@@ -1114,9 +1211,10 @@ final class FleetStore: ObservableObject {
         inFlight.insert(bot.key)
         let dryRun = mode == .dryRun
         log("\(origin): queued \(bot.key)\(allowConnected && !freshStart ? " (confirmed restart of a connected bot)" : "")")
+        let admission = expected ?? FleetModel.evaluateOne(bot, cfg)
         reconnectQueue.async { [weak self] in
             let outcome = FleetModel.performReconnect(bot, cfg, allowConnected: allowConnected, dryRun: dryRun,
-                                                      askForPermission: !phone, freshStart: freshStart,
+                                                      askForPermission: !phone, freshStart: freshStart, expected: admission,
                                                       log: { if phone { ActionLog.shared.writePhone($0) } else { ActionLog.shared.write($0) } })
             Task { @MainActor in self?.finishReconnect(bot, outcome, freshStart: freshStart, phone: phone) }
         }
@@ -1134,6 +1232,10 @@ final class FleetStore: ObservableObject {
                 try? await Task.sleep(for: .seconds(2.5))
                 self?.succeeded.remove(bot.key)
             }
+        case .skipped:
+            succeeded.remove(bot.key)
+            notes[bot.key] = RowNote(text: "\(freshStart ? "Fresh start" : "Reconnect") \(outcome.failureText ?? "skipped")",
+                                     isError: false, at: now, session: session)
         case .healedBeforeRun:
             notes[bot.key] = RowNote(text: "Connected again before the restart ran, so nothing was restarted",
                                      isError: false, at: now, session: session)
@@ -1305,7 +1407,7 @@ final class FleetStore: ObservableObject {
 
     func dumpText() -> String {
         var out: [String] = []
-        let markText = marks.map { $0 == .watchdogOff ? "[shield-slash: auto-recovery off]" : "[antenna-slash: Telegram unreachable]" }
+        let markText = marks.map { $0 == .watchdogOff ? "[shield-slash: auto-recovery off or paused]" : "[antenna-slash: Telegram unreachable]" }
         var itemParts: [String] = ["Status item: " + (iconText.isEmpty ? "?" : iconText)]
         itemParts.append(contentsOf: markText)
         itemParts.append(countText + "  (" + (alarm ? "red" : "monochrome") + ")")
@@ -1318,10 +1420,18 @@ final class FleetStore: ObservableObject {
         for row in rows {
             let name = row.name.padding(toLength: width, withPad: " ", startingAt: 0)
             let status = row.dumpStatus.padding(toLength: statusWidth, withPad: " ", startingAt: 0)
-            out.append("  \(row.connected ? "●" : "○") \(name)  \(status)  \(row.detailLine)\(row.stall ? " · stall suspected" : "")  [Reconnect]")
+            out.append("  \(row.connected ? "●" : "○") \(name)  \(status)  \(row.detailLine)\(row.stall ? " · stall suspected" : "")\(row.autoPaused ? " · auto-recovery paused" : "")  [Reconnect]")
         }
         if anyDown { out.append("[Reconnect all down]") }
         out.append("Watchdog: \(watchdogCaption) [switch \(watchdog?.available == false ? "unavailable" : (watchdog?.isOn == true ? "on" : "off"))]")
+        if let w = watchdog, w.available {
+            let tripped = w.autoPaused.map { breaker in
+                "\(breaker.bot.name) paused (\((breaker.path as NSString).lastPathComponent)"
+                    + (breaker.since.map { ", since " + clockTime($0) + " ET" } ?? "")
+                    + (breaker.reason.map { ", " + $0 } ?? "") + ")"
+            }
+            out.append("Auto breaker: " + (tripped.isEmpty ? "not tripped for any bot" : tripped.joined(separator: "; ")))
+        }
         out.append("[Snapshot]  [Restore\(snapshotAvailable ? "" : " (disabled: no snapshot saved)")]  [Refresh]")
         if let cfg = config { out.append("config: \(cfg.path)") }
         return out.joined(separator: "\n")
@@ -1329,7 +1439,7 @@ final class FleetStore: ObservableObject {
 
     // MARK: Demo (clearly labelled, never used for real decisions)
 
-    enum DemoFrame { case main, legend, snapshot }
+    enum DemoFrame { case main, legend, snapshot, longError }
 
     static func demo(_ frame: DemoFrame = .main) -> FleetStore {
         let store = FleetStore(mode: .demo)
@@ -1369,6 +1479,7 @@ final class FleetStore: ObservableObject {
             store.header = HeaderStatus(watchdogOffFor: [], watchdogTotal: 6, lastPassAge: 12, telegramReachable: true)
             store.showLegend = frame == .legend
         case .snapshot:
+            // A snapshot preserves the recovery settings (the engine runs --keep-watchdog).
             store.rows = [
                 row(0, .connected, "12s", detail: "Opus 5.5 · max · 41% ctx"),
                 row(1, .connected, "3s", detail: "Opus 5.5 · max · 63% ctx"),
@@ -1377,14 +1488,39 @@ final class FleetStore: ObservableObject {
                 row(4, .connected, "5s", detail: "Opus 5.5 · max · 22% ctx"),
                 row(5, .connected, "1s", detail: "Opus 5.5 · max · 7% ctx"),
             ]
-            let bots = names.prefix(6).map { Bot(key: $0.lowercased(), name: $0, workdir: "", stateDir: "") }
-            store.watchdog = WatchdogSwitches(dir: "demo", dirExists: true, disabled: Array(bots), odd: [], total: 6)
-            store.header = HeaderStatus(watchdogOffFor: Array(names.prefix(6)), watchdogTotal: 6, lastPassAge: 12,
-                                        telegramReachable: true)
+            store.watchdog = WatchdogSwitches(dir: "demo", dirExists: true, disabled: [], odd: [], total: 6)
+            store.header = HeaderStatus(watchdogOffFor: [], watchdogTotal: 6, lastPassAge: 12, telegramReachable: true)
+            store.marks = []
+            store.snapshotAvailable = true
+            store.snapshotLine = "Snapshot saved · 6 sessions · 12:41pm ET"
+            store.snapshotTip = "Snapshot saved · 6 sessions · 12:41pm ET. " + PanelCopy.restoreHelp
+            store.confirmation = "Snapshot saved · 6 sessions · 12:41pm ET"
+        case .longError:
+            // A long lasting error under the switch, and one bot paused by the watchdog's
+            // crash-loop breaker: the error stays at three lines, so the controls stay put.
+            var paused = row(4, .down, "Down", detail: "Opus 5.5 · max · 5 restarts/h", uptime: "Down since 12:31pm")
+            paused.autoPaused = true
+            paused.autoTip = "Auto-recovery paused since 12:31pm ET: the watchdog restarted \(names[4]) too often (5 restarts in the last hour, limit 4), so its crash-loop breaker stopped restarting it and messaged you instead. It stays paused until its .disabled-auto marker is removed from the watchdog's state folder, and the watchdog reminds you every 6 hours while its manual Watchdog switch is on. A manual disable suppresses those reminders. Reconnect still restarts \(names[4]) by hand. The Watchdog switch does not change this."
+            store.rows = [
+                row(0, .connected, "12s", detail: "Opus 5.5 · max · 41% ctx"),
+                row(1, .connected, "3s", detail: "Opus 5.5 · max · 63% ctx"),
+                row(2, .connected, "9s", detail: "Opus 5.5 · max · 12% ctx"),
+                row(3, .connected, "20s", detail: "Fable 5.1 · high · 18% ctx"),
+                paused,
+                row(5, .connected, "1s", detail: "Opus 5.5 · max · 7% ctx"),
+            ]
+            let bot = Bot(key: "demo-4", name: names[4], workdir: "", stateDir: "")
+            let breaker = AutoBreaker(bot: bot, path: "demo/demo-4.disabled-auto", since: Date().timeIntervalSince1970 - 1800,
+                                      reason: "5 restarts in the last hour (limit 4)")
+            store.watchdog = WatchdogSwitches(dir: "demo", dirExists: true, disabled: [], odd: [], total: 6, autoPaused: [breaker])
+            store.header = HeaderStatus(watchdogOffFor: [], watchdogTotal: 6, lastPassAge: 12, telegramReachable: true,
+                                        autoPausedFor: [names[4]])
             store.marks = [.watchdogOff]
             store.snapshotAvailable = true
-            store.snapshotTip = "Snapshot saved · 6 sessions · 12:41pm ET. Restore reopens each bot that is not running in its saved conversation and turns auto-recovery back on."
-            store.confirmation = "Snapshot saved · 6 sessions · 12:41pm ET"
+            store.snapshotLine = "Snapshot saved · 6 sessions · 12:41pm ET"
+            store.snapshotTip = "Snapshot saved · 6 sessions · 12:41pm ET. " + PanelCopy.restoreHelp
+            store.footerNote = RowNote(text: "Snapshot failed: claude-channels-snapshot.sh could not write /Users/demo/.claude/channels/restart-state/snapshot.tsv.tmp.48213 (No space left on device), so nothing was committed and every switch this run set was removed again. Free some disk space, then press Snapshot again. The engine's table follows: claudini 3f2a91c0 saved, claudito 77b1e2d4 saved, cactus 0c9d4e11 saved, jarvis 5be07aa2 saved, prune e41f09b3 saved, friday 9a3c5d70 not written.",
+                                       isError: true, at: Date().timeIntervalSince1970, session: nil)
         }
         return store
     }
@@ -1677,9 +1813,12 @@ struct PanelView: View {
     @FocusState private var headerFocused: Bool
 
     /// The legend and the rows scroll once they would push the panel past the screen:
-    /// the visible height, less the header, the bottom group and the margins.
+    /// the visible height, less the header, the bottom group and the margins, and less
+    /// the bottom group's lines that come and go (a failure note, at most three lines,
+    /// and a confirmation), so the switch, Snapshot and Restore always stay on screen.
     private var middleLimit: CGFloat {
-        max(240, (NSScreen.main?.visibleFrame.height ?? 800) - 330)
+        let reserve: CGFloat = 330 + (store.footerNote != nil ? 56 : 0) + (store.confirmation != nil ? 28 : 0)
+        return max(240, (NSScreen.main?.visibleFrame.height ?? 800) - reserve)
     }
 
     var body: some View {
@@ -1843,9 +1982,7 @@ struct HeaderV2: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(Palette.alertText)
                     .padding(.leading, 36 + Space.m)
-                    .help(problem.contains("Telegram")
-                          ? "Telegram's API does not answer from this Mac, so no bot can hear or reply. Nothing is restarted for a network outage."
-                          : "The watchdog is not restarting dropped bots. Turn Auto-recovery back on with the switch below, or press Restore after a snapshot.")
+                    .help(store.headerProblemTip)
             }
         }
     }
@@ -1911,7 +2048,7 @@ struct LegendV2: View {
             }
             GridRow {
                 Image(systemName: "shield.slash")
-                Text("Auto-recovery is off")
+                Text("Auto-recovery is off or paused")
             }
             GridRow {
                 Image(systemName: "antenna.radiowaves.left.and.right.slash")
@@ -1933,6 +2070,11 @@ struct LegendV2: View {
                 Text("stall")
                 Text("A message waited 10+ min, idle")
             }
+            GridRow {
+                Text("paused")
+                Text("Watchdog stopped restarting that bot")
+            }
+            .help("Auto-recovery paused: after too many restarts in an hour, the watchdog's crash-loop breaker stops restarting that bot and messages you instead. It stays paused until its marker is removed, and the watchdog reminds you every 6 hours while its manual Watchdog switch is on. A manual disable suppresses those reminders.")
         }
         .font(.system(size: 11))
         .foregroundStyle(Palette.label)
@@ -1945,12 +2087,13 @@ struct LegendV2: View {
     static let spokenLegend = "Legend. "
         + "Menu bar dots: one per bot, filled when connected, hollow when down. "
         + "A red count such as 5 of 6: a bot is not connected. "
-        + "A shield with a slash: auto-recovery is off. "
+        + "A shield with a slash: auto-recovery is off or paused for a bot. "
         + "An antenna with a slash: Telegram is unreachable from this Mac. "
         + "A pulse with seconds: the poller heartbeat, its liveness ping. "
         + "ctx: the context window used by the session. "
         + "restarts per hour: watchdog restarts in the last hour. "
-        + "stall: a message waited 10 or more minutes while the bot sat idle."
+        + "stall: a message waited 10 or more minutes while the bot sat idle. "
+        + "auto-recovery paused: the watchdog's crash-loop breaker stopped restarting that bot after too many restarts in an hour, until its marker is removed."
 }
 
 struct RowDivider: View {
@@ -2044,7 +2187,9 @@ struct RowV2: View {
             }
             .frame(height: 22)
 
-            (Text(row.detailLine) + (row.stall ? Text(" · ") + Text("stall suspected").fontWeight(.semibold) : Text("")))
+            (Text(row.detailLine)
+                + (row.stall ? Text(" · ") + Text("stall suspected").fontWeight(.semibold) : Text(""))
+                + (row.autoPaused ? Text(" · ") + Text("auto-recovery paused").fontWeight(.semibold) : Text("")))
                 .font(.system(size: 11))
                 .monospacedDigit()
                 .foregroundStyle(Palette.secondary)
@@ -2053,7 +2198,7 @@ struct RowV2: View {
                 .padding(.top, 3)
                 .help(row.detailTip + (row.stall
                       ? " Stall suspected: a message reached this bot over 10 minutes ago and nothing has happened since. The watchdog only flags this; it never restarts for it."
-                      : ""))
+                      : "") + (row.autoTip.map { " " + $0 } ?? ""))
 
             if let note = store.notes[row.id] {
                 Text(store.noteText(note))
@@ -2108,6 +2253,7 @@ struct RowV2: View {
         .onKeyPress(.space) { store.toggleExpanded(row.id); return .handled }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(row.name), \(busy ? "reconnecting" : row.spokenStatus)"
+                            + (row.autoPaused ? ", auto-recovery paused" : "")
                             + (store.notes[row.id].map { ", \($0.text)" } ?? ""))
         .accessibilityValue(expanded ? "details shown" : "details hidden")
         .accessibilityAction(named: Text(expanded ? "Hide details" : "Show details")) { store.toggleExpanded(row.id) }
@@ -2201,7 +2347,7 @@ struct FooterV2: View {
                             .foregroundStyle(Palette.label)
                         Text(store.watchdogCaption)
                             .font(.system(size: 11))
-                            .foregroundStyle(store.watchdog?.isOn == false ? Palette.alertText : Palette.secondary)
+                            .foregroundStyle(store.watchdogAlert ? Palette.alertText : Palette.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     Spacer(minLength: Grid2.gap)
@@ -2216,21 +2362,28 @@ struct FooterV2: View {
                     .disabled(store.watchdog?.available != true)
                     .help(store.watchdog?.available == false
                           ? "Unavailable: there is no watchdog state folder, so nothing can say whether auto-recovery runs."
-                          : "Auto-recovery: when on, the watchdog restarts a bot that stays disconnected. Off pauses it for every bot.")
+                          : "Auto-recovery: when on, the watchdog restarts a bot that stays disconnected. Off turns that off for every bot. The watchdog's own crash-loop breaker is separate, and this switch does not clear it.")
                     .accessibilityLabel("Auto-recovery")
                     .accessibilityValue(store.watchdogCaption)
                 }
                 .padding(Grid2.inset)
 
                 if let note = store.footerNote {
-                    Text(store.noteText(note))
+                    // At most three lines, so a long engine error can never push the
+                    // switch, Snapshot or Restore off the panel; the tooltip and
+                    // VoiceOver carry the whole text.
+                    let full = store.noteText(note)
+                    Text(full)
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(Palette.alertText)
+                        .lineLimit(3)
+                        .truncationMode(.tail)
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, Grid2.inset)
                         .padding(.bottom, Grid2.inset)
-                        .help("It stays until that action works; menubar.log has every step.")
+                        .help(full + " (It stays until that action works; menubar.log has every step.)")
+                        .accessibilityLabel(full)
                 }
 
                 RowDivider(leading: Grid2.inset)
@@ -2250,7 +2403,7 @@ struct FooterV2: View {
                     .capsuleButton(prominent: false)
                     .controlSize(.small)
                     .disabled(store.snapshotBusy || store.restoreBusy)
-                    .help("Save every bot's current conversation so a reboot or macOS update can bring each one back (the fleet snapshot engine). It pauses auto-recovery until Restore.")
+                    .help(store.snapshotButtonTip)
                     .accessibilityLabel("Snapshot")
 
                     Button {
@@ -2403,7 +2556,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         } else {
             button.title = text
         }
-        let extras = store.marks.map { $0 == .watchdogOff ? "auto-recovery off" : "Telegram unreachable" }
+        let extras = store.marks.map { $0 == .watchdogOff ? "auto-recovery off or paused" : "Telegram unreachable" }
         button.setAccessibilityLabel((["Telebots, \(store.summary)"] + extras).joined(separator: ", "))
         var tip = "Telebots: \(store.summary). One dot per bot, hollow when not connected; click for details."
         for mark in store.marks { tip += "\n" + mark.meaning + "." }
@@ -2526,7 +2679,7 @@ enum CLI {
             return 3
         }
         let outcome = FleetModel.performReconnect(bot, cfg, allowConnected: confirmed, dryRun: dryRun,
-                                                  askForPermission: false, log: { ActionLog.shared.write($0) })
+                                                  askForPermission: false, expected: health, log: { ActionLog.shared.write($0) })
         if let failure = outcome.failureText { ActionLog.shared.write("reconnect \(bot.key): \(failure)") }
         switch outcome {
         case .dryRun, .connected, .healedBeforeRun: return 0
@@ -2694,6 +2847,8 @@ enum CLI {
             frames.append((FleetStore.demo(.legend), false, base + tag + "-legend-light.png"))
             frames.append((FleetStore.demo(.snapshot), false, base + tag + "-snapshot-light.png"))
             frames.append((FleetStore.demo(.snapshot), true, base + tag + "-snapshot-dark.png"))
+            frames.append((FleetStore.demo(.longError), false, base + tag + "-long-error-light.png"))
+            frames.append((FleetStore.demo(.longError), true, base + tag + "-long-error-dark.png"))
         } else {
             let store = FleetStore(mode: .snapshot)
             store.refreshNow()
@@ -2782,14 +2937,54 @@ if let unknown = arguments.first(where: { !guiFlags.contains($0) }) {
 
 /// One running copy per user: an exclusive lock on a file only this user can reach.
 /// The kernel drops it when the process ends, crash or not, so it never goes stale.
+///
+/// Right after taking the lock the holder publishes who it is, and checks the write:
+///   <pid> <launchd|manual>
+///   started <its process start time, epoch seconds>
+/// (install.sh reads the first line). The lock is taken before that record is
+/// written, so a contender can find a record that is empty, half there, or left by an
+/// earlier holder. It trusts a record only when it is complete and names a live
+/// Telebots Bar whose start time matches; anything else is an unresolved owner.
 enum InstanceLock {
     static var path: String { Env.home + "/Library/Application Support/Telebots Bar/instance.lock" }
     private static var held: Int32 = -1
 
+    struct Holder: Equatable {
+        let pid: pid_t
+        let owner: String            // "launchd" or "manual"
+        let started: TimeInterval
+    }
+
     enum Outcome {
         case acquired
-        case heldBy(pid: pid_t?, owner: String)
+        case heldBy(Holder?, detail: String)   // nil: the record is incomplete, stale, or not a Telebots Bar
         case failed(String)
+    }
+
+    /// The published record for a holder.
+    static func record(pid: pid_t, owner: String, started: TimeInterval) -> String {
+        "\(pid) \(owner)\nstarted \(String(format: "%.6f", started))\n"
+    }
+
+    /// A record as a holder, only when it is complete: two newline-terminated lines,
+    /// a pid, launchd or manual, and a start time.
+    static func parse(_ text: String) -> Holder? {
+        guard text.hasSuffix("\n") else { return nil }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        guard lines.count == 3, lines[2].isEmpty else { return nil }
+        let first = lines[0].split(separator: " ", omittingEmptySubsequences: false)
+        guard first.count == 2, let pid = pid_t(first[0]), pid > 1, ["launchd", "manual"].contains(String(first[1])),
+              lines[1].hasPrefix("started "), let started = TimeInterval(lines[1].dropFirst("started ".count)),
+              started > 0 else { return nil }
+        return Holder(pid: pid, owner: String(first[1]), started: started)
+    }
+
+    /// The holder a record names, only when that process is alive now, is this user's
+    /// Telebots Bar, and started when the record says (so a reused pid never counts).
+    static func confirm(_ text: String) -> Holder? {
+        guard let holder = parse(text), isTelebotsBar(holder.pid), let started = processStartTime(holder.pid),
+              abs(started - holder.started) < 0.001 else { return nil }
+        return holder
     }
 
     static func acquire(owner: String) -> Outcome {
@@ -2799,15 +2994,37 @@ enum InstanceLock {
         let fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard fd >= 0 else { return .failed("cannot open \(path) (\(String(cString: strerror(errno))))") }
         guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
-            let holder = readHolder(fd)
+            let text = readRecord(fd)
             close(fd)
-            return .heldBy(pid: holder.pid, owner: holder.owner)
+            if let holder = confirm(text) { return .heldBy(holder, detail: "pid \(holder.pid), started \(holder.owner)") }
+            return .heldBy(nil, detail: parse(text) == nil
+                           ? (text.isEmpty ? "its owner record is empty" : "its owner record is incomplete")
+                           : "its owner record names a process that is gone or is not this app")
         }
-        let line = "\(getpid()) \(owner)\n"
-        _ = ftruncate(fd, 0)
-        _ = line.withCString { pwrite(fd, $0, strlen($0), 0) }
+        guard let started = processStartTime(getpid()) else {
+            close(fd)
+            return .failed("cannot read this process's own start time, so it could not publish itself as the owner")
+        }
+        let text = record(pid: getpid(), owner: owner, started: started)
+        if let problem = publish(fd, text) {
+            // Never run holding the lock under a record no contender can confirm.
+            close(fd)
+            return .failed("took the lock but could not publish its owner record in \(path) (\(problem)), so it let go")
+        }
         held = fd
         return .acquired
+    }
+
+    /// Writes the record and reads it back; nil when a contender will read exactly it.
+    private static func publish(_ fd: Int32, _ text: String) -> String? {
+        let bytes = Array(text.utf8)
+        guard ftruncate(fd, 0) == 0 else { return "truncate: " + String(cString: strerror(errno)) }
+        let written = bytes.withUnsafeBytes { pwrite(fd, $0.baseAddress, $0.count, 0) }
+        guard written == bytes.count else {
+            return written < 0 ? "write: " + String(cString: strerror(errno)) : "write: \(written) of \(bytes.count) bytes"
+        }
+        guard readRecord(fd) == text else { return "the record read back differs from what was written" }
+        return nil
     }
 
     /// Waits for another copy to let go of the lock, up to `seconds`.
@@ -2820,13 +3037,22 @@ enum InstanceLock {
         return false
     }
 
-    private static func readHolder(_ fd: Int32) -> (pid: pid_t?, owner: String) {
-        var buffer = [UInt8](repeating: 0, count: 64)
-        let count = pread(fd, &buffer, 63, 0)
-        let text = count > 0 ? String(decoding: buffer[0..<count], as: UTF8.self) : ""
-        let parts = text.split(whereSeparator: { $0 == " " || $0 == "\n" })
-        return (parts.first.flatMap { pid_t($0) }, parts.count > 1 ? String(parts[1]) : "unknown")
+    private static func readRecord(_ fd: Int32) -> String {
+        var buffer = [UInt8](repeating: 0, count: 256)
+        let count = pread(fd, &buffer, 255, 0)
+        return count > 0 ? String(decoding: buffer[0..<count], as: UTF8.self) : ""
     }
+}
+
+/// A process's start time from the kernel (epoch seconds), or nil when it is gone.
+func processStartTime(_ pid: pid_t) -> TimeInterval? {
+    var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+    var info = kinfo_proc()
+    var size = MemoryLayout<kinfo_proc>.stride
+    guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size >= MemoryLayout<kinfo_proc>.stride,
+          info.kp_proc.p_pid == pid else { return nil }
+    let start = info.kp_proc.p_un.__p_starttime
+    return TimeInterval(start.tv_sec) + TimeInterval(start.tv_usec) / 1e6
 }
 
 /// True only for this user's own Telebots Bar executable.
@@ -2853,20 +3079,50 @@ var terminationSource: DispatchSourceSignal?
         switch InstanceLock.acquire(owner: owner) {
         case .acquired:
             break
-        case .heldBy(let pid, let holder):
-            // The LaunchAgent's copy is the supervised one, so it takes over from a copy
-            // started by hand; any other second copy just leaves.
-            if owner == "launchd", holder != "launchd", let pid, isTelebotsBar(pid) {
-                ActionLog.shared.write("start (launchd): a copy started by hand is running (pid \(pid)); asking it to quit so launchd supervises this one")
-                kill(pid, SIGTERM)
-                guard InstanceLock.waitAndAcquire(owner: owner, seconds: 10) else {
-                    ActionLog.shared.write("start (launchd): pid \(pid) did not quit within 10s; this copy exits with an error so launchd tries again")
+        case .heldBy(let first, let detail):
+            guard owner == "launchd" else {
+                // A second copy started by hand just leaves.
+                ActionLog.shared.write(first != nil
+                    ? "start: Telebots Bar is already running (\(detail)), this copy exits"
+                    : "start: the single-copy lock is held (\(detail)), this copy exits")
+                exit(0)
+            }
+            // The LaunchAgent's copy is the supervised one. It may exit cleanly only for a
+            // confirmed launchd owner, since a clean exit stops launchd from starting it
+            // again. An owner it cannot confirm yet (a record not written yet, or one an
+            // earlier holder left) gets a few seconds, then this copy exits with an error
+            // so launchd tries again.
+            var holder = first
+            var lastDetail = detail
+            var tookLock = false
+            let deadline = Date().addingTimeInterval(5)
+            while holder == nil && !tookLock && Date() < deadline {
+                usleep(250_000)
+                switch InstanceLock.acquire(owner: owner) {
+                case .acquired: tookLock = true
+                case .heldBy(let next, let why): holder = next; lastDetail = why
+                case .failed(let why):
+                    ActionLog.shared.write("start (launchd): cannot take the single-copy lock (\(why)); this copy exits with an error so launchd tries again")
                     exit(1)
                 }
-                ActionLog.shared.write("start (launchd): took over from pid \(pid)")
-            } else {
-                ActionLog.shared.write("start: Telebots Bar is already running (pid \(pid.map { String($0) } ?? "unknown"), started \(holder)), this copy exits")
+            }
+            if tookLock {
+                ActionLog.shared.write("start (launchd): the lock came free while its owner was unconfirmed; this copy holds it now")
+            } else if let holder, holder.owner == "manual" {
+                // Take over from a copy started by hand.
+                ActionLog.shared.write("start (launchd): a copy started by hand is running (pid \(holder.pid)); asking it to quit so launchd supervises this one")
+                kill(holder.pid, SIGTERM)
+                guard InstanceLock.waitAndAcquire(owner: owner, seconds: 10) else {
+                    ActionLog.shared.write("start (launchd): pid \(holder.pid) did not quit within 10s; this copy exits with an error so launchd tries again")
+                    exit(1)
+                }
+                ActionLog.shared.write("start (launchd): took over from pid \(holder.pid)")
+            } else if let holder {
+                ActionLog.shared.write("start (launchd): Telebots Bar is already running under launchd (pid \(holder.pid)), this copy exits")
                 exit(0)
+            } else {
+                ActionLog.shared.write("start (launchd): the single-copy lock is held but its owner could not be confirmed within 5s (\(lastDetail)); this copy exits with an error so launchd tries again")
+                exit(1)
             }
         case .failed(let why):
             ActionLog.shared.write("start: cannot take the single-copy lock (\(why)); this copy exits")

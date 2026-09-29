@@ -7,10 +7,12 @@
 # Args:
 #   $1  bot key OR workdir (either is accepted; resolved via fleet-config)
 #   $2  resume id (optional):
-#         (empty)     fresh session; resets per-bot model-state to your default
-#         continue    resume the most recent conversation in this workdir
-#         fresh-keep  empty session but KEEP the model-state /model wrote
-#         <uuid>      resume that specific session (context preserving)
+#         (empty)      fresh session; preserves per-bot model-state
+#         fresh-reset  fresh session on the default model (explicit /fresh reset)
+#         continue     resume the most recent conversation in this workdir
+#         fresh-keep   empty session but KEEP the model-state /model wrote
+#         <uuid>       resume that specific session (context preserving)
+#       Anything else is refused (exit 2) before anything is written or launched.
 #
 # What it does: exports TELEGRAM_STATE_DIR + TELEGRAM_BOT_TOKEN (from the bot's
 # state-dir .env) + CLAUDE_CODE_NO_FLICKER=1, applies the sticky per-bot model /
@@ -19,7 +21,8 @@
 # exec's claude with the official telegram channel plugin.
 #
 # Env: FLEET_HOME (default ~/.claude/telegram-fleet); CC_LAUNCH_DRYRUN=1 prints
-# the planned command and exits without launching or touching any window.
+# the planned command and exits without launching, touching any window, or
+# writing or deleting anything (a model-state reset is only reported).
 #
 # macOS is the supported platform (Terminal.app window handling by the caller).
 
@@ -32,7 +35,9 @@ case "${1:-}" in
   -h|--help) usage; exit 0 ;;
 esac
 
-FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
+# Keep custom fleet paths stable across Terminal's new shell and hook children.
+FLEET_HOME="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "${FLEET_HOME:-$HOME/.claude/telegram-fleet}")" || exit 2
+export FLEET_HOME
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 resolve_bin() {
@@ -42,6 +47,10 @@ resolve_bin() {
 }
 FC_BIN="$(resolve_bin fleet-config)"
 fc() { "$FC_BIN" "$@"; }
+# Reject duplicate keys and shared/invalid paths before any lookup can choose a bot.
+fc validate >/dev/null || { echo "Invalid fleet configuration; nothing acted on." >&2; exit 2; }
+FLEET_CONFIG="$(fc path)" || exit 2
+export FLEET_CONFIG
 
 ARG="${1:-}"
 RESUME_ID="${2:-}"
@@ -64,6 +73,17 @@ fi
 CWD="$(fc bot "$KEY" workdir)"
 STATE_DIR="$(fc bot "$KEY" state_dir)"
 
+# The resume argument reaches claude's own command line: only a session uuid or
+# one of the fixed words above is accepted.
+case "$RESUME_ID" in
+  ""|continue|fresh-keep|fresh-reset) : ;;
+  *)
+    if ! [[ "$RESUME_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+      echo "fleet-launch: resume argument '$(printf '%s' "$RESUME_ID" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-80)' is not a session uuid, continue, fresh-keep or fresh-reset" >&2
+      exit 2
+    fi ;;
+esac
+
 if [ ! -d "$CWD" ]; then
   echo "fleet-launch: workdir missing: $CWD" >&2
   exit 1
@@ -82,14 +102,14 @@ export CLAUDE_CODE_NO_FLICKER=1
 # MODEL is stored as a CLASS ALIAS (opus/sonnet/fable/haiku) or a literal
 # claude-* id - never a pinned version - so an alias always resolves to the
 # newest model in that class. Absent or invalid state = no flags = your Claude
-# Code default (this tool never forces a model on you). A bare fresh launch
-# resets to that default by removing the state file.
+# Code default (this tool never forces a model on you). Only
+# fresh-reset resets to that default by removing the state file - after the
+# dry-run guard below, so a dry run never deletes it.
 MODEL_STATE_FILE="$STATE_DIR/model-state"
-if [ -z "$RESUME_ID" ]; then
-  rm -f "$MODEL_STATE_FILE" 2>/dev/null || true
-fi
+RESET_MODEL_STATE=0
+case "$RESUME_ID" in fresh-reset) RESET_MODEL_STATE=1 ;; esac
 BOT_MODEL=""; BOT_EFFORT=""
-if [ -f "$MODEL_STATE_FILE" ]; then
+if [ "$RESET_MODEL_STATE" = "0" ] && [ -f "$MODEL_STATE_FILE" ]; then
   _m=$(grep -E '^MODEL='  "$MODEL_STATE_FILE" | head -1 | cut -d= -f2- | tr -d '[:space:]')
   _e=$(grep -E '^EFFORT=' "$MODEL_STATE_FILE" | head -1 | cut -d= -f2- | tr -d '[:space:]')
   case "$_m" in opus|sonnet|fable|haiku) BOT_MODEL="$_m" ;; claude-*) BOT_MODEL="$_m" ;; esac
@@ -111,6 +131,7 @@ fi
 ARGS=(--channels plugin:telegram@claude-plugins-official)
 case "$RESUME_ID" in
   "")          RESUME_DESC="fresh" ;;
+  fresh-reset) RESUME_DESC="fresh-reset" ;;
   continue)    ARGS+=(--continue); RESUME_DESC="continue" ;;
   fresh-keep)  RESUME_DESC="fresh-keep" ;;
   *)           ARGS+=(--resume "$RESUME_ID"); RESUME_DESC="resume $RESUME_ID" ;;
@@ -127,7 +148,15 @@ echo "launching $KEY in $CWD (state: $STATE_DIR, model: ${BOT_MODEL:-default} ef
 
 if [ "${CC_LAUNCH_DRYRUN:-}" = "1" ]; then
   echo "DRYRUN key=$KEY cwd=$CWD argv: claude ${ARGS[*]}"
+  if [ "$RESET_MODEL_STATE" = "1" ]; then
+    echo "DRYRUN model-state would be reset to your default (nothing was deleted)"
+  fi
   exit 0
+fi
+
+# The one and only model-state reset, never reached by a dry run.
+if [ "$RESET_MODEL_STATE" = "1" ]; then
+  rm -f "$MODEL_STATE_FILE" 2>/dev/null || true
 fi
 
 cd "$CWD" || { echo "fleet-launch: cannot cd to $CWD" >&2; exit 1; }

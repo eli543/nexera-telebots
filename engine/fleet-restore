@@ -1,58 +1,132 @@
 #!/bin/bash
 # fleet-restore - POST-RESTART restore. Reads the snapshot written by
 # fleet-snapshot and brings every bot back RESUMED into its exact pre-restart
-# conversation via fleet-launch, then un-parks the watchdog.
+# conversation via fleet-launch (a bot whose session still runs but whose Telegram
+# poller is gone is restarted through fleet-fresh instead), checks every bot once
+# more as it is right now, un-parks the watchdog, and archives the snapshot only
+# when every bot is back.
 #
 # Usage:
 #   fleet-restore            real restore (opens the bot windows)
-#   fleet-restore --dry-run  print what it WOULD launch; touch nothing
+#   fleet-restore --dry-run  print what it WOULD do; touch nothing
 #
 # Run this AFTER you log back in, from a plain terminal - never from inside one
 # of the bots (it relaunches all of them). Config driven; no hardcoded bot list.
 # macOS (osascript / Terminal.app).
+#
+# Exit codes: 0 every bot is back and the snapshot generation this run read is
+# archived; 1 INCOMPLETE (a bot failed or is pending, or there is no snapshot) and
+# the snapshot is kept for a retry; 2 a snapshot row was rejected and never acted
+# on, the snapshot is kept; 7 skipped because another fleet-snapshot or
+# fleet-restore holds the fleet transaction lock, nothing touched.
 
+# Takeover audit: validate the complete snapshot before acting on any row;
+# require a current session, current poller and bounded valid heartbeat at completion.
 set -uo pipefail
 
-# 2026-09-27 fix, reproduced on a scratch fleet first: launches are checked. An
-# osascript failure is reported and not counted as a launch, and each launched
-# bot must be seen running again (its session) within RESTORE_WAIT seconds; its
-# Telegram poller is reported too. A bot that did not launch or come back keeps
-# its watchdog switch and the snapshot is kept, not archived, so running
-# fleet-restore again retries exactly those bots (exit 1 then). Only switches the
-# snapshot set (we_parked=1) are removed, and only for bots that are up.
+# Fixes, each reproduced on a scratch fleet first:
+#  - Launches are checked: an osascript failure is reported and not counted as a
+#    launch, and each launched bot gets RESTORE_WAIT seconds to come back. A bot
+#    that did not launch or come back keeps its watchdog switch and the snapshot
+#    is kept, not archived, so running fleet-restore again retries exactly those
+#    bots (exit 1 then). Only switches the snapshot set (we_parked=1) are removed,
+#    and only for bots whose session is running. Each launch runs under the same
+#    per-bot restart lock fleet-fresh takes, so the two can never launch the same
+#    bot at once.
+#  - Final check: nothing seen earlier counts (a session that showed up once and
+#    died used to count as back, and an unconfirmed poller still let the snapshot
+#    be archived). Right before it decides, fleet-restore checks every bot it
+#    handled as it is NOW: its session running, its poller process running, and
+#    its required poller.heartbeat (patch 03) fresh (at
+#    most HEARTBEAT_MAX_AGE old, written since the running session started).
+#    Only when every bot passes is the snapshot archived and the exit 0. A bot
+#    whose session runs without a confirmed poller is reported "pending
+#    watchdog", with whether the watchdog is really enabled for it; a bot with no
+#    session failed. Either keeps the snapshot and exits 1 INCOMPLETE.
+#  - A session without its poller is not up: it is restarted, resumed into its
+#    saved session, through fleet-fresh (identity-checked kill, launch, poller
+#    proof, old-window proof). A session younger than STARTUP_GRACE seconds, or
+#    one whose restart lock is held, is left to finish.
+#  - One transaction at a time: a real run holds the fleet transaction lock that
+#    a real fleet-snapshot holds too, so the two can never interleave.
+#  - Generation: the snapshot's generation id is read from its header at the
+#    start, reported, and the file is archived only while it still carries that
+#    generation, so a newer snapshot this run did not process is never consumed.
+#    A snapshot written before generations existed reads as "legacy".
+#  - Rows must match fleet.json: a row is acted on only when its key is a bot in
+#    fleet.json, it appears once, its cwd, state dir and project dir are exactly
+#    that bot's, and its session id is a uuid or empty. The launch command is
+#    built from fleet.json, single-quoted for the Terminal shell and handed to
+#    osascript as an argument, never written into the AppleScript text. A
+#    rejected row is never acted on, the snapshot is kept, and the run exits 2.
+#  - Rows are split on tabs WITHOUT collapsing empty fields, so an empty session
+#    id never shifts the later columns.
 
-case "${1:-}" in -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+case "${1:-}" in -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
 
-FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
+# Keep custom fleet paths stable across Terminal's new shell and hook children.
+FLEET_HOME="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "${FLEET_HOME:-$HOME/.claude/telegram-fleet}")" || exit 2
+export FLEET_HOME
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 resolve_bin() {
   if [ -x "$FLEET_HOME/bin/$1" ]; then printf '%s\n' "$FLEET_HOME/bin/$1"; return; fi
   if [ -x "$SELF_DIR/$1" ]; then printf '%s\n' "$SELF_DIR/$1"; return; fi
   printf '%s\n' "$1"
 }
+FC_BIN="$(resolve_bin fleet-config)"
+fc() { "$FC_BIN" "$@"; }
+# Reject duplicate keys and shared/invalid paths before any lookup can choose a bot.
+fc validate >/dev/null || { echo "Invalid fleet configuration; nothing acted on." >&2; exit 2; }
+FLEET_CONFIG="$(fc path)" || exit 2
+export FLEET_CONFIG
 LAUNCHER="$(resolve_bin fleet-launch)"
+FRESH="$(resolve_bin fleet-fresh)"   # restarts a session whose poller is gone
 
 DRY_RUN=0
-[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    *) echo "Restore: unknown argument; expected --dry-run. Nothing changed." >&2; exit 2 ;;
+  esac
+done
 
 WD_STATE="$FLEET_HOME/watchdog-state"
 RESTART_STATE="$FLEET_HOME/restart-state"
-RESTORE_WAIT=120   # seconds each launched bot gets to come back before it counts as failed
+WATCHDOG_LOG="$FLEET_HOME/logs/watchdog.log"
+# Locks live under /tmp (cleared at boot), named for this fleet so parallel fleets
+# or a test run never collide. fleet-fresh and fleet-snapshot use the same names.
+LOCK_BASE="/tmp/nexera-telebots-$(printf '%s' "$FLEET_HOME" | cksum | awk '{print $1}')"
+FLEET_LOCK="$LOCK_BASE-fleet-lock"   # the snapshot/restore transaction lock
+RESTORE_WAIT=120        # seconds each launched bot gets to come back before it counts as failed
+LOCK_STALE=180          # must match fleet-fresh: a restart lock that records NO pid and is older than this belonged to a crashed run
+HEARTBEAT_MAX_AGE=180   # must match daemon/watchdog.sh: a heartbeat older than this is stale
+STARTUP_GRACE=90        # a session this young whose poller is not up yet is still starting
+WATCHDOG_PASS_MAX=180   # the watchdog logs a pass about every 60s; none for this long means it is not running
+KEY_RE='^[a-z0-9][a-z0-9-]{0,30}$'
 
 SNAP="$RESTART_STATE/snapshot.tsv"
 if [ $DRY_RUN -eq 1 ] && [ -f "$RESTART_STATE/snapshot.dryrun.tsv" ]; then
   SNAP="$RESTART_STATE/snapshot.dryrun.tsv"
 fi
 
-if [ ! -f "$SNAP" ]; then
-  echo "No snapshot found at $SNAP." >&2
-  echo "Run fleet-snapshot BEFORE restarting so there's something to restore." >&2
-  exit 1
-fi
+
 if [ ! -x "$LAUNCHER" ] && ! command -v "$LAUNCHER" >/dev/null 2>&1; then
   echo "Launcher missing: $LAUNCHER" >&2
   exit 1
 fi
+
+# One line of printable text for the output: a rejected row can hold anything.
+printable() { printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-80; }
+
+# shq <word>: the word single-quoted for the Terminal window's shell.
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# The generation id a snapshot's header carries, "legacy" when it has none.
+snap_generation() {
+  local g
+  g=$(head -1 "$1" 2>/dev/null | sed -n 's/.* generation=\([0-9A-Za-z_-]\{1,64\}\)$/\1/p')
+  printf '%s' "${g:-legacy}"
+}
 
 session_pid_for() {
   local want="$1" pid s
@@ -60,149 +134,513 @@ session_pid_for() {
   # shellcheck disable=SC2009
   for pid in $(ps -axo pid=,command= | grep 'channels plugin:telegram' | grep -v grep | awk '{print $1}'); do
     [ -z "$pid" ] && continue
-    s=$(ps eww -p "$pid" 2>/dev/null | tr ' ' '\n' | grep -m1 '^TELEGRAM_STATE_DIR=' | cut -d= -f2-)
+    s=$(ps eww -p "$pid" 2>/dev/null | python3 -c 'import re,sys; m=re.search(r"(?:^| )TELEGRAM_STATE_DIR=(.*?)(?= [A-Za-z_][A-Za-z0-9_]*=|$)", sys.stdin.read().rstrip("\n")); print(m.group(1) if m else "")')
     if [ "$s" = "$want" ]; then echo "$pid"; return; fi
   done
 }
 
-# The poller's own proof that it started after <since>: bot.pid written since
-# then naming a live process, and a heartbeat epoch since then.
-poller_live() {   # poller_live <state dir> <since epoch>
-  local sdir="$1" since="$2" bp hb
-  [ -f "$sdir/bot.pid" ] && [ -f "$sdir/poller.heartbeat" ] || return 1
-  [ "$(stat -f %m "$sdir/bot.pid" 2>/dev/null || echo 0)" -ge "$since" ] || return 1
-  bp=$(head -1 "$sdir/bot.pid" 2>/dev/null | tr -cd '0-9')
-  [ -n "$bp" ] && ps -p "$bp" -o pid= >/dev/null 2>&1 || return 1
-  hb=$(head -1 "$sdir/poller.heartbeat" 2>/dev/null | tr -cd '0-9')
-  [ -n "$hb" ] && [ "$hb" -ge "$since" ]
+# pid of the live Telegram poller (bun server.ts) whose TELEGRAM_STATE_DIR matches
+# $1 (or empty) - the watchdog's own worker test.
+poller_pid_for() {
+  local want="$1" pid s
+  # shellcheck disable=SC2009
+  for pid in $(ps -axo pid=,command= | grep 'server.ts' | grep -v grep | awk '{print $1}'); do
+    [ -z "$pid" ] && continue
+    s=$(ps eww -p "$pid" 2>/dev/null | python3 -c 'import re,sys; m=re.search(r"(?:^| )TELEGRAM_STATE_DIR=(.*?)(?= [A-Za-z_][A-Za-z0-9_]*=|$)", sys.stdin.read().rstrip("\n")); print(m.group(1) if m else "")')
+    if [ "$s" = "$want" ]; then echo "$pid"; return; fi
+  done
 }
 
-launched=0; skipped=0; failed=0
+# Seconds since pid $1 started (from ps etime, [[dd-]hh:]mm:ss), or empty.
+session_age() {
+  local e a b c d=0 h=0 m=0 s=0
+  e=$(ps -o etime= -p "$1" 2>/dev/null | tr -d '[:space:]')
+  [ -n "$e" ] || return 0
+  case "$e" in *-*) d=${e%%-*}; e=${e#*-} ;; esac
+  IFS=: read -r a b c <<< "$e"
+  if [ -n "$c" ]; then h=$a; m=$b; s=$c; else m=$a; s=${b:-0}; fi
+  echo $(( 10#$d * 86400 + 10#$h * 3600 + 10#$m * 60 + 10#$s ))
+}
+
+# The final check: one bot as it is NOW, nothing remembered from before. Sets
+# FC_STATE (live | pending | failed) and FC_DETAIL. A fresh heartbeat is required.
+poller_belongs_to() {   # <poller pid> <session pid>, bounded parent-chain proof
+  local child="$1" parent="$2" hops=0
+  while [[ "$child" =~ ^[1-9][0-9]*$ ]] && [ "$child" -gt 1 ] && [ "$hops" -lt 16 ]; do
+    [ "$child" = "$parent" ] && return 0
+    child=$(ps -o ppid= -p "$child" 2>/dev/null | tr -d '[:space:]') || return 1
+    hops=$((hops + 1))
+  done
+  return 1
+}
+
+FC_STATE=""; FC_DETAIL=""
+final_state() {   # final_state <state dir>
+  local sdir="$1" spid wpid hb now age
+  now=$(date +%s)
+  spid=$(session_pid_for "$sdir")
+  if [[ -z "$spid" ]] || ! kill -0 "$spid" 2>/dev/null; then
+    FC_STATE=failed; FC_DETAIL="its session is not running"; return 0
+  fi
+  wpid=$(poller_pid_for "$sdir")
+  if [[ -z "$wpid" ]] || ! kill -0 "$wpid" 2>/dev/null; then
+    FC_STATE=pending; FC_DETAIL="session pid $spid runs, but no Telegram poller runs for it"; return 0
+  fi
+  hb=$(head -1 "$sdir/poller.heartbeat" 2>/dev/null)
+  if ! [[ "$hb" =~ ^[0-9]{1,12}$ ]]; then
+    FC_STATE=pending; FC_DETAIL="session pid $spid and poller pid $wpid run, but the poller heartbeat holds no time"; return 0
+  fi
+  hb=$(( 10#$hb ))
+  now=$(date +%s)
+  if (( now - hb > HEARTBEAT_MAX_AGE || hb > now + 2 )); then
+    FC_STATE=pending; FC_DETAIL="session pid $spid and poller pid $wpid run, but the poller heartbeat is $(( now - hb ))s old (limit ${HEARTBEAT_MAX_AGE}s)"; return 0
+  fi
+  age=$(session_age "$spid")
+  if [[ -z "$age" ]]; then
+    FC_STATE=failed; FC_DETAIL="session identity could not be rechecked"; return 0
+  fi
+  if (( hb + 2 < now - age )); then
+    FC_STATE=pending; FC_DETAIL="session pid $spid and poller pid $wpid run, but the heartbeat predates this session"; return 0
+  fi
+  if ! kill -0 "$spid" 2>/dev/null; then
+    FC_STATE=failed; FC_DETAIL="session pid $spid exited during the final check"; return 0
+  fi
+  if ! kill -0 "$wpid" 2>/dev/null; then
+    FC_STATE=pending; FC_DETAIL="poller pid $wpid exited during the final check"; return 0
+  fi
+  if ! poller_belongs_to "$wpid" "$spid"; then
+    FC_STATE=pending; FC_DETAIL="poller pid $wpid is not a child of session pid $spid"; return 0
+  fi
+  FC_STATE=live; FC_DETAIL="session pid $spid, poller pid $wpid, heartbeat $(( now - hb ))s old"
+}
+
+# Why the watchdog will NOT look after bot $1 right now; prints nothing when it will.
+watchdog_gap() {
+  local mt
+  if [ "$(fc option watchdog 2>/dev/null || echo true)" = "false" ]; then echo "the watchdog is turned off in fleet.json"; return 0; fi
+  if [ -f "$WD_STATE/$1.disabled" ]; then echo "its switch $1.disabled is set"; return 0; fi
+  if [ -f "$WD_STATE/$1.disabled-auto" ]; then echo "its switch $1.disabled-auto is set"; return 0; fi
+  mt=$(stat -f %m "$WATCHDOG_LOG" 2>/dev/null)
+  if [ -z "$mt" ]; then echo "the watchdog has not logged a pass"; return 0; fi
+  if [ $(( $(date +%s) - mt )) -gt "$WATCHDOG_PASS_MAX" ]; then echo "the watchdog last logged a pass $(( $(date +%s) - mt ))s ago"; fi
+  return 0
+}
+
+# ---- restart and fleet locks: one protocol, three copies ---------------------
+# fleet-fresh, fleet-restore and fleet-snapshot all carry this block word for
+# word; change one and change the others. A bot's restart lock is the directory
+# <LOCK_BASE>-fresh-lock-<key>; the fleet transaction lock, held from start to
+# finish by a real fleet-snapshot and by a real fleet-restore, is the directory
+# <LOCK_BASE>-fleet-lock. In either one the file "pid" names the run that holds
+# it. LOCK_STALE is set by each script.
+#  - Taking it: mkdir the directory, then record this run's pid. The pid is
+#    written to a private file and hard-linked into place, so a pid file is
+#    always complete and never overwrites another run's; it is then read back.
+#  - A lock whose recorded pid is alive is never taken over, however old: taking
+#    over by age alone once let a long restart lose its lock and a third run in.
+#  - A lock is taken over only when its recorded pid is dead, or when it records
+#    no pid and is older than LOCK_STALE. The takeover makes its own mkdir
+#    first (<lock>/takeover), so only one run at a time can take a lock over;
+#    under that claim it re-checks that the lock still records what was judged
+#    stale, then replaces the pid file in one atomic rename. No run ever moves
+#    or deletes a pid file it did not write. A claim left by a run that died
+#    mid-takeover (a takeover takes milliseconds) is cleared after 60 seconds.
+#  - Releasing it: only while its pid file still names this run.
+# Durable per-generation hard links are both the ownership proof and undo journal.
+# Write journal before publishing switches. Replay only under the fleet lock.
+snapshot_generation() {
+  head -1 "$1" 2>/dev/null | sed -n 's/.* generation=\([0-9A-Za-z_-]\{1,64\}\)$/\1/p'
+}
+snapshot_owns_switch() {
+  local generation="$1" key="$2" ref
+  [[ "$generation" =~ ^[0-9A-Za-z_-]{1,64}$ && "$key" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || return 1
+  ref="$RESTART_STATE/.snapshot-markers-$generation/$key"
+  [[ -f "$ref" && ! -L "$ref" && ! -L "$WD_STATE/$key.disabled" && "$WD_STATE/$key.disabled" -ef "$ref" ]]
+}
+recover_snapshot_journals() {
+  local current dir generation ref key
+  current=$(snapshot_generation "$RESTART_STATE/snapshot.tsv")
+  for dir in "$RESTART_STATE"/.snapshot-markers-*; do
+    [[ -d "$dir" && ! -L "$dir" ]] || continue
+    generation=${dir##*/.snapshot-markers-}
+    [[ "$generation" =~ ^[0-9A-Za-z_-]{1,64}$ ]] || { echo "Invalid snapshot journal: $dir" >&2; return 1; }
+    [[ "$generation" == "$current" ]] && continue
+    for ref in "$dir"/*; do
+      [[ -f "$ref" && ! -L "$ref" ]] || continue
+      key=${ref##*/}
+      [[ "$key" == journal ]] && continue
+      [[ "$key" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || return 1
+      if snapshot_owns_switch "$generation" "$key" && ! snapshot_owns_switch "$current" "$key"; then
+        rm -f "$WD_STATE/$key.disabled" || return 1
+        echo "Recovered interrupted snapshot $generation: removed its $key watchdog switch"
+      fi
+      rm -f "$ref" || return 1
+    done
+    rm -f "$dir/journal" || return 1
+    rmdir "$dir" || return 1
+  done
+}
+
+# PID/start ownership is changed only under a stable, kernel-held flock gate.
+# The gate lives beside the directory and is never unlinked. Crashes release it.
+LOCK_NOTE=""
+lock_pid_in() {
+  local p
+  p=$(head -1 "$1" 2>/dev/null | tr -d '[:space:]')
+  [[ "$p" =~ ^[1-9][0-9]*$ ]] || p=""
+  printf '%s' "$p"
+}
+lock_start() { LC_ALL=C TZ=UTC ps -p "$1" -o lstart= 2>/dev/null | awk '{$1=$1; print}'; }
+LOCK_SELF_START=$(lock_start "$$")
+if [[ "${CC_FLEET_MANAGED_GROUP:-}" == 1 ]]; then
+  CC_FLEET_ENGINE_PGID=$(ps -p "$$" -o pgid= | tr -d '[:space:]')
+  [[ "$CC_FLEET_ENGINE_PGID" =~ ^[1-9][0-9]*$ ]] || exit 8
+  CC_FLEET_GROUP_START=${CC_FLEET_GROUP_START:-$(lock_start "$CC_FLEET_ENGINE_PGID")}
+  [[ -n "$CC_FLEET_GROUP_START" ]] || exit 8
+  export CC_FLEET_ENGINE_PGID CC_FLEET_GROUP_START
+fi
+lock_op() {
+  python3 - "$1" "$2" "$$" "$LOCK_SELF_START" "$LOCK_STALE" "${CC_FLEET_ENGINE_PGID:-}" "${CC_FLEET_GROUP_START:-}" <<'LOCKPY'
+import fcntl, os, shutil, subprocess, sys, time
+from pathlib import Path
+op, raw, pid, started, stale, group, group_start = sys.argv[1:]
+dir = Path(raw)
+file = dir / 'pid'
+def start(p):
+    try:
+        r = subprocess.run(['/bin/ps', '-p', str(p), '-o', 'lstart='], capture_output=True, text=True,
+                           env=dict(os.environ, TZ='UTC', LC_ALL='C'), timeout=3)
+        return ' '.join(r.stdout.split()) if r.returncode == 0 else ''
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+def exists(p):
+    try: os.kill(p, 0); return True
+    except ProcessLookupError: return False
+    except PermissionError: return True
+
+def read():
+    try: return file.read_text().splitlines()
+    except FileNotFoundError: return []
+
+def live(record):
+    if record and record[0].isdigit() and int(record[0]) > 0 and exists(int(record[0])):
+        now = start(record[0])
+        if len(record) < 2 or not record[1] or not now or now == record[1]: return True
+    if len(record) >= 4 and record[2].isdigit() and int(record[2]) > 1:
+        # A reused group leader PID does not inherit its predecessor's lease.
+        now = start(record[2])
+        if now and now != record[3]: return False
+        if exists(-int(record[2])): return True
+    return False
+
+try:
+    if op == 'live': sys.exit(0 if live(read()) else 1)
+    fd = os.open(raw + '.gate', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    if dir.is_symlink(): raise RuntimeError('lock directory is a symlink')
+    record = read()
+    if op == 'release':
+        if record[:2] != [pid, started]: sys.exit(1)
+        # The app supervises the whole group, including children after shell exit.
+        # Preserve the lease until a later caller proves the group is gone.
+        if not group: shutil.rmtree(dir)
+    else:
+        if not started: raise RuntimeError('cannot read this process start time')
+        if live(record): raise RuntimeError('owner PID/start or its engine process group is live')
+        if dir.exists() and not record and time.time() - dir.stat().st_mtime < int(stale):
+            raise RuntimeError('owner identity has not been published yet')
+        dir.mkdir(mode=0o700, exist_ok=True)
+        tmp = dir / ('pid.new.' + pid)
+        with open(tmp, 'w') as f:
+            f.write('\n'.join([pid, started, group, group_start]) + '\n')
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, file)
+        print('PID/start identity admitted under the kernel gate')
+except (OSError, RuntimeError) as error:
+    print(str(error)); sys.exit(1)
+LOCKPY
+}
+lock_owner_live() { lock_op live "${1%/pid}"; }
+lock_take() { LOCK_NOTE=$(lock_op take "$1"); }
+lock_release() { lock_op release "$1"; }
+
+# Restart locks this run took, one per bot it launches, and the fleet transaction
+# lock. Each restart lock is released once the launched bots are checked, and all
+# of them again on any exit; lock_release only ever removes a lock that still
+# names this run, so a repeat is harmless.
+taken_locks=()
+FLEET_LOCK_HELD=0
+release_taken_locks() {
+  local l
+  for l in ${taken_locks[@]+"${taken_locks[@]}"}; do lock_release "$l"; done
+}
+release_all_locks() {
+  release_taken_locks
+  if [ "$FLEET_LOCK_HELD" -eq 1 ]; then
+    lock_release "$FLEET_LOCK"
+    FLEET_LOCK_HELD=0
+  fi
+}
+trap release_all_locks EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [ $DRY_RUN -eq 0 ]; then
+  if ! lock_take "$FLEET_LOCK"; then
+    echo "Restore NOT run: another fleet-snapshot or fleet-restore is running ($LOCK_NOTE). Nothing was changed; run it again when that one finishes."
+    exit 7
+  fi
+  FLEET_LOCK_HELD=1
+  recover_snapshot_journals || { echo "Restore recovery failed; no bot acted on"; exit 1; }
+fi
+
+if [ ! -f "$SNAP" ]; then
+  echo "No snapshot found at $SNAP, so there is nothing to restore." >&2
+  echo "Run fleet-snapshot BEFORE restarting so there's something to restore." >&2
+  exit 1
+fi
+
+# The generation this run processes, read once, under the fleet lock.
+GEN=$(snap_generation "$SNAP")
+echo "Snapshot: $SNAP (generation $GEN)"
+
+UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+
+launched=0; restarted=0; skipped=0; waiting=0; failed=0; rejected=0
+dry_launch=0; dry_restart=0
 problems=""
-to_unpark=()
-l_key=(); l_sdir=(); l_since=(); l_parked=()   # bots launched this run, still to be checked
+seen=" "
+validated_rows=()
+h_key=(); h_sdir=(); h_parked=()   # every bot this run handles: each one is checked again at the end
+l_key=(); l_sdir=()                # bots launched this run, waited on in pass 2
 note_problem() { problems="${problems:+$problems; }$1"; failed=$((failed+1)); }
+reject_row() { problems="${problems:+$problems; }$1"; rejected=$((rejected+1)); }
 
-# ---- pass 1: launch (or skip) each bot ------------------------------------
-# Parse tab-separated fields WITHOUT collapsing empties: `IFS=$'\t' read` treats
-# tab as whitespace and would swallow an empty session_id, shifting every later
-# column. Convert tabs to the unit-separator (a non-whitespace delimiter) so an
-# empty field is preserved. `set -f` disables globbing on the split.
-while IFS= read -r line; do
+# ---- pass 1: launch, restart or skip each bot -------------------------------
+# Tabs become the unit separator, which is not IFS whitespace, so an empty field
+# (an empty session id) stays an empty field instead of vanishing.
+while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in \#*|"") continue ;; esac
-  set -f
-  oldIFS=$IFS; IFS=$'\037'
-  # intentional field split on the unit-separator (globbing disabled above).
-  # shellcheck disable=SC2046
-  set -- $(printf '%s' "$line" | tr '\t' '\037')
-  IFS=$oldIFS
-  set +f
-  # TSV columns: 1 key  2 cwd  3 state_dir  4 proj_dir  5 session_id
-  #              6 was_running  7 already_disabled  8 we_parked  9 mtime
-  key="${1:-}"; cwd="${2:-}"; sdir="${3:-}"; sid="${5:-}"
-  already_disabled="${7:-}"; we_parked="${8:-}"
-  [ -z "$key" ] && continue
-
-  if [ "$already_disabled" = "1" ]; then
-    echo "$key: was manually disabled before the snapshot -> leaving DOWN (respecting your kill switch)"
+  IFS=$'\037' read -r key cwd sdir proj sid was_running already_disabled we_parked smtime < <(printf '%s\n' "${line//$'\t'/$'\037'}")
+  # Checked against fleet.json: only a row that names a configured bot with
+  # exactly that bot's own paths is ever acted on.
+  want_cwd=""; want_sdir=""; want_proj=""
+  if [[ "$key" =~ $KEY_RE ]]; then
+    want_cwd=$(fc bot "$key" workdir 2>/dev/null || true)
+    want_sdir=$(fc bot "$key" state_dir 2>/dev/null || true)
+    want_proj=$(fc project-dir "$key" 2>/dev/null || true)
+  fi
+  why=""
+  if [ -z "$want_cwd" ] || [ -z "$want_sdir" ]; then
+    why="'$(printable "$key")' is not a bot in fleet.json"
+  elif [[ "$seen" == *" $key "* ]]; then
+    why="$key appears twice"
+  elif [ "$cwd" != "$want_cwd" ] || [ "$sdir" != "$want_sdir" ] || [ "$proj" != "$want_proj" ]; then
+    why="its paths are not the ones fleet.json gives $key"
+  elif ! [[ -z "$sid" || "$sid" =~ $UUID_RE ]]; then
+    why="its session id is not a uuid"
+  elif ! [[ "$was_running" =~ ^[01]$ && "$already_disabled" =~ ^[01]$ && "$we_parked" =~ ^[01]$ && "$smtime" =~ ^[0-9]+$ ]]; then
+    why="its flags are malformed"
+  fi
+  if [ -n "$why" ]; then
+    rk="$(printable "$key")"
+    echo "${rk:-?}: snapshot row REJECTED ($why) -> not acting on it; its switch and the snapshot are left as they are"
+    reject_row "${rk:-?}: rejected snapshot row"
     continue
   fi
+  seen="$seen$key "
+
+  validated_rows+=("$line")
+done < "$SNAP"
+if [[ ${#validated_rows[@]} -eq 0 ]]; then reject_row "snapshot has no valid bot rows"; fi
+if [[ $rejected -gt 0 ]]; then
+  echo "Restore REJECTED: $problems. No bot was acted on; snapshot kept."
+  exit 2
+fi
+
+# All rows are valid and retained in memory under the transaction lock.
+for line in ${validated_rows[@]+"${validated_rows[@]}"}; do
+  IFS=$'\037' read -r key cwd sdir proj sid was_running already_disabled we_parked smtime < <(printf '%s\n' "${line//$'\t'/$'\037'}")
+  if [[ "$already_disabled" == "1" ]] || { [[ -e "$WD_STATE/$key.disabled" ]] && ! snapshot_owns_switch "$GEN" "$key"; }; then
+    echo "$key: manual watchdog switch -> leaving its session untouched and preserving the switch"
+    continue
+  fi
+  h_key+=("$key"); h_sdir+=("$sdir"); h_parked+=("$we_parked")
 
   existing=$(session_pid_for "$sdir")
   if [ -n "$existing" ]; then
-    echo "$key: already running (pid=$existing) -> skip launch, no duplicate"
-    skipped=$((skipped+1))
-    [ "$we_parked" = "1" ] && to_unpark+=("$key")
+    wp=$(poller_pid_for "$sdir")
+    if [ -n "$wp" ]; then
+      echo "$key: already up (session pid=$existing, poller pid=$wp) -> skip launch, no duplicate"
+      skipped=$((skipped+1))
+      continue
+    fi
+    # A session without its poller hears nothing, so it is not "up".
+    lk_pid=$(lock_pid_in "$LOCK_BASE-fresh-lock-$key/pid")
+    if lock_owner_live "$LOCK_BASE-fresh-lock-$key/pid"; then
+      echo "$key: session pid=$existing has no Telegram poller, but a restart of this bot is in flight (pid $lk_pid) -> leaving it to that restart"
+      waiting=$((waiting+1))
+      continue
+    fi
+    age=$(session_age "$existing")
+    if [ -n "$age" ] && [ "$age" -lt "$STARTUP_GRACE" ]; then
+      echo "$key: session pid=$existing started ${age}s ago and its Telegram poller is not up yet -> leaving it to finish starting"
+      waiting=$((waiting+1))
+      continue
+    fi
+    resume="${sid:-fresh-keep}"
+    if [ -n "$sid" ]; then
+      echo "$key: session pid=$existing runs WITHOUT its Telegram poller (it hears nothing) -> restart it through fleet-fresh, resumed into session $sid"
+    else
+      echo "$key: session pid=$existing runs WITHOUT its Telegram poller (it hears nothing) -> restart it through fleet-fresh as a fresh session on its own model"
+    fi
+    if [ $DRY_RUN -eq 1 ]; then
+      echo "   DRY RUN would run: $(shq "$FRESH") $existing $(shq "$cwd") $(shq "$resume") quiet"
+      dry_restart=$((dry_restart+1))
+      continue
+    fi
+    if [ ! -x "$FRESH" ] && ! command -v "$FRESH" >/dev/null 2>&1; then
+      echo "$key: RESTART FAILED ($FRESH is missing) -> its watchdog switch stays on for a retry"
+      note_problem "$key could not be restarted"
+      continue
+    fi
+    "$FRESH" "$existing" "$cwd" "$resume" quiet
+    frc=$?
+    case $frc in
+      0) echo "$key: restarted by fleet-fresh (exit 0, its new poller confirmed)"
+         restarted=$((restarted+1)) ;;
+      7) echo "$key: fleet-fresh skipped it (exit 7: another restart is in flight, or one already brought it back)" ;;
+      *) echo "$key: fleet-fresh exited $frc (see $FLEET_HOME/logs/fresh.log)" ;;
+    esac
     continue
   fi
 
+  # Built from fleet.json and quoted for the Terminal shell. A row with no session
+  # id starts an empty session that keeps the bot's own model (fresh-keep).
   if [ -z "$sid" ]; then
-    echo "$key: no saved session id -> start FRESH"
-    cmd="$LAUNCHER $cwd"
+    echo "$key: no saved session id -> start FRESH on its own model"
+    cmd="/usr/bin/env $(shq "FLEET_HOME=$FLEET_HOME") $(shq "FLEET_CONFIG=$FLEET_CONFIG") $(shq "$LAUNCHER") $(shq "$cwd") $(shq fresh-keep)"
   else
     echo "$key: resume session $sid"
-    cmd="$LAUNCHER $cwd $sid"
+    cmd="/usr/bin/env $(shq "FLEET_HOME=$FLEET_HOME") $(shq "FLEET_CONFIG=$FLEET_CONFIG") $(shq "$LAUNCHER") $(shq "$cwd") $(shq "$sid")"
   fi
 
   if [ $DRY_RUN -eq 1 ]; then
     echo "   DRY RUN would open Terminal -> do script: $cmd"
-    [ "$we_parked" = "1" ] && to_unpark+=("$key")
+    dry_launch=$((dry_launch+1))
     continue
   fi
 
-  since=$(date +%s)
-  osa_err=$(/usr/bin/osascript 2>&1 >/dev/null <<OSA
-tell application "Terminal"
-  activate
-  do script "$cmd"
-end tell
+  # The launch runs under the bot's restart lock, the one fleet-fresh takes, held
+  # until the launched bots are checked in pass 2. A restart already in flight
+  # keeps it: this bot is then not launched and counts as a problem, so its switch
+  # and the snapshot stay for a retry.
+  lock="$LOCK_BASE-fresh-lock-$key"
+  if ! lock_take "$lock"; then
+    echo "$key: another restart of this bot is in flight ($LOCK_NOTE) -> not launched; its watchdog switch stays on for a retry"
+    note_problem "$key: another restart was in flight"
+    continue
+  fi
+  taken_locks+=("$lock")
+  # Checked again under the lock: a restart that just finished may have brought it back.
+  existing=$(session_pid_for "$sdir")
+  if [ -n "$existing" ]; then
+    lock_release "$lock"
+    echo "$key: came back while fleet-restore was starting it (pid=$existing) -> skip launch, no duplicate"
+    skipped=$((skipped+1))
+    continue
+  fi
+
+  osa_err=$(/usr/bin/osascript - "$cmd" 2>&1 >/dev/null <<'OSA'
+on run argv
+  tell application "Terminal"
+    activate
+    do script (item 1 of argv)
+  end tell
+end run
 OSA
 )
   osa_rc=$?
   if [ $osa_rc -ne 0 ]; then
+    lock_release "$lock"
     echo "$key: LAUNCH FAILED (osascript exit $osa_rc: ${osa_err:-no error text}) -> its watchdog switch stays on for a retry"
     note_problem "$key did not launch"
     continue
   fi
   launched=$((launched+1))
-  l_key+=("$key"); l_sdir+=("$sdir"); l_since+=("$since"); l_parked+=("$we_parked")
+  l_key+=("$key"); l_sdir+=("$sdir")
   sleep 3   # stagger so windows come up one at a time
-done < "$SNAP"
+done
 
 if [ $DRY_RUN -eq 1 ]; then
-  for key in ${to_unpark[@]+"${to_unpark[@]}"}; do
-    [ -z "$key" ] && continue
-    echo "   DRY RUN would un-park: rm -f $WD_STATE/$key.disabled"
+  unpark_n=0
+  for i in "${!h_key[@]}"; do
+    [ "${h_parked[$i]}" = "1" ] || continue
+    echo "   DRY RUN would un-park once ${h_key[$i]} is confirmed back: rm -f $WD_STATE/${h_key[$i]}.disabled"
+    unpark_n=$((unpark_n+1))
   done
+  [ $unpark_n -eq 0 ] && echo "   DRY RUN: nothing to un-park (this snapshot set no watchdog switch)"
   echo
-  echo "DRY RUN complete. Nothing launched, nothing un-parked."
+  [ $((failed + rejected)) -gt 0 ] && echo "DRY RUN found problems: $problems. A real run would not act on those rows and would keep the snapshot."
+  echo "DRY RUN complete: $skipped already up, $dry_launch to launch, $dry_restart to restart, $waiting left to finish starting. Nothing launched, nothing un-parked."
+  [ $rejected -gt 0 ] && exit 2
   exit 0
 fi
 
-# ---- pass 2: check every launch -------------------------------------------
-# A launch counts only once the bot's session is seen running again. Its Telegram
-# poller is reported too; a session that is up while its poller is not confirmed
-# yet is handed to the watchdog, which restarts a poller that stays dead.
-back=0; poller_pending=""
+# ---- pass 2: wait for the launches ------------------------------------------
+# Each launched bot gets RESTORE_WAIT seconds. Every look is a fresh one: a bot
+# that was seen once and then died is not remembered as back.
 if [ $launched -gt 0 ]; then
   echo
   echo "Waiting up to ${RESTORE_WAIT}s for each launched bot to come back before re-enabling the watchdog..."
   deadline=$(( $(date +%s) + RESTORE_WAIT ))
-  l_state=()
-  for i in "${!l_key[@]}"; do l_state[i]="down"; done
   while :; do
     all_live=1
     for i in "${!l_key[@]}"; do
-      [ "${l_state[$i]}" = "live" ] && continue
-      if [ "${l_state[$i]}" = "down" ] && [ -n "$(session_pid_for "${l_sdir[$i]}")" ]; then l_state[i]="up"; fi
-      if [ "${l_state[$i]}" = "up" ] && poller_live "${l_sdir[$i]}" "${l_since[$i]}"; then l_state[i]="live"; fi
-      [ "${l_state[$i]}" = "live" ] || all_live=0
+      final_state "${l_sdir[$i]}"
+      if [ "$FC_STATE" != "live" ]; then all_live=0; break; fi
     done
     { [ $all_live -eq 1 ] || [ "$(date +%s)" -ge $deadline ]; } && break
     sleep 3
   done
-  for i in "${!l_key[@]}"; do
-    key="${l_key[$i]}"
-    case "${l_state[$i]}" in
-      live) echo "$key: back - session running, Telegram poller live" ;;
-      up)   echo "$key: back - session running, but its Telegram poller was not confirmed within ${RESTORE_WAIT}s (the watchdog takes it from here)"
-            poller_pending="${poller_pending:+$poller_pending }$key" ;;
-      *)    echo "$key: DID NOT COME BACK within ${RESTORE_WAIT}s -> its watchdog switch stays on for a retry"
-            note_problem "$key did not come back"
-            continue ;;
-    esac
-    back=$((back+1))
-    [ "${l_parked[$i]}" = "1" ] && to_unpark+=("$key")
-  done
 fi
+# Every launch has been checked (or has run out of time): release the restart locks.
+release_taken_locks
 
-# ---- pass 3: hand control back to the watchdog ----------------------------
-# Only switches the snapshot set, and only for bots that are up. A bot that did
-# not come back keeps its switch, so nothing races a retry.
+# ---- final check: every bot as it is right now ------------------------------
+echo
+echo "Final check, every bot this restore handled, as it is right now:"
+pending=""
+to_unpark=()
+for i in "${!h_key[@]}"; do
+  key="${h_key[$i]}"
+  final_state "${h_sdir[$i]}"
+  case "$FC_STATE" in
+    live)
+      echo "  $key: back - $FC_DETAIL"
+      [ "${h_parked[$i]}" = "1" ] && to_unpark+=("$key") ;;
+    pending)
+      echo "  $key: PENDING WATCHDOG - $FC_DETAIL"
+      pending="${pending:+$pending }$key"
+      [ "${h_parked[$i]}" = "1" ] && to_unpark+=("$key") ;;   # the watchdog finishes it
+    *)
+      echo "  $key: FAILED - $FC_DETAIL -> its watchdog switch stays on for a retry"
+      note_problem "$key is not running" ;;
+  esac
+done
+
+# ---- pass 3: hand control back to the watchdog ------------------------------
+# Only switches the snapshot set, and only for bots whose session runs. A bot that
+# is not running keeps its switch, so nothing races a retry.
 unparked=0
 for key in ${to_unpark[@]+"${to_unpark[@]}"}; do
   [ -z "$key" ] && continue
   [ -f "$WD_STATE/$key.disabled" ] || continue
+  if ! snapshot_owns_switch "$GEN" "$key"; then
+    echo "$key: current watchdog switch is not owned by this snapshot; preserved"
+    continue
+  fi
   if rm -f "$WD_STATE/$key.disabled"; then
     unparked=$((unparked+1))
   else
@@ -210,19 +648,48 @@ for key in ${to_unpark[@]+"${to_unpark[@]}"}; do
   fi
 done
 
-echo
-if [ $failed -eq 0 ]; then
-  # Snapshot consumed - archive it so a stale snapshot can't be reused by accident.
-  if ! mv "$SNAP" "$SNAP.used.$(date +%s)"; then
-    echo "Restore INCOMPLETE: every bot is up, but the snapshot could not be archived. Rename $SNAP by hand."
-    exit 1
+# A pending bot is only as good as the watchdog that is meant to finish it: say
+# whether the watchdog really looks after it now.
+for key in $pending; do
+  gap=$(watchdog_gap "$key")
+  if [ -z "$gap" ]; then
+    echo "  $key: pending watchdog - the watchdog is enabled for $key (no switch set, a pass logged within the last ${WATCHDOG_PASS_MAX}s), so it restarts a poller that stays down"
+  else
+    echo "  $key: pending watchdog - but the watchdog is NOT enabled for $key ($gap), so nothing finishes this on its own: run fleet-restore again, or /fresh it"
   fi
-  echo "Restore complete: $launched launched, $skipped already-up, watchdog re-enabled for $unparked bots."
-  [ -n "$poller_pending" ] && echo "Telegram poller not confirmed yet for: $poller_pending. The watchdog now watches them."
-  echo "Give the bots up to a minute to finish reconnecting Telegram."
-  echo "If a bot was mid-task when you restarted, send it 'continue' to pick up where it left off."
+done
+
+echo
+summary="$launched launched, $restarted restarted, $skipped already up; watchdog re-enabled for $unparked bots"
+if [ $rejected -gt 0 ]; then
+  echo "Restore ran: $summary."
+  echo "Restore INCOMPLETE: $problems${pending:+; pending watchdog: $pending}. The snapshot (generation $GEN) was kept at $SNAP; the rejected rows were not acted on. Fix or retake the snapshot, then run fleet-restore again."
+  exit 2
+fi
+if [ $failed -gt 0 ] || [ -n "$pending" ]; then
+  why="$problems"
+  [ -n "$pending" ] && why="${why:+$why; }pending watchdog: $pending"
+  echo "Restore ran: $summary."
+  echo "Restore INCOMPLETE: $why. The snapshot (generation $GEN) was kept at $SNAP, and the switches of bots that are not running stay on. Run fleet-restore again to retry them."
+  exit 1
+fi
+
+# Every bot is back. Archive the snapshot, but only the generation this run read:
+# a newer snapshot is never consumed by a restore that did not process it.
+if [ ! -f "$SNAP" ]; then
+  echo "Restore complete: $summary. Snapshot generation $GEN is no longer at $SNAP (already archived or removed), so there was nothing to archive."
   exit 0
 fi
-echo "Restore ran: $launched launched ($back back), $skipped already-up, watchdog re-enabled for $unparked bots."
-echo "Restore INCOMPLETE: $problems. The snapshot was kept at $SNAP and those bots' watchdog switches stay on. Run fleet-restore again to retry them."
-exit 1
+cur=$(snap_generation "$SNAP")
+if [ "$cur" != "$GEN" ]; then
+  echo "Restore complete: $summary. $SNAP now holds generation $cur, not generation $GEN that this restore processed, so it was left in place for its own restore."
+  exit 0
+fi
+arch="$SNAP.used.$(date +%s)"
+if ! mv "$SNAP" "$arch"; then
+  echo "Restore INCOMPLETE: every bot is back, but the snapshot could not be archived. Rename $SNAP by hand."
+  exit 1
+fi
+echo "Restore complete: $summary. Snapshot generation $GEN archived as $arch."
+echo "If a bot was mid-task when you restarted, send it 'continue' to pick up where it left off."
+exit 0
