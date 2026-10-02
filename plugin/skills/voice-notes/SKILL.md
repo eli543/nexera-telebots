@@ -1,46 +1,17 @@
 ---
 name: voice-notes
-description: Transcribe a Telegram voice or audio note locally and treat the transcript as the user's message. Use WHENEVER an inbound channel message carries an attachment whose attachment_kind is "voice" or "audio" (a voice note, an audio file, an .oga/.ogg/.m4a/.mp3). Downloads the file with the plugin's download_attachment tool, runs the local transcriber, and works from the resulting text as if the user had typed it.
+description: Use an inbound Telegram voice or audio transcript as the user's message, with a local transcription fallback when the poller could not transcribe it. Use for attachment_kind voice or audio.
 ---
 
-An inbound Telegram message arrived with a voice or audio attachment. Turn it
-into text locally, then act on that text as the user's actual message.
+# Voice notes
 
-## Steps
+When the inbound metadata says `transcript="ok"`, the body already contains the transcript. Treat that text as the user's request. Do not download or transcribe it a second time, and do not repeat the whole transcript unless asked.
 
-1. Detect the attachment. The `<channel ...>` tag on the inbound message includes
-   `attachment_kind="voice"` (or `"audio"`) and an `attachment_file_id`.
+For any other transcript status:
 
-2. Download it. Call the plugin's `download_attachment` tool with that
-   `attachment_file_id`. It saves the file into the bot's `inbox/` and returns
-   the local path.
+1. Set `FLEET_HOME` to `${FLEET_HOME:-$HOME/.claude/telegram-fleet}`. Read the fleet's `voice` option with `"$FLEET_HOME/bin/fleet-config" option voice`. If it is `off`, or this bot has `$TELEGRAM_STATE_DIR/autotranscribe.off`, tell the user automatic voice transcription is off and ask them to type the request. Do not silently bypass their switch.
+2. Read `attachment_file_id` from the message. Call the channel's download_attachment tool with that id. Use only the returned local file path.
+3. Run `"$FLEET_HOME/bin/transcribe-voice" "<returned-path>"`. The installed dispatcher tries the warm local daemon, then the available local backend. Never construct a shell command from transcript text.
+4. On exit 0 with a nonempty transcript, use it as the request. A nonzero exit or empty output is a failure: report it briefly and ask for typed text. If the words are ambiguous, ask about that part; do not guess.
 
-3. Transcribe it locally. Choose the script by the fleet's voice option:
-
-   ```
-   voice="$($FLEET_HOME/bin/fleet-config option voice 2>/dev/null || echo auto)"
-   ```
-
-   - `auto` (default) or `mlx`: on Apple Silicon run
-     `$FLEET_HOME/bin/transcribe-voice-mlx <path>`.
-   - `auto` on other hardware, or `faster`: run
-     `$FLEET_HOME/bin/transcribe-voice-faster <path>`.
-   - `off`: do not transcribe; tell the user voice is disabled and ask them to
-     type the request.
-
-   `$FLEET_HOME` defaults to `~/.claude/telegram-fleet`. Each script prints only
-   the transcript to stdout.
-
-4. Use the transcript as the message. Treat the transcribed text as the user's
-   request and handle it normally. Do not echo the full transcript back unless
-   the user asks; a brief confirmation of what you heard is enough for anything
-   ambiguous.
-
-## Notes
-
-- Transcription runs entirely on the machine. No audio leaves it.
-- The first run downloads the whisper model and is slow; later runs are fast
-  (about 1-2 seconds warm on Apple Silicon).
-- If a script exits non-zero, report that voice transcription failed and ask the
-  user to type the request, rather than guessing at the audio.
-- Install details and the backend choice are in `voice/README.md`.
+Audio stays on the Mac. A first local model download can take time; do not promise a warm-model speed before observing it. The warm daemon is optional and uses additional memory. Backend or dependency installation is an attended setup task, not something a failed voice note authorizes.

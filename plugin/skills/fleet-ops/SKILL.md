@@ -1,94 +1,60 @@
 ---
 name: fleet-ops
-description: Day-two operations for a nexera-telebots install. Use when the user wants to add a bot to the fleet, rotate a bot token, read the watchdog logs, park or re-enable a bot, turn a hook off with a kill switch, or test a hook safely. Covers the exact file paths and the safe procedures.
+description: Manage an existing Telebots fleet on macOS, including adding and pairing a bot locally, inspecting health and logs, parking watchdog recovery, and explaining feature switches. Uses installed engines and the configured bot list.
 ---
 
-Operational knowledge for running a fleet after it is set up. `$FLEET_HOME`
-defaults to `~/.claude/telegram-fleet`. State directories are at
-`~/.claude/channels/fleet-<key>/`.
+# Fleet operations
 
-## Add a bot
+Set `FLEET_HOME` to `${FLEET_HOME:-$HOME/.claude/telegram-fleet}` and use `"$FLEET_HOME/bin/<engine>"`. Read `$FLEET_HOME/fleet.json`; never infer a state directory from a bot's name or a fixed list. This product requires macOS 14 or newer and Terminal.app. If the engines are missing, finish the documented installer first.
 
-1. Create the bot in @BotFather and copy its token.
-2. Add an entry to `$FLEET_HOME/fleet.json` (schema in
-   `config/fleet.example.json`): `name`, `key` (matching
-   `^[a-z0-9][a-z0-9-]{0,30}$`, unique), `workdir`, `state_dir` of
-   `~/.claude/channels/fleet-<key>`, and an emoji.
-3. Create the state directory and write the token:
-   ```
-   mkdir -p ~/.claude/channels/fleet-<key>
-   printf 'TELEGRAM_BOT_TOKEN=%s\n' "<token>" > ~/.claude/channels/fleet-<key>/.env
-   chmod 600 ~/.claude/channels/fleet-<key>/.env
-   ```
-   Never echo the token back or write it anywhere else.
-4. Seed `access.json` with `dmPolicy` `pairing` and an empty `allowFrom`.
-5. Pair and lock down: DM the bot, `/telegram:access pair <code>`, then
-   `/telegram:access policy allowlist`.
-6. Start it: `$FLEET_HOME/bin/fleet-launch <key>`. The watchdog picks it up on
-   its next pass; no script edits are needed.
+## Add one bot
 
-## Rotate a token
+Do this from an attended local session, never by approving a pairing from Telegram.
 
-1. In @BotFather, pick the bot and choose Revoke current token. The old token
-   dies immediately.
-2. Write the new token into `~/.claude/channels/fleet-<key>/.env` (chmod 600),
-   or run `/telegram:configure <new-token>` from that bot.
-3. Restart the bot so the poller reloads the token:
-   `$FLEET_HOME/bin/fleet-fresh <pid> <workdir>` or send `/fresh`.
+1. You do this: create one bot in @BotFather with /newbot. Choose its name and a username ending in bot. Keep the token out of the assistant conversation.
+2. Run `"$FLEET_HOME/bin/fleet-add-bot" <key> --name "<name>" --emoji "<emoji>"`, using a unique key matching `^[a-z0-9][a-z0-9-]{0,30}$`.
+3. You do this: paste the token into the hidden Mac dialog, or type it at the engine's hidden Terminal prompt. The engine validates it, checks for duplicates, writes its state at mode 600, and appends the config entry last. Never write a token with an assistant-authored shell command or paste it into /telegram:configure.
+4. Run `"$FLEET_HOME/bin/fleet-start" <key>`. You do this: accept the first-launch folder trust prompt in the new Terminal window, and the permissions warning if full stance was explicitly selected.
+5. You do this: DM the bot and read the six-character pairing code. Run `"$FLEET_HOME/bin/fleet-pair" <key> <code> --lock` locally. This updates that bot's allowlist and writes its .enrolled marker.
+6. Send hi from the phone, run `"$FLEET_HOME/bin/fleet-checklist" <key>`, and complete its phone checks. An existing watchdog picks up the new bot only after enrollment. No changes to other bots are needed.
 
-## Read the logs
+BotFather can allow a few new bots and then ask you to wait. Finish one before making another; waits can be long and Telegram does not publish the throttle rule. Community references report 20 bots per account, or 40 with Premium. Treat a BotFather refusal as the current limit rather than trying to bypass it.
 
-- Watchdog: `$FLEET_HOME/logs/watchdog.log` (restarts, health decisions).
-- Command engines: `$FLEET_HOME/logs/fresh.log`, `model.log`, `esc.log`,
-  `context.log`, `usage.log` - one per engine, every request and refusal.
-- To see what the watchdog would do without acting:
-  `$FLEET_HOME/bin/watchdog.sh --dry-run`.
+## Inspect first
 
-## The Telegram "/" command menu
+- `"$FLEET_HOME/bin/fleet-doctor"` reports health and setup gaps.
+- `"$FLEET_HOME/bin/fleet-state" --json` reports the configured sessions.
+- `"$FLEET_HOME/bin/watchdog.sh" --dry-run` explains the next recovery decisions without restarting bots.
+- Watchdog logs live in `$FLEET_HOME/logs/`. Poller and per-bot engine logs live under the configured `<state_dir>/logs/`; look for poller-events.log, fresh.log, update.log, compact.log, esc.log, context.log and usage.log.
+- `$FLEET_HOME/overlay.status` records overlay health. A different official plugin version pauses extras safely. Do not force an old overlay onto it or restart repeatedly to try to fix version drift.
 
-With the optional patches applied, each poller re-registers the real command
-menu (`esc`, `fresh`, `opus`, `fable`, `model`, `context`, `usage`, `resume`)
-every time it starts - the poller-start list in patch 09 is the source of
-truth. If the menu looks stale or boilerplate: confirm the patches are applied
-(`patches/verify-patches.sh`), restart the bot (`/fresh` is enough), and give
-the Telegram client a minute to refresh its cache. For instant effect there is
-a one-off `setMyCommands` curl in `patches/README.md`.
+The menu comes from `$FLEET_HOME/ux.json`: esc, fresh, update, key, inbox, opus, fable, model, effort, context, compact, usage, resume. It registers on poller start. For a stale menu, check the overlay and logs before requesting a restart; /fresh clears the conversation, while /update resumes it.
 
-## If /esc reports it could not land
+## Permissions and recovery
 
-`fleet-esc` presses a real key, so macOS must allow it: grant Automation and
-Accessibility consent when prompted (System Settings -> Privacy & Security).
-A locked screen also blocks window fronting. Every attempt and its outcome is
-in `$FLEET_HOME/logs/esc.log`, and the bot reports a miss honestly in the chat
-rather than letting silence read as success.
+Use `"$FLEET_HOME/bin/fleet-checklist" --consent` while the user is at the Mac to request Terminal Automation and Accessibility access. A phone cannot approve those dialogs. Do not claim /esc or /compact worked without their reported evidence.
 
-## Park or re-enable a bot
+The permission stance is fleet-wide. safe uses ordinary prompts; scoped uses Claude Code `--permission-mode auto`; full uses `--dangerously-skip-permissions` and must be selected explicitly. A mixed stance can hold peer messages for approval. Never change stance as a workaround for a blocked task.
 
-- Park one bot (stop the watchdog from restarting it) by creating its disable
-  marker under `$FLEET_HOME/watchdog-state/`.
-- Re-enable it by removing that marker.
+To park automatic recovery, create the configured state's `stopped` marker. Remove only that marker to resume watchdog coverage. Parking does not stop a running session. State changes require the user's direction; never signal a process based only on its name. Use the provided engine for a requested restart and verify its result.
 
-## Kill switches (turn a hook off, no restart)
+Token rotation is attended. The user revokes the old token in @BotFather, enters the replacement through a local hidden-input procedure, and requests a history-preserving restart. Never print, copy into chat, or include a token in command arguments. Do not invent an unsupported fleet-add-bot replacement flag; inspect the installed engine's help first.
 
-State-dir switches live in `~/.claude/channels/fleet-<key>/` and affect only
-that bot:
+## Per-bot switches
 
-| File | Turns off |
+Read the selected state directory before changing anything. Create or remove only the requested marker:
+
+| Marker | Effect |
 |---|---|
-| `stream.off` | the live progress box |
-| `ack.off` | the instant reaction ack |
-| `tldr_hook_off` | the whole numbered-TLDR check |
-| `tldr_judge_off` | only the API judge (free checks stay on) |
-| `reply_guard_off` | the reply-delivery guarantee |
+| stream.off | Disable the live box |
+| ack.off | Disable the instant acknowledgement reaction |
+| tldr_hook_off | Disable the structured reply check |
+| tldr_judge_off | Disable only the optional API judge |
+| reply_guard_off | Disable the reply delivery guard |
+| autotranscribe.off | Disable automatic voice transcription |
+| rich-stream | Enable rich live-box transport with plain fallback |
+| guardian-thresholds | Override this bot's context thresholds as comma-separated percentages |
 
-One switch is global: `$FLEET_HOME/deliver-nudge.off` turns off the
-document-delivery nudge, which runs in every session.
+The optional document-delivery switch is `$FLEET_HOME/deliver-nudge.off`. Hooks do nothing outside a Telegram bot session. Optional AI judging is off unless configured; no API key is needed for the normal reply structure checks.
 
-Create one with `touch`; remove the file to restore the hook.
-
-## Test a hook safely
-
-Never start a second Claude session against a live bot to test it; a duplicate
-poller kills the real one. Test the streamer offline with `STREAM_DRY=1` and
-`STREAM_NO_SPAWN=1` set, which blocks real API calls and the animator spawn. The
-hook test harnesses under `tests/` also run fully offline.
+Never test against a live state directory. Use the project's scrubbed sandbox harness, an isolated HOME and fake credentials. A second poller with the same token can disconnect the real bot.

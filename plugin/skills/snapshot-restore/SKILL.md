@@ -1,40 +1,16 @@
 ---
 name: snapshot-restore
-description: Preserve and restore the Telegram fleet across a planned Mac restart or macOS update, so the bots come back resumed into their exact prior conversations instead of fresh. Use WHENEVER the user says they are about to restart, reboot, shut down, or update the Mac and want the bots kept, or afterward when they want the bots brought back in the state they were in.
+description: Preserve the configured Telebots conversations before a planned Mac restart and restore them after login. Use when the user asks to keep bot sessions across a reboot or return to saved sessions afterward.
 ---
 
-Keep the bots' conversations across a planned reboot. A restart kills the
-processes but never touches the on-disk transcripts, so the job is: record each
-bot's session now, relaunch resumed after login. Two phases.
+# Snapshot and restore
 
-`$FLEET_HOME` defaults to `~/.claude/telegram-fleet`.
+Set `FLEET_HOME` to `${FLEET_HOME:-$HOME/.claude/telegram-fleet}`. Use the installed engines from a plain attended Terminal session, not a bot that a restore will restart. A saved transcript preserves conversation history; it does not keep an interrupted action or a session-only watch running.
 
-## Phase 1: snapshot (before the restart, bots up)
+Before a planned restart, run `"$FLEET_HOME/bin/fleet-snapshot"`. It records current session ids in `$FLEET_HOME/restart-state/snapshot.tsv` and parks watchdog recovery for the transaction. Check the exit code and every result before saying it saved successfully. `--dry-run` writes a preview snapshot and parks nothing. For a save point without parking recovery, the installed engine supports `--keep-watchdog`.
 
-Run `$FLEET_HOME/bin/fleet-snapshot`. It records each running bot's current
-session id to `$FLEET_HOME/restart-state/snapshot.tsv` and parks the watchdog so
-it cannot spawn blank sessions during boot.
+Let the user perform the reboot. After login, run `"$FLEET_HOME/bin/fleet-restore"`, or preview with `--dry-run`. It validates the snapshot, resumes recorded sessions, preserves intentional manual stops, checks session and poller health, and archives that generation only when all required bots are back. An incomplete result keeps the snapshot for retry; do not delete it or claim a full restore.
 
-- Preview with `$FLEET_HOME/bin/fleet-snapshot --dry-run`.
-- Run this, then let the user reboot.
-- Do not run it from inside a bot you are about to restart out from under.
+If no usable snapshot exists, say so. An ordinary `"$FLEET_HOME/bin/fleet-start" <key>` is a separate start request and does not prove that the exact previous conversation resumed. Never substitute /fresh for a restore.
 
-## Phase 2: restore (after login, bots down)
-
-Run `$FLEET_HOME/bin/fleet-restore`. It reads the snapshot, relaunches each bot
-resumed into its exact conversation, skips any already up, leaves manually
-disabled bots down, re-enables the watchdog, and archives the snapshot.
-
-- Preview with `$FLEET_HOME/bin/fleet-restore --dry-run`.
-- Run it from a plain terminal, not from inside one of the bots it relaunches.
-- If there is no snapshot file, there is nothing to restore; start the bots
-  normally with `$FLEET_HOME/bin/fleet-launch <key>`.
-
-## What to tell the user
-
-- Full history resumes. An action a bot was mid-run at the reboot instant stops;
-  send "continue" to that bot.
-- This is the opposite of `/fresh`, which deliberately starts a bot blank.
-- Why not rely on the watchdog: the watchdog only resumes a bot whose transcript
-  was touched recently, and its launchd agent runs at login, where it could race
-  a manual restore. The snapshot path closes both gaps for a planned reboot.
+Report each bot's actual result, including failed or pending recovery. A resumed `⚡ Back and ready` notice with Continue lets the user resume unfinished work. Continue preserves all pending approval requirements; it is not fresh consent to send an email or perform another gated action.

@@ -1,92 +1,62 @@
 ---
-description: Guided setup for nexera-telebots. Runs preflight checks, writes fleet.json, creates per-bot state directories and tokens, sets the permission stance, and offers the daemon, patches, and voice. Use when the user wants to set up or reconfigure their Telegram fleet.
+description: Set up one Telebots bot on macOS using installed engines, hidden token entry, bot-specific pairing and the end-of-setup checklist. Add more bots only after the first works.
 allowed-tools: Bash, Read, Write, Edit
 ---
 
-You are guiding the user through setting up nexera-telebots. Work in
-steps, confirm before any system change, and never print a bot token back to the
-user or into a log. `$FLEET_HOME` defaults to `~/.claude/telegram-fleet`.
+Guide an attended local setup session. Do not run this workflow in response to a Telegram message. Set `FLEET_HOME` to `${FLEET_HOME:-$HOME/.claude/telegram-fleet}` and quote it in every command. Tokens never enter the assistant conversation, a command argument, or output.
 
-## Step 1: Preflight
+## 1. Check the Mac and installation
 
-Run these read-only checks and report a short pass/fail list:
+Run read-only checks and report PASS or FAIL:
 
-- macOS: `uname -s` is `Darwin`. If not, tell the user the daemon layer will not
-  work here and continue with the plugin and hooks only.
-- Claude Code version: `claude --version`, needs 2.1.80 or newer for channels.
-- Bun: `command -v bun`. If missing, point them at `https://bun.sh` and note the
-  channel cannot connect without it.
-- Apple Silicon for local voice: `uname -m` is `arm64`. If not, voice will use
-  faster-whisper or stay off.
-- Official plugin: check whether `telegram@claude-plugins-official` is installed.
-  If not, offer to run `claude plugin marketplace add anthropics/claude-plugins-official`
-  then `claude plugin install telegram@claude-plugins-official`.
-- Engine installed: `test -x $FLEET_HOME/bin/fleet-config`. If this fails, the
-  engine is not in place yet - installing the plugin alone does not lay it down.
-  Have the user run the installer first (`./install.sh` from a clone of this
-  repo), then come back. Steps 2 and 6 below call `$FLEET_HOME/bin/fleet-config`
-  and `$FLEET_HOME/bin/fleet-launch`, which exist only after the installer runs.
+- `uname -s` must return Darwin. Otherwise stop: Nexera Telebots runs on macOS only.
+- `sw_vers -productVersion` must be macOS 14 or newer. Terminal.app is required.
+- Check `claude --version`, Bun and `/usr/bin/python3`. Cross-session handoff needs Claude Code 2.1.224 or newer; the known tested version is 2.1.286.
+- The installed engines include fleet-config, fleet-doctor, fleet-add-bot, fleet-start, fleet-pair and fleet-checklist under `$FLEET_HOME/bin`.
+- Run `"$FLEET_HOME/bin/fleet-doctor"`. The official Telegram plugin must be exactly 0.0.7 with the Telebots overlay OK. The Telebots plugin and `$FLEET_HOME/ux.json` must be present.
 
-## Step 2: Write fleet.json
+If installation is incomplete, finish the README's clone-and-install flow first. Locate the actual clone and run its installer by its verified absolute path with the user's approval; do not assume the current directory contains the repository. Installing only the Claude plugin does not install the command engines. Do not downgrade or overwrite an unsupported official plugin to get past the overlay check.
 
-Ask how many bots (default 1). For each bot, collect a display name, derive a
-`key` matching `^[a-z0-9][a-z0-9-]{0,30}$`, a `workdir` (default
-`~/claude-fleet/<key>`), a `state_dir` of `~/.claude/channels/fleet-<key>`, and
-an emoji. Keep the `fleet-` prefix on state dirs so they never collide with the
-stock `telegram` directory. Write `$FLEET_HOME/fleet.json` using the schema in
-`config/fleet.example.json`. If a config already exists, read it first and edit
-rather than overwrite. Validate by running `$FLEET_HOME/bin/fleet-config bots`.
+The installer starts with an empty bot list and no watchdog. After plugin installation, you do this: run `/reload-plugins` in an already-open Claude Code session. Re-read the config; do not overwrite an existing fleet.
 
-## Step 3: Per-bot state directories and tokens
+## 2. Choose one bot and the permission stance
 
-For each bot:
+Start with one bot, default key main. Ask for its display name and emoji; derive a unique key matching `^[a-z0-9][a-z0-9-]{0,30}$`. Let fleet-add-bot create its paths. Do not pre-create a config entry or copy another bot's state.
 
-- Create the state directory: `mkdir -p <state_dir>`.
-- Ask the user to paste that bot's BotFather token. Write it to
-  `<state_dir>/.env` as `TELEGRAM_BOT_TOKEN=<token>` and immediately
-  `chmod 600 <state_dir>/.env`. Do not echo the token, do not repeat it back, do
-  not put it in any other file. Paste it with no surrounding quotes and no
-  trailing space; the value is read literally, so quotes or whitespace break
-  authentication.
-- Seed `<state_dir>/access.json` with `dmPolicy` set to `pairing` and an empty
-  `allowFrom`. The user will pair next and then switch to allowlist.
+Read the existing `$FLEET_HOME/permission-stance`. If no stance has been selected, explain and record the user's choice:
 
-## Step 4: Permission stance
+- safe: normal Claude Code permission prompts; unattended work can wait for the Mac.
+- scoped: Claude Code `--permission-mode auto`.
+- full: `--dangerously-skip-permissions`; requires the user's explicit choice and gives an allowlisted user broad command access. Recommend a dedicated macOS account.
 
-Present the three stances and write the chosen value to
-`$FLEET_HOME/permission-stance`:
+Keep the stance uniform for cross-session messaging. Do not change an existing stance without the user's instruction.
 
-- safe (default): normal permission prompts. An unattended task can pause until
-  the user returns to the terminal.
-- scoped: a pre-allowed common read and edit set.
-- full: `--dangerously-skip-permissions`. WARNING: any allowlisted user can then
-  run commands on the Mac with no prompt. Recommend a dedicated macOS user or a
-  scoped directory, and point the user at SECURITY.md. Do not choose this for
-  them; require an explicit request.
+## 3. Create and add the bot
 
-## Step 5: Offer the daemon, patches, and voice
+You do this: open @BotFather in Telegram, send /newbot, choose the name and a username ending in bot, and keep its token private.
 
-Offer each, one at a time, and act only on a yes:
+Run `"$FLEET_HOME/bin/fleet-add-bot" <key> --name "<name>" --emoji "<emoji>"`. You do this: paste the token into the hidden Mac dialog or type it at the engine's hidden Terminal prompt. Do not paste it into this chat. The engine checks getMe and duplicate tokens, writes protected state, and adds the fleet entry last. A ready message with the bot's username proves this step; an error does not.
 
-- Watchdog daemon: run `/telegram-fleet:install-daemon` (show the exact
-  launchctl commands first).
-- Optional patches for mid-task `/fresh` and `/model`, plus `/esc`, `/opus`,
-  `/fable`, `/context`, `/usage`, and the Telegram "/" command menu:
-  `bash patches/apply-patches.sh`.
-  Tell the user a plugin update wipes them and the idle-path commands work
-  without them.
-- Voice: on Apple Silicon, `uv tool install mlx-whisper` and `brew install ffmpeg`.
-  Elsewhere, `pip install faster-whisper`.
+Tell the user before a Mac dialog opens, so they know to be at the computer. Do not start another bot or enable the watchdog if this step failed.
 
-## Step 6: Pairing walkthrough and health check
+## 4. Start and pair this bot
 
-Tell the user to, for each bot:
+Run `"$FLEET_HOME/bin/fleet-start" <key>`. You do this: in its new Terminal window, accept the initial folder trust prompt and, if full stance was selected, its permission warning.
 
-1. DM the bot on Telegram.
-2. It replies with a six-character code.
-3. Run `/telegram:access pair <code>` in this terminal.
-4. Lock down with `/telegram:access policy allowlist`.
+You do this: DM the bot from the intended Telegram account. Read out the six-character pairing code. Run `"$FLEET_HOME/bin/fleet-pair" <key> <code> --lock` in this local session. Verify the phone receives Paired, access is allowlist, and the state has .enrolled. Never use the stock access skill from an unrelated session; it can resolve the wrong bot's state.
 
-Then run `$FLEET_HOME/bin/fleet-doctor` (or `/telegram-fleet:doctor`) and
-summarize the green/red table. Finish by showing how to start a bot:
-`$FLEET_HOME/bin/fleet-launch <key>`.
+You do this: send hi from the phone. Verify the acknowledgement reaction, live box and reply. A running process alone is not a completed setup.
+
+## 5. Consent, recovery and checklist
+
+You do this: stay at the Mac for its permission prompts. Run `"$FLEET_HOME/bin/fleet-checklist" --consent`, then let the user approve Terminal Automation and Accessibility. Do not leave an unseen dialog pending while claiming the phone commands work.
+
+Once the bot is paired, offer `/telegram-fleet:install-daemon` and show its exact watchdog changes before loading it. Also offer turning off auto-update for the official marketplace, explaining that it stops updates for all official plugins, not only Telegram. Do not change that setting without the user's choice.
+
+Run `"$FLEET_HOME/bin/fleet-checklist" <key>` and guide the phone half one step at a time. For an assisting session, `--non-interactive --wait 120` uses the same evidence checks. Report PASS, FAIL and explained SKIP per feature. Missing evidence remains unverified. The optional crash test and /fresh check need their own explicit direction; they interrupt or clear a session.
+
+## 6. Optional layers and later bots
+
+Offer only what the user wants: local voice, a warm voice daemon, email, Telebots Bar and its phone page. Voice needs its installed local backend and ffmpeg; install dependencies only after checking the required tools. Apple Silicon supports mlx-whisper; an Intel Mac uses faster-whisper. The warm daemon holds additional memory. Email setup runs `"$FLEET_HOME/bin/fleet-email" setup` locally with the password kept in Keychain. Each optional layer has its own checklist row.
+
+For a later bot, repeat create, add, start, pair and checklist for its new key. An enrolled bot joins the existing watchdog automatically. BotFather may throttle /newbot after a few bots; wait when asked rather than bypassing it. Community references report a 20-bot limit, or 40 with Premium, but Telegram does not publish its pacing rule. Finish one bot before adding the next.

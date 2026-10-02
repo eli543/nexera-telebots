@@ -1,11 +1,11 @@
 {
   "name": "telegram-fleet",
   "displayName": "Telegram Fleet",
-  "version": "0.2.0",
-  "description": "The always-on upgrade for Claude Code's official Telegram channel: live progress streaming, voice-note prompts, enforced structured replies, /fresh /resume /model plus /esc interrupt, one-tap /opus /fable, live /context /usage meters and a real command menu from Telegram, a self-healing watchdog, reboot-surviving restore, and an N-bot fleet sharing one brain. macOS.",
+  "version": "0.3.0",
+  "description": "Nexera Telebots for macOS: live progress with a mission and task plan, voice notes, tap choices, reactions, local notes, handoff, optional inbox and two-tap email, watchdog recovery, and /esc /fresh /update /key /inbox /opus /fable /model /effort /context /compact /usage /resume.",
   "author": {
-    "name": "Eli Almo, Nexera Intelligence",
-    "url": "https://github.com/eli543"
+    "name": "Nexera Intelligence",
+    "url": "https://nexeraintelligence.com"
   },
   "license": "MIT",
   "homepage": "https://github.com/eli543/nexera-telebots",
