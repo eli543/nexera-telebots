@@ -164,6 +164,23 @@ class OfflineOps(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.email.builtin("send", bad, c)
 
+    def test_email_setup_uses_keychain_prompt_and_saves_no_password(self):
+        answers = ["mail.example.test", "993", "smtp.example.test", "465", "ssl",
+                   "user@example.test", "user@example.test", "Archive"]
+        with patch.object(self.email.sys, "stdin", SimpleNamespace(isatty=lambda: True)), \
+             patch("builtins.input", side_effect=answers), \
+             patch.object(self.email.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as keychain, \
+             patch.object(self.email, "builtin", return_value={"status": "ok", "sent": False}):
+            answer = self.email.setup()
+        self.assertEqual(answer["status"], "configured")
+        argv = keychain.call_args.args[0]
+        self.assertEqual(argv[-1], "-w")
+        self.assertEqual(argv[argv.index("-s") + 1], "telebots-email")
+        saved = (self.fleet / "email.json").read_text()
+        self.assertIn('"enabled":true', saved)
+        self.assertNotIn("password", saved.lower())
+        self.assertEqual((self.fleet / "email.json").stat().st_mode & 0o777, 0o600)
+
     def test_checklist_rows_and_event_evidence(self):
         self.assertEqual(len(self.checklist.ROWS), 27)
         self.assertEqual([code for code, _, _ in self.checklist.ROWS],
