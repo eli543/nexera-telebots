@@ -1,6 +1,6 @@
 {
   "name": "nexera-telebots",
-  "description": "Claude Code Telegram: the always-on upgrade for the official Telegram channel. Live streaming, voice notes, structured replies, a self-healing watchdog, reboot-surviving restore, and an N-bot fleet on one brain.",
+  "description": "Claude Code Telegram controls for macOS: live work box, voice notes, tap replies, reactions, recovery, and a fleet of bots you name.",
   "owner": {
     "name": "Nexera Intelligence"
   },
@@ -8,7 +8,7 @@
     {
       "name": "telegram-fleet",
       "source": "./plugin",
-      "description": "Hooks, skills, and slash commands that upgrade the official Telegram channel plugin: live progress streaming, guaranteed acks and replies, enforced numbered-TLDR replies, voice-note prompts, and /fresh /resume /model /esc /opus /fable /context /usage from Telegram. Pairs with an installer for the watchdog and snapshot/restore daemon layer."
+      "description": "For macOS. Adds hooks and skills to the official Telegram channel: live progress, voice, bubbles, reactions, and /esc /fresh /update /key /inbox /opus /fable /model /effort /context /compact /usage /resume. Installer adds the checked poller overlay and optional recovery."
     }
   ]
 }

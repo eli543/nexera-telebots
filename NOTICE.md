@@ -2,41 +2,22 @@
 
 ## What this repository contains
 
-This repository contains only its own add-on code (hooks, skills, slash
-commands, engine and daemon scripts, an installer, docs, and optional patch
-files), all licensed under the MIT License (see `LICENSE`).
+This repository contains its own hooks, skills, commands, engine and daemon scripts, installer, documentation, `poller/telebots.ts` and one unified diff. Its original code is licensed under the MIT License in [LICENSE](LICENSE).
 
-It installs and orchestrates the official Telegram channel plugin, which
-Anthropic distributes separately under the Apache License 2.0. This repository
-does not redistribute that plugin. The installer fetches it through the normal
-Claude Code plugin path (`claude plugin install telegram@claude-plugins-official`).
+The installer obtains Anthropic's official `telegram@claude-plugins-official` plugin through the normal Claude Code plugin path. Anthropic distributes that plugin under Apache License 2.0. This repository does not redistribute its source.
 
-## Relationship to Anthropic's Apache-2.0 plugin
+## Change to the locally installed Anthropic plugin
 
-The upstream plugin (`telegram@claude-plugins-official`, version 0.0.6,
-Copyright 2026 Anthropic, PBC) is Apache-2.0 licensed. Two facts follow:
+The installer modifies your own local copy of `telegram@claude-plugins-official` version 0.0.7 with one unified diff, `poller/seam-0.0.7.patch`, and adds one file of our own, `telebots.ts` (MIT). Anthropic's code is not copied into this repository. The patched copy on your Mac retains Anthropic's license and notices. The change statement required by Apache-2.0 section 4(b) is in `poller/README.md`.
 
-- We never vendor or copy the upstream plugin's source into this repository.
-  You install it yourself from the official marketplace.
-- The optional files in `patches/` modify your own local copy of that
-  Apache-2.0 code after you have installed it. They do not carry Anthropic's
-  code into this repository; they are unified diffs. The patched result on your
-  machine retains the upstream plugin's license and notices. Per Apache-2.0
-  section 4(b), the changes those patches make are stated in `patches/README.md`.
+The overlay checks the exact upstream version and file hash before applying the diff. It keeps a local stock backup so uninstall can restore that file.
 
-## Not affiliated with Anthropic
+## No affiliation or unofficial client
 
-This project is an independent, community-built add-on layer. It is not
-affiliated with, sponsored by, or endorsed by Anthropic. "Claude", "Claude
-Code", and related marks belong to Anthropic. "Telegram" belongs to Telegram
-Messenger Inc.
+Nexera Telebots is an independent project. Anthropic does not sponsor or endorse it. "Claude" and "Claude Code" are Anthropic marks; "Telegram" belongs to Telegram Messenger Inc.
 
-## No unofficial client
-
-This project runs on Anthropic's sanctioned `--channels` path and the official
-Telegram channel plugin. It ships no forked or spoofed Claude client and does
-not replace the Claude Code CLI.
+The project runs through the official Telegram channel and Claude Code's `--channels` path. It ships no replacement Claude Code client.
 
 ## Maintained by
 
-Eli Almo at Nexera Intelligence (AI consulting, New York). Repository: https://github.com/eli543/nexera-telebots
+Eli Almo at Nexera Intelligence, New York. Repository: https://github.com/eli543/nexera-telebots

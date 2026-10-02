@@ -1,116 +1,66 @@
 # Changelog
 
-All notable changes to this project are documented here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims
-to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Changes are grouped by release. This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Pre-public polish pass.
+No entries yet.
+
+## [0.3.0] - Pending release
+
+Prepared Friday, October 2, 2026. The release date will be set after integration and the real-phone acceptance test.
 
 ### Added
 
-- `SETUP-WITH-CLAUDE.md`: a guided install written to an assisting Claude, so
-  dropping the repo link into Claude and saying "set this up for me" stands up
-  the first bot end to end with a verify gate at each step, explains every
-  component as it goes, then repeats for more bots. Linked from the top of the
-  README.
+- The 13-command Telegram menu: `/esc`, `/fresh`, `/update`, `/key`, `/inbox`, `/opus`, `/fable`, `/model`, `/effort`, `/context`, `/compact`, `/usage` and `/resume`.
+- Tap bubbles, the first-reply quick bar, a model-then-effort picker and Close on every picker.
+- Seven reaction actions and `/key`, with a local notes folder in place of a private knowledge base.
+- A live work box based on streamer v30.22, with the 🎯 mission line and a Plan built from real task updates.
+- Poller-side local voice transcription, with an optional warm model, a local cold fallback and an explicit failure path.
+- Tappable `/resume` with labels based on each conversation's opening topic, including a no-key fallback.
+- A context nudge at 60, 70, 80 and 90 percent, plus a picker for handoff to another configured bot.
+- Optional `/inbox` cards backed by the user's own IMAP/SMTP account. Sending uses an exact preview and server-checked two-tap consent.
+- Setup and operations engines: `fleet-add-bot`, `fleet-start`, `fleet-pair`, `fleet-checklist`, `fleet-email`, `fleet-update`, `fleet-compact`, `fleet-state`, `fleet-handoff`, `fleet-resume-open` and `fleet-context-pct`.
+- An upstream plugin hash watch and an offline sandbox runner in CI.
+- Telebots Bar as an optional Mac menu bar layer, with a phone page over Tailscale.
 
 ### Changed
 
-- `/usage` and `/context` meter legends restyled to the minimal form: the
-  colored squares are gone from the legend line under each bar (they stay inside
-  the bar itself). The legend now reads `↳ X% used · Y% left · resets ...` and
-  `↳ X% full · U used · F free of CAP`.
-- Install docs corrected: only the installer lays down the engine, so the
-  three-line plugin path is now honest that you also run `./install.sh`, and a
-  guard in `/telegram-fleet:setup` stops early if the engine is not installed.
-- README states it is built and provided by Nexera Intelligence, with a short
-  About section; the badge row is trimmed to platform and license; and
-  attribution was added to the plugin and marketplace metadata and NOTICE.
+- The nine optional patches for official Telegram plugin 0.0.6 are replaced by one hash-checked seam diff for plugin 0.0.7 plus the project's own Telebots module. The local stock file is backed up for uninstall.
+- Install starts with an empty bot list. It neither creates a bot nor loads the watchdog before pairing. The watchdog manages enrolled bots and falls back to PID-only health checks when an upstream plugin update removes the overlay.
+- The phone setup now uses a hidden token prompt, a new Terminal window, bot-specific pairing, macOS consent while the person is at the Mac and a feature checklist.
+- `/fresh` and `/update` send "⚡ Back and ready" with a Continue bubble after a resumed restart.
+- The project is scoped to macOS 14 or newer. Bot names and count come from config; the docs state BotFather's pacing and account limits.
+- `scoped` is documented as Claude Code's `--permission-mode auto`.
 
-## [0.2.0] - 2026-07-14
+### Fixed
 
-The phone-control release: interrupt a busy bot, switch models in one tap, read
-live meters, and get a real "/" menu. All four features ship as optional
-`server.ts` patches (06-09) plus three new config-driven engines; nothing in the
-zero-patch core changed behavior.
+- `/usage` deduplicates transcript usage by message and request and includes subagent transcripts in fleet token burn.
+- Slash commands use installed engine paths rather than the location of the clone. Hooks are inert outside bot sessions.
+- Doctor and troubleshooting guidance cover overlay status, token duplication, exact logs and Claude Code version gates.
 
-### Added
+### Removed
 
-- `/esc` interrupt (patch 06 + `engine/fleet-esc`): press a real, verified
-  Escape in the requesting bot's Terminal window so the current turn stops and
-  a queued message is read immediately. No restart, no context loss. Atomic
-  activate-front-verify before the single keystroke (macOS delivers keys to the
-  frontmost application), per-tty debounce, a global keystroke lock, focus
-  restore, and honest in-chat failure reporting.
-- `/opus` and `/fable` one-tap model shortcuts (patch 07): menu taps cannot
-  carry arguments, so the two common switches are commands of their own,
-  routing into the existing `/model` machinery with the conversation kept.
-- `/context` live context meter (patch 08 + `engine/fleet-context`): used
-  tokens vs the window cap with a two-tone bar, read from the session
-  transcript's newest usage record, computed and sent entirely outside the
-  model - works mid-task and costs the session zero context.
-- `/usage` plan limits + fleet burn (patch 08 + `engine/fleet-usage`): your
-  real plan limits first - session and weekly percentages with local-time
-  resets, fetched from the same endpoint the terminal `/usage` screen uses,
-  with your own Claude Code OAuth token read from the Keychain at call time
-  (never logged or stored; the undocumented endpoint fails soft to a one-line
-  notice) - then measured token burn for today plus the trailing 7 days across
-  every bot in `fleet.json`, per-bot and per-model split. Both meters use the
-  orange/black emoji bar style, the machine's local timezone, and state their
-  remaining limits honestly (the per-category context table is terminal-only).
-- Real Telegram "/" command menu (patch 09): replaces the stock dead
-  `/start` `/help` `/status` entries with the fleet's actual commands (`esc`,
-  `fresh`, `opus`, `fable`, `model`, `context`, `usage`, `resume`),
-  re-registered on every poller start, plus a documented one-off curl for
-  instant effect.
+- The experimental `platform/windows/` folder and its support promise. A separate cross-platform product is outside this release.
+- The optional 0.0.6 patch set and the old setup instructions for applying it.
 
-### Changed
+## [0.2.0] - Tuesday, July 14, 2026
 
-- README restructured: a complete Setup section now sits at the top - the
-  one-bot-one-session-one-window design rationale, bot creation and pairing,
-  the restart family, and the command menu.
-- Patch tooling now applies and verifies all nine patches with an updated
-  fully-patched reference hash; `verify-patches.sh` reports the four new
-  patches individually.
-- SECURITY.md documents exactly what `/esc` can and cannot press and the macOS
-  Automation/Accessibility consent it sits behind. TROUBLESHOOTING, FAQ,
-  ARCHITECTURE, and the fleet-ops skill cover the new commands.
-
-## [0.1.0] - 2026-07-12
-
-First public release. Built on Anthropic's official Telegram channel plugin
-(`telegram@claude-plugins-official`, v0.0.6) and the sanctioned `--channels`
-path.
+The original phone-control release on official Telegram plugin 0.0.6. Its poller extensions were optional patches; version 0.3.0 replaces that packaging.
 
 ### Added
 
-- Live progress streaming: an animated status message that edits in place while
-  Claude works and folds into a tap-to-expand recap. Zero model tokens.
-- Guaranteed instant reaction ack on every inbound message, content-aware.
-- Reply guarantee: a Stop hook so a turn cannot end silently in the terminal.
-- Enforced structured replies: a deterministic numbered-TLDR check plus an
-  optional Haiku judge, off by default.
-- Document-delivery nudge: when Claude writes a document, it is handed to you as
-  a tappable file.
-- Voice-note prompts: local transcription with mlx-whisper on Apple Silicon and
-  a faster-whisper fallback elsewhere.
-- `/fresh`, `/resume`, and `/model` from Telegram, including a cross-bot resume
-  picker. Idle-path commands need no plugin patches; mid-task interception is
-  available as optional patches.
-- Self-healing watchdog: a launchd daemon that restarts a dropped bot into the
-  same conversation, with exact-PID kills, debounce, cooldown, and a crash-loop
-  breaker.
-- Snapshot and restore across a macOS reboot, resuming your exact conversations.
-- Managed multi-bot fleet: one config file, N identical bots sharing one brain.
-- Installer and uninstaller for the daemon layer, plus a plugin marketplace for
-  the hooks, skills, and slash commands.
-- Optional patches for mid-task `/fresh` and `/model`, quarantined with
-  re-apply and restore tooling.
-- Offline test harnesses for the hooks and a CI workflow (shellcheck, bash -n,
-  py_compile, and a secret scan).
+- `/esc` interrupt with a verified Terminal window and exact PID guard.
+- `/opus` and `/fable` shortcuts that kept the conversation.
+- `/context` and `/usage` meters, and an eight-command Telegram menu.
+- Setup guidance for the installer, bot pairing and daemon layer.
 
-[Unreleased]: https://github.com/eli543/nexera-telebots/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/eli543/nexera-telebots/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/eli543/nexera-telebots/releases/tag/v0.1.0
+## [0.1.0] - Sunday, July 12, 2026
+
+First public release, built on Anthropic's official Telegram channel plugin 0.0.6 and its `--channels` path.
+
+### Added
+
+- Live progress, acknowledgement reactions, a reply guard, numbered TLDR checks and document delivery nudges.
+- Local voice notes, `/fresh`, `/resume`, `/model`, watchdog supervision and exact-conversation snapshot and restore.
+- A config-driven fleet, installer and uninstaller, plus offline hook checks.

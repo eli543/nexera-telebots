@@ -1,109 +1,45 @@
 # FAQ
 
-## Why not just use the stock plugin, or Remote Control?
+## Do I need more than one bot?
 
-This is the stock plugin, plus the layer Anthropic does not ship. The official
-Telegram channel gives you a chat bridge: messages in, replies out, access
-control. It explicitly does not keep a session alive ("events only arrive while
-the session is open"), stream progress, transcribe voice, survive a reboot, or
-add Telegram-side commands. This repo adds those on top of the official plugin,
-without replacing it. If the stock bridge is all you need, you do not need this.
-
-## What makes this different from the many other Claude-plus-Telegram projects?
-
-The community space is large, and the common features are genuinely common.
-Streaming, voice, keepalive daemons, and slash commands each exist in several
-projects, so this repo does those deeper rather than claiming them first. The
-parts that appear to have no shipped public counterpart, based on reading the
-most relevant projects, are:
-
-- The verified reply contract: a deterministic numbered-TLDR check plus an
-  optional model judge that bounces a badly structured reply.
-- Restore across a macOS reboot that resumes your exact conversations, not a
-  summary and not a plain `--continue`.
-- The identical-fleet-one-brain topology. Other multi-bot projects run different
-  specialist agents; this one runs identical bots on one knowledge base.
-- The cross-bot resume picker.
-- The reply-delivery guarantee as an enforced Stop hook, rather than a prompt.
-
-That is the honest positioning. Everything else in the feature table is an
-improvement on things others also do.
+No. Start with one. Each additional bot needs a separate BotFather token, Terminal session and pairing. You choose the names and count. See [FLEET.md](FLEET.md).
 
 ## Does this run on Linux or Windows?
 
-The daemon layer is macOS only. It uses launchd, the Keychain, `osascript`, and
-Terminal.app. There is no supported Linux or Windows daemon yet.
+No. Nexera Telebots is macOS only, with macOS 14 or newer required. It uses launchd, Keychain, AppleScript and Terminal.app. The experimental Windows folder was removed from this release.
 
-The hooks themselves are portable Python with no third-party dependencies, so the
-Claude-facing behavior would port. A `platform/windows/` sketch exists, built to
-mirror the macOS logic through Task Scheduler and Windows Terminal, but it is
-untested and marked experimental in every file. A systemd port for Linux is a
-welcome pull request and a good first issue.
+## Why use this instead of only the official Telegram plugin?
 
-## What does the reply judge cost, and is my data safe?
+The official plugin handles the Telegram channel and pairing. Telebots adds the local overlay for mid-task controls, tap callbacks, reactions, the menu and voice, plus hooks for the live work box and reply checks. Optional launchd supervision and snapshot/restore add recovery. The official plugin remains the channel in use.
 
-The judge uses a fast, inexpensive model (Haiku class), which costs a fraction of
-a cent per long reply. It runs only on long replies, and it is off by default.
+## Is the project an unofficial Claude Code client?
 
-When you turn it on, it sends your own outbound draft reply text, capped, to the
-Anthropic API using your own key, which lives in the macOS Keychain. The
-recipient is Anthropic, the same company running your Claude Code session. The
-deterministic structural checks run locally with no key and no network, so you
-can leave the judge off and still get most of the value. See
-[SECURITY.md](../SECURITY.md) for the full data-flow description.
+No. It runs Claude Code with Anthropic's official `telegram@claude-plugins-official` plugin through `--channels`. It modifies the user's local copy of plugin 0.0.7 with a version-checked diff and ships its own module. [NOTICE.md](../NOTICE.md) explains the licenses. Claude Code channels remain a research preview and can change.
 
-## Is this within Anthropic's terms of service?
+## Can BotFather make as many bots as I want?
 
-Yes, as far as the mechanism goes. It runs the official Telegram channel plugin
-through the sanctioned `--channels` flag. It ships no forked or spoofed Claude
-client and does not replace the Claude Code CLI. That is the opposite posture
-from the unofficial clients Anthropic has moved against. Your own use still has to
-follow Anthropic's terms; the tooling does not change what those require of you.
+Bot names and the number you configure are your choice, but Telegram controls creation. BotFather may throttle `/newbot` after the first few; waits can reach about a day. Telegram does not publish that pacing rule. Community references put the account limit at 20 bots, or 40 with Telegram Premium. Finish one bot before creating the next.
 
-## What happens when Claude Code updates?
+## Does voice require Apple Silicon?
 
-Channels are an Anthropic research preview, and Anthropic states the `--channels`
-flag and protocol may change based on feedback. So a Claude Code update can change
-behavior.
+Apple Silicon is needed for the fast mlx-whisper path. Voice is optional. An Intel Mac can use the slower faster-whisper fallback when installed. ffmpeg and a backend must be present, and the first model run may download roughly 1.6 to 1.9 GB. Without a local backend the voice checklist row is skipped rather than pretending transcription worked.
 
-- `/telegram-fleet:doctor` checks your versions against the known-good set
-  and is the first place a mismatch will show.
-- The README carries a supported-versions table.
-- CI runs the tests against the current Claude Code so regressions surface early.
+## What does the optional AI key send?
 
-If an update breaks something, the doctor output and the version table are the
-starting point for an issue.
+The local reply checks and the no-key `/resume` labeler need no extra key. If you enable AI extras, an outbound draft may be sent to Anthropic for the TLDR judge, the opening of a chat may be sent for a topic label, and the model-list refresher may call Anthropic. The key stays in macOS Keychain. See [SECURITY.md](../SECURITY.md).
 
-## Does a plugin update overwrite the optional patches?
+## Does `/inbox` work with my mail provider?
 
-Yes. The poller-side interceptors (mid-task `/fresh` and `/model`, plus `/esc`,
-`/opus`, `/fable`, `/context`, `/usage`, and the "/" command menu) are patches
-on the official plugin's `server.ts`, which sits in a version-pinned cache
-directory. When the plugin updates, Claude Code writes a new cache directory and
-the patches do not carry over. This is expected, and it is why the patches are
-optional and quarantined rather than part of the core.
+The built-in backend needs IMAP and SMTP access with an app password. Gmail, iCloud Mail, Fastmail and Yahoo can work when their account settings permit that access. Outlook.com and Microsoft 365 accounts that require OAuth are outside the built-in backend in v0.3.0. `/inbox` remains visible and shows a setup hint until the connection passes `fleet-email test`. See [EMAIL.md](EMAIL.md).
 
-- The idle-path `/fresh`, `/resume`, and `/model` work with no patches at all.
-- To restore the interceptors after an update, rerun
-  `patches/apply-patches.sh`. The command menu re-registers when each patched
-  poller restarts.
+## What happens when the official Telegram plugin updates?
 
-## Do I have to run a fleet?
+The overlay is pinned to the stock 0.0.7 file. It will not patch an unknown version. On an unsupported update, Telebots extras pause; the stock bot can still answer and the watchdog uses PID-only checks instead of restarting in a heartbeat loop. Check `fleet-doctor` and the overlay status, then update Telebots when a supported seam is available. Turning off auto-update for the whole official marketplace also delays updates to its other plugins.
 
-No. One bot is the default and the common case. A fleet is two or more bots in the
-same config file, sharing one knowledge base. Start with one; add bots when you
-want more independent chat surfaces into the same operation. See
-[FLEET.md](FLEET.md).
+## Can I switch features off?
 
-## Can I turn a feature off?
+Yes. The [architecture guide](ARCHITECTURE.md#kill-switches-and-testing) lists the hook switches. Voice, email, the warm voice daemon, the watchdog, Telebots Bar and the phone page are separately optional. A switch must be checked against a real bot reply to confirm its effect.
 
-Every hook has a kill switch, a single file you create to disable it with no
-restart. The list is in [ARCHITECTURE.md](ARCHITECTURE.md). Turning a hook off
-leaves the bot running without that behavior.
+## How do I handle a leaked token?
 
-## How do I rotate a token if it leaks?
-
-Message @BotFather, select the bot, choose `Revoke current token`, and configure
-the new one with `/telegram:configure <new-token>`. The old token stops working
-immediately. Rotate if a token ever appeared in a screen recording or a shared
-log.
+Revoke the token in [@BotFather](https://t.me/BotFather). Enter the replacement through a hidden local prompt, never through a Claude chat, then restart that bot and run its checklist. The old token stops working when revoked. Check shared logs and recordings for any exposure.

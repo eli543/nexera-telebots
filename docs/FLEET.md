@@ -1,106 +1,33 @@
-# The fleet: N bots, one brain
+# One bot or a fleet
 
-Most projects that run several Telegram bots make them different: a coding
-specialist, a research specialist, a scheduler. This one makes them the same.
-Every bot is an identical Claude Code setup that reads the same knowledge base.
-The value is not division of labor; it is having several independent chat
-surfaces into one operation, any of which can pick up where another left off.
+One bot is a complete installation. More bots give you separate Telegram chats and Claude Code sessions with the same Telebots commands, hooks and rules. You choose each bot's name, emoji and key. There is no built-in six-bot limit; BotFather's account limits and the Mac's capacity set the practical count.
 
-## Why identical
+Each bot has its own BotFather token, Terminal.app window, working directory, state directory, access list and transcript history. Do not point two sessions at one token. You can give bots the same project context by linking their workdirs to a shared `CLAUDE.md` or common notes, but that shared knowledge is your choice and is separate from their tokens and state.
 
-- One knowledge base to maintain. A fact you teach the operation is a fact every
-  bot knows, because they all read the same `CLAUDE.md` and the same notes.
-- Any bot can answer anything. There is no "wrong bot for this question."
-- Sessions are portable. Because the setups are identical, a conversation started
-  in one bot resumes cleanly in another. That is what powers the cross-bot resume
-  picker.
+## Add another bot
 
-What differs between bots is deliberately small: the name, the key, the working
-directory, the state directory, the token, and an emoji. Everything else, the
-hooks, the permission stance, the watchdog logic, is shared.
+Finish the first bot and its checklist before starting the next. Then:
 
-## The shared brain in practice
+1. You do this on your phone: create the next bot in [@BotFather](https://t.me/BotFather) and keep the token private.
+2. Run `~/.claude/telegram-fleet/bin/fleet-add-bot <key> --name <name> --emoji <emoji>` on the Mac. You do this: paste the token into the hidden dialog. The command validates it before adding the entry to `fleet.json`.
+3. Run `~/.claude/telegram-fleet/bin/fleet-start <key>`. You do this at the Mac: accept the new folder trust prompt in that bot's Terminal window.
+4. You do this on your phone: DM that bot, read its code, then run `~/.claude/telegram-fleet/bin/fleet-pair <key> <code> --lock` on the Mac.
+5. Send `hi` and run `~/.claude/telegram-fleet/bin/fleet-checklist <key>`. Complete the requested phone steps. The existing watchdog starts supervising the new bot only after enrollment.
 
-The bots share knowledge the same way any Claude Code project does, through
-context files.
+Do not hand-edit `.env` or create a config entry while waiting for a BotFather token. Telegram may let you create a few bots quickly and then delay another `/newbot` by about a day. Its exact pacing is unpublished. Community references put the account cap at 20 bots, or 40 with Telegram Premium. Add one bot at a time.
 
-- A `CLAUDE.md` that each bot's working directory can see, holding the rules and
-  facts you want every bot to follow. If you keep your knowledge in a notes vault,
-  point the bots at it and reference it from `CLAUDE.md`.
-- Because each bot runs in its own working directory, you can either give each a
-  copy of the same `CLAUDE.md` or point them all at one shared location. A single
-  shared source is easier to keep consistent: edit once, every bot updates.
+## Config and paths
 
-There is no separate database. The "brain" is your context files plus Claude
-Code's own session transcripts, which the resume and restore features read.
+`~/.claude/telegram-fleet/fleet.json` is the one bot list. Version 2 has a `bots` array and options for watchdog, voice, notes, rich messages, context thresholds and optional email. Version 1 remains readable with defaults. The installer starts version 2 with an empty `bots` array.
 
-## Cross-bot resume
+A key must match `^[a-z0-9][a-z0-9-]{0,30}$` and be unique. The default state directory pattern is `~/.claude/channels/fleet-<key>/`. The engine validates resolved workdirs and state dirs to avoid collisions and ambiguous PID checks. Use `fleet-config validate` after a manual config change. Normal setup uses `fleet-add-bot` to make those entries safely.
 
-From any bot, `/resume` builds a numbered list of recent sessions across every
-bot in the fleet, newest first, each with a short topic label:
+## Resume and handoff
 
-```
-/resume
-  1  🤖 Main      invoice script for the Q3 batch      12m ago
-  2  🔬 Research  competitor pricing pull              1h ago
-  3  🤖 Main      debugging the deploy hook            3h ago
-  ...
-```
+`/resume` lists up to 20 recent chats across configured bots, newest first. Each row identifies its source bot and gives a short label based on the conversation's opening topic. Without an optional AI key, a local heuristic builds the label from the first substantive request, including a transcribed voice note. It does not label every row with a raw session ID. Tap a row to reopen it in the bot you are chatting with; the source bot's session is left in place. The list is refreshed when you ask for it, and stale selections are refused.
 
-`/resume 3` opens session 3 in the bot you are chatting with. The transcript is
-copied into this bot's project directory and the bot relaunches resumed into it.
-The origin bot is left untouched, so you can open the same conversation in two
-bots if you want.
+With two or more bots, a context nudge can offer Hand off. The picker excludes the current bot and resolves the other bots from `fleet.json` when tapped. The sending bot prepares a self-contained note, shows it for review, and sends it through Claude Code's same-user cross-session messaging only after confirmation. The recipient session name is `telebots-<key>`. If it is down, the note stays local for retry. Handoff needs Claude Code 2.1.224 or later and a uniform permission stance so a message is not held for a terminal approval. A handoff never counts as approval for access, money or email.
 
-The topic labels use the same optional key as the reply judge. With no key, the
-list still renders, using a short heuristic preview instead of a generated label.
+## Availability
 
-The picker list is regenerated on each `/resume`. If you send `/resume 3` more
-than a few hours after the list was built, it refuses and asks you to send
-`/resume` again, because the numbering drifts as sessions age.
-
-## Adding a bot
-
-1. Create a bot with @BotFather and copy its token.
-2. Add an entry to `~/.claude/telegram-fleet/fleet.json`:
-
-```json
-{
-  "name": "Ops",
-  "key": "ops",
-  "workdir": "~/claude-fleet/ops",
-  "state_dir": "~/.claude/channels/fleet-ops",
-  "emoji": "🛠"
-}
-```
-
-3. Create the state directory and write the token into its `.env` at `chmod 600`,
-   or run `/telegram:configure` from that bot. Seed `access.json` with your
-   allowlist.
-4. Pair and lock down: DM the new bot, run `/telegram:access pair <code>`, then
-   `/telegram:access policy allowlist`.
-5. The watchdog picks the new bot up on its next pass. No script edits are needed;
-   every engine reads the bot list from `fleet.json`.
-
-The `fleet-ops` skill has the day-two version of this, plus token rotation,
-reading logs, and the kill switches.
-
-## Keys and paths
-
-- `key` must match `^[a-z0-9][a-z0-9-]{0,30}$` and be unique. It is the handle
-  every script uses.
-- Paths may use `~`; every consumer expands it.
-- The state directory should keep the `fleet-` prefix so it never collides with
-  the stock plugin's default `telegram` directory.
-
-A single bot is the default install. A fleet is simply two or more entries in the
-same file.
-
-Configured workdirs must use their physical absolute path after `~` expansion.
-`fleet-config validate` rejects symlink, dot-dot and trailing-slash spellings with
-the required path in the error. Caller lookup accepts an alias but resolves it to
-that validated workdir before any PID comparison or launch. Claude's transcript
-project directory is derived from the accepted launch path spelling, with `/`
-replaced by `-`. Existing transcripts are never moved automatically; migrating an
-older alias-based configuration requires deliberately retaining or moving its
-history before using the physical launch path.
+The optional watchdog can restart an enrolled bot whose session or poller dies, subject to its cooldown and breaker. It skips parked bots. A Mac that is asleep, logged out or offline cannot receive or answer Telegram updates. For a planned reboot, snapshot first and restore after login. Prove recovery with a real message round trip, not only a process badge.
