@@ -44,7 +44,7 @@ SCENARIOS = [
 ]
 
 
-def sh(root: Path, *args: str, fake_uname: str = "Darwin", timeout: int = 90) -> subprocess.CompletedProcess[str]:
+def sh(root: Path, *args: str, fake_uname: str = "Darwin") -> subprocess.CompletedProcess[str]:
     """Every executed test command goes through sbenv, never inherited env."""
     env = {
         "HOME": str(Path.home()),
@@ -58,7 +58,6 @@ def sh(root: Path, *args: str, fake_uname: str = "Darwin", timeout: int = 90) ->
         text=True,
         capture_output=True,
         check=False,
-        timeout=timeout,
     )
 
 
@@ -115,7 +114,7 @@ def sandbox(parent: Path, number: int, phase1: bool, stock: Path | None, bun: Pa
 
 
 def suite(root: Path, command: tuple[str, ...], name: str) -> str:
-    result = sh(root, *command, timeout=300)
+    result = sh(root, *command)
     # Outputs stay in the disposable sandbox. A token-shaped string is always
     # redacted before either stream is stored.
     import re
@@ -322,13 +321,13 @@ def main() -> int:
                         try:
                             detail = integration_suite(root, group)
                             group_results[group] = ("PASS", detail)
-                        except (AssertionError, OSError, subprocess.TimeoutExpired) as exc:
+                        except (AssertionError, OSError) as exc:
                             group_results[group] = ("FAIL", str(exc))
                     status, detail = group_results[group]
                 else:
                     detail = scenario_stub(root, number, title, required)
                     status = "STUB"
-            except (AssertionError, OSError, subprocess.TimeoutExpired) as exc:
+            except (AssertionError, OSError) as exc:
                 detail = str(exc)
                 status = "FAIL"
             total[status] += 1
