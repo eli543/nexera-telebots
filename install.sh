@@ -101,9 +101,10 @@ if [ "$DRY_RUN" -eq 0 ]; then
 fi
 
 say "Install directories and scripts"
-run mkdir -p "$FLEET_HOME/bin" "$FLEET_HOME/logs" "$FLEET_HOME/watchdog-state" "$FLEET_HOME/restart-state"
+run mkdir -p "$FLEET_HOME/bin" "$FLEET_HOME/templates" "$FLEET_HOME/logs" "$FLEET_HOME/watchdog-state" "$FLEET_HOME/restart-state"
 run cp -R "$REPO_DIR/engine/." "$FLEET_HOME/bin/"
 run cp "$REPO_DIR/daemon/watchdog.sh" "$REPO_DIR/daemon/watchdog-loop.sh" "$FLEET_HOME/bin/"
+run cp "$REPO_DIR/daemon/com.claude-fleet.watchdog.plist.template" "$FLEET_HOME/templates/"
 for voice_script in transcribe-voice transcribe-voice-mlx transcribe-voice-faster transcribe-voice-daemon; do
   if [ -f "$REPO_DIR/voice/$voice_script" ]; then run cp "$REPO_DIR/voice/$voice_script" "$FLEET_HOME/bin/"; fi
 done
@@ -195,6 +196,40 @@ if command -v uv >/dev/null 2>&1 && command -v brew >/dev/null 2>&1; then
 else
   note "Voice extras skipped: install both uv and Homebrew first, then mlx-whisper and ffmpeg."
   note "Text chat works without them. The voice-notes fallback remains available."
+fi
+
+if command -v uv >/dev/null 2>&1; then
+  uv_tools="$(uv tool dir 2>/dev/null || true)"
+  voice_python="$uv_tools/mlx-whisper/bin/python"
+  if [ -n "$uv_tools" ] && [ -x "$voice_python" ]; then
+    note "Render the optional voice agent template for the installed mlx-whisper interpreter."
+    if [ "$DRY_RUN" -eq 0 ]; then
+      python3 - "$REPO_DIR/daemon/com.claude-fleet.voice.plist.template" \
+        "$FLEET_HOME/templates/com.claude-fleet.voice.plist.template" "$FLEET_HOME" "$voice_python" <<'PYPLIST'
+import plistlib
+from pathlib import Path
+import sys
+
+source, output, fleet_home, interpreter = map(Path, sys.argv[1:])
+with source.open("rb") as handle:
+    data = plistlib.load(handle)
+def render(value):
+    if isinstance(value, str):
+        return value.replace("__FLEET_HOME__", str(fleet_home)).replace("__UV_TOOL_PYTHON__", str(interpreter))
+    if isinstance(value, list):
+        return [render(item) for item in value]
+    if isinstance(value, dict):
+        return {key: render(item) for key, item in value.items()}
+    return value
+with output.open("wb") as handle:
+    plistlib.dump(render(data), handle)
+PYPLIST
+    fi
+  else
+    note "Warm voice agent template is pending. Install mlx-whisper with uv, then rerun this installer."
+  fi
+else
+  note "Warm voice agent template is pending. Install uv and mlx-whisper, then rerun this installer."
 fi
 
 say "Next steps"

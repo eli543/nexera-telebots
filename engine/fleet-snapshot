@@ -100,7 +100,14 @@ SNAP="$RESTART_STATE/snapshot.tsv"
 [ $DRY_RUN -eq 1 ] && SNAP="$RESTART_STATE/snapshot.dryrun.tsv"
 # Locks live under /tmp (cleared at boot), named for this fleet so parallel fleets
 # or a test run never collide. fleet-fresh and fleet-restore use the same names.
-LOCK_BASE="/tmp/nexera-telebots-$(printf '%s' "$FLEET_HOME" | cksum | awk '{print $1}')"
+LOCK_ROOT=/tmp
+if [[ ${TELEBOTS_TEST:-} == 1 ]]; then
+  case "${TMPDIR:-}" in
+    "${TELEBOTS_SANDBOX_ROOT:?}"/*) LOCK_ROOT="${TMPDIR%/}" ;;
+    *) echo "The test lock directory is outside the sandbox." >&2; exit 8 ;;
+  esac
+fi
+LOCK_BASE="$LOCK_ROOT/nexera-telebots-$(printf '%s' "$FLEET_HOME" | cksum | awk '{print $1}')"
 FLEET_LOCK="$LOCK_BASE-fleet-lock"   # the snapshot/restore transaction lock
 LOCK_STALE=180   # must match fleet-fresh: a lock that records NO pid and is older than this belonged to a crashed run
 if ! mkdir -p "$RESTART_STATE" "$WD_STATE"; then

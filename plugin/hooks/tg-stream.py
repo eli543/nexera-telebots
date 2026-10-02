@@ -5367,6 +5367,11 @@ def _apply_rich_result(st, result, owner_id=None, sdir=None):
         st["rich_429_streak"] = 0
         st["rich_transient_streak"] = 0
         st["rich_hard_streak"] = RICH_HARD_LIMIT
+    elif error_class == "api_404":
+        # Older Bot API servers may not implement sendRichMessage. Use plain text.
+        st["rich_429_streak"] = 0
+        st["rich_transient_streak"] = 0
+        st["rich_hard_streak"] = RICH_HARD_LIMIT
     else:
 
 

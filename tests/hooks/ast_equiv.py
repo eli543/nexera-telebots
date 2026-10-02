@@ -23,6 +23,7 @@ ALLOWED_FUNCTIONS = {
     "_models_keychain_key": "Use the optional public key service without an account pin.",
     "_models_cache_maybe_refresh": "Refresh only when optional AI extras are enabled.",
     "_models_refresh_main": "Require a bot session and optional AI extras before refreshing.",
+    "_apply_rich_result": "HTTP 404 from a rich endpoint falls back to plain text.",
 }
 ALLOWED_CONSTANTS = {
     "BOT_IDENTITIES": "The private identity table is empty; configuration supplies names.",

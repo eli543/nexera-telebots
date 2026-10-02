@@ -121,7 +121,14 @@ POLLER_WAIT=60       # seconds to wait for the new session's poller before calli
 RC=0
 # Locks live under /tmp (cleared at boot, so a lock can never outlive a restart),
 # named for this fleet so parallel fleets or a test run never collide.
-LOCK_BASE="/tmp/nexera-telebots-$(printf '%s' "$FLEET_HOME" | cksum | awk '{print $1}')"
+LOCK_ROOT=/tmp
+if [[ ${TELEBOTS_TEST:-} == 1 ]]; then
+  case "${TMPDIR:-}" in
+    "${TELEBOTS_SANDBOX_ROOT:?}"/*) LOCK_ROOT="${TMPDIR%/}" ;;
+    *) echo "The test lock directory is outside the sandbox." >&2; exit 8 ;;
+  esac
+fi
+LOCK_BASE="$LOCK_ROOT/nexera-telebots-$(printf '%s' "$FLEET_HOME" | cksum | awk '{print $1}')"
 # Every real invocation is appended to <key>.manual_restart_log here for
 # visibility. A ledger only: nothing reads it.
 MANUAL_LOG_DIR="$FLEET_HOME/watchdog-state"

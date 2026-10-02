@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import smtplib
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -130,20 +131,34 @@ def message_data(client, uid):
 
 
 def canonical_email(value):
-    if not isinstance(value, dict):
+    fields = {"to", "cc", "bcc", "subject", "body"}
+    if (not isinstance(value, dict) or set(value) - fields
+            or not {"to", "subject", "body"}.issubset(value)):
         fail("Email must be an object.")
     result = {key: value.get(key, [] if key in ("to", "cc", "bcc") else "")
               for key in ("to", "cc", "bcc", "subject", "body")}
+    address = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,63}$")
     for key in ("to", "cc", "bcc"):
-        if not isinstance(result[key], list) or any(not isinstance(item, str) for item in result[key]):
+        if (not isinstance(result[key], list) or (key == "to" and not result[key])
+                or any(not isinstance(item, str) or len(item) > 254 or not address.fullmatch(item)
+                       for item in result[key])):
             fail("Email recipients must be lists of addresses.")
-    if not result["to"] or not isinstance(result["subject"], str) or not isinstance(result["body"], str):
+    if not isinstance(result["subject"], str) or not isinstance(result["body"], str):
         fail("Email needs a recipient, subject and body.")
+    if (re.search(r"[\x00-\x1f\x7f]", result["subject"])
+            or re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", result["body"])):
+        fail("Email contains a hidden control character.")
+    try:
+        json.dumps(result, ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        fail("Email contains invalid Unicode.")
     return result
 
 
 def digest(value):
-    raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    # The poller hashes this exact compact, alphabetically keyed UTF-8 JSON.
+    raw = json.dumps(canonical_email(value), ensure_ascii=False, sort_keys=True,
+                     separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -151,26 +166,63 @@ def state_for(bot):
     if not isinstance(bot, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,30}", bot):
         fail("Invalid bot key.")
     fleet = load_json(FLEET_HOME / "fleet.json", {})
-    for item in fleet.get("bots", []):
+    if not isinstance(fleet, dict) or not isinstance(fleet.get("bots"), list):
+        fail("Fleet configuration is unavailable.")
+    for item in fleet["bots"]:
+        if not isinstance(item, dict):
+            continue
         if item.get("key") == bot:
-            path = Path(item["state_dir"]).expanduser().resolve()
+            configured = item.get("state_dir")
+            if not isinstance(configured, str):
+                break
+            path = Path(configured).expanduser().resolve()
+            selected = os.environ.get("TELEGRAM_STATE_DIR")
+            if selected and Path(selected).expanduser().resolve() != path:
+                fail("Selected bot state does not match fleet configuration.")
             if path.is_dir():
                 return path
     fail("Bot state directory is unavailable.")
 
 
-def claim_send(req):
+def checked_send(req):
     consent_id, bot = req.get("consent_id"), req.get("bot")
     if not isinstance(consent_id, str) or not CONSENT_RE.fullmatch(consent_id):
         fail("Invalid consent ID.")
     state = state_for(bot)
-    record = load_json(state / "consents.json", {}).get(consent_id)
+    path = state / "consents.json"
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "r", encoding="utf-8") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 8 * 1024 * 1024:
+            fail("Consent storage is unavailable.")
+        records = json.load(stream)
+    if not isinstance(records, dict):
+        fail("Consent storage is unavailable.")
+    record = records.get(consent_id)
     target = canonical_email(req.get("email"))
-    if (not isinstance(record, dict) or record.get("phase") != "consumed"
-            or record.get("expires", 0) < time.time() * 1000
+    if (not isinstance(record, dict) or record.get("id") != consent_id
+            or record.get("phase") != "consumed"
+            or not isinstance(record.get("chat"), str)
+            or not re.fullmatch(r"[1-9][0-9]*", record["chat"])
+            or type(record.get("message")) is not int or record["message"] <= 0
+            or type(record.get("expires")) is not int
+            or record["expires"] <= time.time() * 1000
+            or record["expires"] > 2**53 - 1
             or canonical_email(record.get("email")) != target
             or record.get("digest") != digest(target)):
         fail("Exact email consent is missing or expired.")
+    access = load_json(state / "access.json")
+    if (not isinstance(access, dict) or access.get("dmPolicy") == "disabled"
+            or not isinstance(access.get("allowFrom"), list)
+            or not all(isinstance(chat, str) for chat in access["allowFrom"])
+            or record["chat"] not in access["allowFrom"]):
+        fail("The original chat is not on the current allowlist.")
+    return target, state
+
+
+def claim_send(req):
+    target, state = checked_send(req)
+    consent_id = req["consent_id"]
     attempts = state / "mail-attempts"
     attempts.mkdir(mode=0o700, exist_ok=True)
     path = attempts / consent_id
@@ -184,9 +236,9 @@ def claim_send(req):
 
 
 def builtin(op, req, c):
-    secret = password(c["username"]) if op != "snooze" else ""
     if op == "send":
         value, attempt = claim_send(req)
+        secret = password(c["username"])
         message = EmailMessage()
         message["From"] = c["from"]
         message["To"] = ", ".join(value["to"])
@@ -199,7 +251,9 @@ def builtin(op, req, c):
             refused = client.send_message(message, to_addrs=recipients)
         status = "smtp-accepted" if not refused else "partially-refused"
         atomic_json(attempt, {"at": time.time(), "state": status})
-        return {"status": status, "note": "SMTP acceptance does not prove delivery."}
+        if refused:
+            fail("SMTP refused at least one recipient. Delivery may be partial.")
+        return {"ok": True, "status": status, "note": "SMTP acceptance does not prove delivery."}
     if op == "snooze":
         uid, hours = str(req.get("id", "")), req.get("hours")
         if not uid.isdigit() or not isinstance(hours, (int, float)) or not 0 < hours <= 720:
@@ -209,6 +263,7 @@ def builtin(op, req, c):
         value[uid] = time.time() + hours * 3600
         atomic_json(path, value)
         return {"status": "snoozed", "id": uid, "hours": hours}
+    secret = password(c["username"])
     with imap_client(c, secret) as client:
         status, _ = client.select("INBOX", readonly=op != "archive")
         if status != "OK":
@@ -268,6 +323,11 @@ def setup():
 
 
 def main(argv):
+    if len(argv) == 2 and argv[1] in ("--help", "-h"):
+        print("fleet-email setup|test|inbox|read|archive|snooze|send")
+        print("JSON on stdin except setup. Send returns ok=true only after full SMTP acceptance.")
+        print("Exit codes: 0 success, 1 unavailable or refused, 2 invalid command.")
+        return 0
     if len(argv) != 2 or argv[1] not in ("setup", "test", "inbox", "read", "archive", "snooze", "send"):
         sys.stderr.write("usage: fleet-email setup|test|inbox|read|archive|snooze|send (JSON stdin except setup)\n")
         return 2
@@ -286,16 +346,26 @@ def main(argv):
             else:
                 if not os.path.isabs(backend) or not os.access(backend, os.X_OK):
                     fail("Custom email backend is not an executable absolute path.")
-                attempt = None
                 if op == "send":
-                    _, attempt = claim_send(req)
+                    _, state = checked_send(req)
+                    attempt = state / "mail-attempts" / req["consent_id"]
+                    if attempt.exists():
+                        fail("This email already has a send attempt.")
+                child_env = {key: os.environ[key] for key in
+                             ("HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "FLEET_HOME",
+                              "TELEGRAM_STATE_DIR", "TELEBOTS_TEST", "TELEBOTS_SANDBOX_ROOT")
+                             if key in os.environ}
                 result = subprocess.run([backend, op], input=json.dumps(req), text=True,
-                                        capture_output=True, check=False, timeout=30)
+                                        capture_output=True, check=False, timeout=30,
+                                        env=child_env)
                 if result.returncode:
                     fail("Custom email backend failed.")
                 output = json.loads(result.stdout)
-                if attempt is not None:
-                    atomic_json(attempt, {"at": time.time(), "state": "backend-accepted"})
+                if op == "send":
+                    if not attempt.is_file() or stat.S_IMODE(attempt.stat().st_mode) != 0o600:
+                        fail("Custom email backend did not record its send attempt.")
+                    if not isinstance(output, dict) or output.get("ok") is not True:
+                        fail("Custom email backend did not confirm full acceptance.")
         print(json.dumps(output, ensure_ascii=False))
         return 0
     except (ValueError, OSError, imaplib.IMAP4.error, smtplib.SMTPException,

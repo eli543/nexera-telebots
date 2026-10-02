@@ -4,10 +4,12 @@
 import argparse
 from datetime import datetime
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -31,7 +33,7 @@ ROWS = (
     ("A9", "Watchdog", "launchctl list; watchdog.sh --dry-run"),
     ("A10", "Claude Code handoff gates", "claude --version; settings.json; permission-stance"),
     ("A11", "Optional email and menu bar", "fleet-email test; Telebots Bar process when installed"),
-    ("P1", "First reply and live box", "INBOUND event; streamer state; reply-guard record"),
+    ("P1", "First reply and live box", "INBOUND; ack.log ACK ok=true; stream/state.json; reply_guard_sent"),
     ("P2", "Checklist bubble", "TAP family=qr in poller-events.log"),
     ("P3", "Save reaction and notes", "REACTION event; notes_dir dated file"),
     ("P4", "Key legend", "KEY event in poller-events.log"),
@@ -42,7 +44,7 @@ ROWS = (
     ("P9", "Interrupt while busy", "INTERCEPT cmd=esc; esc.log key landed"),
     ("P10", "Context and usage", "INTERCEPT events; context.log; usage.log"),
     ("P11", "Compact", "compact.log exit 0 or 14"),
-    ("P12", "Context nudge and Keep going", "guardian log reason 8; TAP event"),
+    ("P12", "Context nudge and Keep going", "guardian.log GUARDIAN reason=8 pct= threshold= ok=true; TAP"),
     ("P13", "Handoff picker", "HANDOFF-PICKER offered=; CLOSE kind=handoff"),
     ("P14", "Inbox cards and Snooze", "INTERCEPT cmd=inbox; EMAIL-PREVIEW; snooze record"),
     ("P15", "Optional self-heal", "watchdog.log restart; fresh.log back-online ping sent"),
@@ -56,6 +58,13 @@ def read_json(path, default=None):
             return json.load(stream)
     except (OSError, ValueError):
         return default
+
+
+def read_json_output(output):
+    try:
+        return json.loads(output)
+    except ValueError:
+        return None
 
 
 def run(command, timeout=15, input_text=None):
@@ -99,8 +108,16 @@ def event_lines(state):
 
 
 def lines_since(state, started):
+    return log_lines_since(state / "logs" / "poller-events.log", started)
+
+
+def log_lines_since(path, started):
     result = []
-    for line in event_lines(state):
+    try:
+        source = path.read_text().splitlines()
+    except OSError:
+        return result
+    for line in source:
         try:
             stamp = datetime.fromisoformat(line.split(" ", 1)[0]).timestamp()
         except (ValueError, IndexError):
@@ -108,6 +125,29 @@ def lines_since(state, started):
         if stamp >= started:
             result.append(line)
     return result
+
+
+def guardian_sent(lines):
+    for line in lines:
+        if not event_seen([line], "GUARDIAN", reason=8, ok="true"):
+            continue
+        fields = dict(part.split("=", 1) for part in line.split()[2:] if "=" in part)
+        try:
+            pct, threshold = float(fields["pct"]), float(fields["threshold"])
+        except (KeyError, ValueError):
+            continue
+        if 0 < threshold <= pct <= 100:
+            return True
+    return False
+
+
+def reply_guard_sent(state, started):
+    turn, sent = state / "reply_guard_turn", state / "reply_guard_sent"
+    try:
+        return (sent.stat().st_mtime >= started and turn.read_text().strip() != ""
+                and turn.read_text().strip() == sent.read_text().strip())
+    except OSError:
+        return False
 
 
 def event_seen(lines, name, **fields):
@@ -137,6 +177,14 @@ def fresh_log_has(path, pattern, started):
 
 def result(status, detail):
     return {"status": status, "detail": detail}
+
+
+def voice_backend_available():
+    if (ROOT / "voice/daemon.sock").is_socket():
+        return True
+    if shutil.which("mlx_whisper") or (Path.home() / ".local/bin/mlx_whisper").is_file():
+        return True
+    return importlib.util.find_spec("faster_whisper") is not None
 
 
 def auto_row(code, bot, fleet, state, token):
@@ -174,8 +222,10 @@ def auto_row(code, bot, fleet, state, token):
         except (OSError, ValueError):
             return result("Failed", "no heartbeat")
         fleet_state = run([str(engine / "fleet-state"), "--json"]) if (engine / "fleet-state").is_file() else None
-        if fleet_state and fleet_state.returncode == 0 and 0 <= age < 60:
-            return result("Passed", f"heartbeat {int(age)}s old; fleet-state responded")
+        rows = read_json_output(fleet_state.stdout) if fleet_state and fleet_state.returncode == 0 else []
+        selected = next((row for row in rows if row.get("key") == bot["key"]), None) if isinstance(rows, list) else None
+        if selected and selected.get("up") is True and 0 <= age < 60:
+            return result("Passed", f"heartbeat {int(age)}s old; session and poller up")
         return result("Failed", "session/poller state or heartbeat missing")
     if code == "A5":
         try:
@@ -200,8 +250,8 @@ def auto_row(code, bot, fleet, state, token):
         voice = fleet.get("options", {}).get("voice", "auto")
         if voice == "off":
             return result("Not configured", "voice disabled")
-        if not (engine / "transcribe-voice").is_file():
-            return result("Not configured", "no voice backend installed")
+        if not (engine / "transcribe-voice").is_file() or not voice_backend_available():
+            return result("Not configured", "no local voice backend installed")
         with tempfile.TemporaryDirectory(prefix="voice-check-", dir=ROOT) as temp:
             audio = str(Path(temp) / "sample.aiff")
             sample = run(["say", "-o", audio, "Check the voice note"], timeout=30)
@@ -212,6 +262,9 @@ def auto_row(code, bot, fleet, state, token):
             ok = transcript.returncode == 0 and "voice" in words and "note" in words
             return result("Passed" if ok else "Failed", "local voice sample matched" if ok else "voice sample did not match")
     if code == "A9":
+        plist = Path.home() / "Library/LaunchAgents/com.claude-fleet.watchdog.plist"
+        if not plist.is_file():
+            return result("Not configured", "optional watchdog is not installed")
         check = run(["launchctl", "list"])
         probe = run(["/bin/bash", str(engine / "watchdog.sh"), "--dry-run"]) if (engine / "watchdog.sh").is_file() else None
         ok = "com.claude-fleet.watchdog" in check.stdout and probe and probe.returncode == 0
@@ -244,7 +297,17 @@ def phone_row(code, state, notes, fleet_size, email_enabled, crash_test, started
     logs = state / "logs"
     evidence = lambda name, pattern: fresh_log_has(logs / name, pattern, started)
     if code == "P1":
-        ok = event_seen(lines, "INBOUND", kind="text") and evidence("tg-stream.log", r"mission|🎯") and evidence("reply-guard.log", r"reply")
+        stream_file = state / "stream" / "state.json"
+        stream = read_json(stream_file, {})
+        try:
+            stream_fresh = stream_file.stat().st_mtime >= started
+        except OSError:
+            stream_fresh = False
+        ok = (event_seen(lines, "INBOUND", kind="text")
+              and event_seen(log_lines_since(logs / "ack.log", started), "ACK", ok="true")
+              and stream_fresh and stream.get("rich_box") is True
+              and bool(stream.get("msgid")) and bool(stream.get("mission"))
+              and reply_guard_sent(state, started))
     elif code == "P2": ok = event_seen(lines, "TAP", family="qr")
     elif code == "P3": ok = event_seen(lines, "REACTION") and notes.is_dir() and any(path.stat().st_mtime >= started for path in notes.glob("20??-??-??.md"))
     elif code == "P4": ok = event_seen(lines, "KEY")
@@ -255,7 +318,7 @@ def phone_row(code, state, notes, fleet_size, email_enabled, crash_test, started
     elif code == "P9": ok = event_seen(lines, "INTERCEPT", cmd="esc") and evidence("esc.log", r"key landed")
     elif code == "P10": ok = all(event_seen(lines, "INTERCEPT", cmd=cmd) and evidence(f"{cmd}.log", r".") for cmd in ("context", "usage"))
     elif code == "P11": ok = evidence("compact.log", r"exit (?:0|14)\b")
-    elif code == "P12": ok = evidence("context-guardian.log", r"reason 8") and event_seen(lines, "TAP", family="qr")
+    elif code == "P12": ok = guardian_sent(log_lines_since(logs / "guardian.log", started)) and event_seen(lines, "TAP", family="qr")
     elif code == "P13":
         if fleet_size < 2: return result("Not configured", "needs two bots")
         ok = event_seen(lines, "HANDOFF-PICKER") and event_seen(lines, "CLOSE", kind="handoff")
@@ -363,7 +426,10 @@ def main():
     parser.add_argument("--non-interactive", action="store_true")
     parser.add_argument("--wait", type=int, default=120)
     parser.add_argument("--crash-test", action="store_true")
+    parser.add_argument("--blank-fresh", action="store_true", help="include the optional last-step blank restart")
     parser.add_argument("--consent", action="store_true")
+    parser.add_argument("--recorded-evidence", action="store_true",
+                        help="sandbox only: evaluate existing logs without phone requests")
     args = parser.parse_args()
     if args.dry_run:
         for code, label, source in ROWS:
@@ -376,11 +442,17 @@ def main():
         print(f"Terminal Automation: {'ready' if automation.returncode == 0 else 'needs your action'}")
         print(f"Accessibility: {'ready' if accessibility.returncode == 0 and accessibility.stdout.strip() == 'true' else 'needs your action'}")
         return 0 if automation.returncode == 0 and accessibility.returncode == 0 and accessibility.stdout.strip() == "true" else 1
+    if args.recorded_evidence:
+        sandbox = Path(os.environ.get("TELEBOTS_SANDBOX_ROOT", "/"))
+        if os.environ.get("TELEBOTS_TEST") != "1" or sandbox.resolve() not in ROOT.resolve().parents:
+            parser.error("recorded evidence is limited to a test sandbox")
     fleet = read_json(ROOT / "fleet.json", {})
     bot = next((item for item in fleet.get("bots", []) if item.get("key") == args.key), None)
     if bot is None:
         parser.error("choose a configured bot key")
     state = Path(bot["state_dir"]).expanduser()
+    if args.recorded_evidence and sandbox.resolve() not in state.resolve().parents:
+        parser.error("recorded state is outside the test sandbox")
     token = token_from(state)
     notes = Path(fleet.get("options", {}).get("notes_dir", "~/Telebots Notes")).expanduser()
     if args.crash_test:
@@ -394,20 +466,24 @@ def main():
         else:
             if code == "P13" and len(fleet.get("bots", [])) < 2:
                 values[code] = result("Not configured", "needs two bots")
+            elif code == "P7" and (fleet.get("options", {}).get("voice") == "off" or not voice_backend_available()):
+                values[code] = result("Not configured", "local voice backend is not configured")
             elif code == "P14" and not read_json(ROOT / "email.json", {}).get("enabled", False):
                 values[code] = result("Not configured", "email is optional")
             elif code == "P15" and not args.crash_test:
                 values[code] = result("Not configured", "optional exact-PID test")
+            elif code == "P16" and not args.blank_fresh:
+                values[code] = result("Not configured", "optional blank restart; rerun with --blank-fresh")
             else:
                 instruction = PHONE_STEPS[code]
                 print(f"{code}: {instruction}")
-                started = time.time()
+                started = 0 if args.recorded_evidence else time.time()
                 threshold = state / "guardian-thresholds"
                 original = threshold.read_bytes() if code == "P12" and threshold.exists() else None
                 try:
-                    if code == "P12":
+                    if code == "P12" and not args.recorded_evidence:
                         threshold.write_text("1\n")
-                    sent = notify_phone(token, state, instruction, bubble=(code == "P2"))
+                    sent = True if args.recorded_evidence else notify_phone(token, state, instruction, bubble=(code == "P2"))
                     if not sent:
                         print("Phone instruction could not be delivered; it is printed above.")
                     if code == "P15":
@@ -433,7 +509,8 @@ def main():
     output = ROOT / f"checklist-{args.key}.json"
     save_results(output, args.key, values)
     summary = ", ".join(f"{code} {value['status']}" for code, value in values.items())
-    notify_phone(token, state, "Checklist: " + summary)
+    if not args.recorded_evidence:
+        notify_phone(token, state, "Checklist: " + summary)
     return 0 if all(v["status"] in ("Passed", "Not configured") for v in values.values()) else 1
 
 
