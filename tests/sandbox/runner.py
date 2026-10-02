@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""Isolated Mac installer tests and the 21-scenario integration manifest.
+
+Phase 1 executes the installer tests and runs each missing-package scenario
+through a sandbox stub. STUB is never counted as an integration pass.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+REPO = Path(__file__).resolve().parents[2]
+HERE = Path(__file__).resolve().parent
+STOCK_SHA = "d902d7195a527b579b889cfdbf251fc24fd224a68e319ac6b7c3b691515c3458"
+SCENARIOS = [
+    (1, "Install without a bot or watchdog", ("install.sh",)),
+    (2, "Overlay gates, repeat install, restore and status tokens", ("poller/install-overlay.sh", "poller/restore-stock.sh")),
+    (3, "Add a bot, protect its token and reject duplicates", ("engine/fleet-add-bot",)),
+    (4, "Poller start, commands and heartbeat", ("tests/poller/mock-telegram.ts", "tests/poller/fake-claude.ts")),
+    (5, "Pairing and enrollment", ("engine/fleet-pair",)),
+    (6, "Text, reply layout and quick bar", ("tests/poller/fake-claude.ts",)),
+    (7, "Tap access, stale messages and slash labels", ("tests/poller/fake-claude.ts",)),
+    (8, "Send it swap without injection", ("tests/poller/fake-claude.ts",)),
+    (9, "Reaction access and normalization", ("tests/poller/fake-claude.ts",)),
+    (10, "Key legend and inbox setup hint", ("tests/poller/fake-claude.ts",)),
+    (11, "Model and effort pickers", ("tests/poller/fake-claude.ts",)),
+    (12, "Handoff picker and single-bot guardian", ("tests/poller/fake-claude.ts", "plugin/hooks/context-guardian.sh")),
+    (13, "Command intercept engine arguments", ("tests/poller/fake-claude.ts",)),
+    (14, "Voice transcription and ordered delivery", ("tests/poller/fake-claude.ts", "voice/transcribe-voice")),
+    (15, "Email preview and one-time consent", ("tests/poller/fake-claude.ts", "engine/fleet-email")),
+    (16, "Engine dry runs and fixture outputs", ("engine/fleet-update", "engine/fleet-compact")),
+    (17, "Hook dry runs and rich fallback", ("plugin/hooks/telebots-rules.sh", "tests/hooks")),
+    (18, "Watchdog enrollment and overlay drift", ("daemon/watchdog.sh", "tests/ops")),
+    (19, "Snapshot and restore transaction", ("engine/fleet-snapshot", "engine/fleet-restore", "tests/ops")),
+    (20, "Uninstall restores stock and removes voice plist", ("uninstall.sh",)),
+    (21, "Non-Mac installer exits before any write", ("install.sh",)),
+]
+
+
+def sh(root: Path, *args: str, fake_uname: str = "Darwin") -> subprocess.CompletedProcess[str]:
+    """Every executed test command goes through sbenv, never inherited env."""
+    env = {
+        "HOME": str(Path.home()),
+        "PATH": "/usr/bin:/bin",
+        "TELEBOTS_FAKE_UNAME": fake_uname,
+    }
+    return subprocess.run(
+        ["/bin/bash", str(HERE / "sbenv"), str(root), *args],
+        cwd=root / "repo",
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def write_stub_overlay(root: Path) -> None:
+    """Phase 1 only: preserve interface names while WP1 builds the overlay."""
+    poller = root / "repo/poller"
+    poller.mkdir(exist_ok=True)
+    if not (poller / "ux.json").exists():
+        shutil.copy2(HERE / "fixtures/ux.json", poller / "ux.json")
+    (poller / "install-overlay.sh").write_text(
+        '#!/usr/bin/env bash\nset -euo pipefail\n'
+        'slot="$HOME/.claude/plugins/cache/claude-plugins-official/telegram/0.0.7"\n'
+        'if [ -f "$slot/server.ts.stock-backup" ]; then exit 0; fi\n'
+        'cp "$slot/server.ts" "$slot/server.ts.stock-backup"\n'
+        'printf "sandbox overlay\\n" > "$slot/server.ts"\n'
+    )
+    (poller / "verify-overlay.sh").write_text(
+        '#!/usr/bin/env bash\nset -euo pipefail\n'
+        'slot="$HOME/.claude/plugins/cache/claude-plugins-official/telegram/0.0.7"\n'
+        'if [ -f "$slot/server.ts.stock-backup" ]; then printf "OK\\n"; '
+        'else printf "STOCK\\n"; exit 1; fi\n'
+    )
+    (poller / "restore-stock.sh").write_text(
+        '#!/usr/bin/env bash\nset -euo pipefail\n'
+        'slot="$HOME/.claude/plugins/cache/claude-plugins-official/telegram/0.0.7"\n'
+        'cp "$slot/server.ts.stock-backup" "$slot/server.ts"\n'
+    )
+
+
+def sandbox(parent: Path, number: int, phase1: bool, stock: Path | None, bun: Path | None) -> Path:
+    root = parent / f"scenario-{number:02d}"
+    root.mkdir()
+    (root / ".telebots-sandbox").write_text("sandbox only\n")
+    for name in ("home", "tmp", "cache", "tools", "logs", "mock"):
+        (root / name).mkdir()
+    shutil.copytree(HERE / "shims", root / "shims", symlinks=True)
+    shutil.copytree(REPO, root / "repo", symlinks=True,
+                    ignore=shutil.ignore_patterns(".git", "node_modules", "__pycache__", "*.pyc"))
+    slot = root / "home/.claude/plugins/cache/claude-plugins-official/telegram/0.0.7"
+    (slot / ".claude-plugin").mkdir(parents=True)
+    (slot / ".claude-plugin/plugin.json").write_text('{"version":"0.0.7"}\n')
+    if phase1:
+        (slot / "server.ts").write_text("stock sandbox fixture\n")
+    else:
+        assert stock is not None and bun is not None
+        (root / "inputs").mkdir()
+        shutil.copy2(stock, root / "inputs/stock-server.ts")
+        shutil.copy2(stock, slot / "server.ts")
+        (root / "shims/bun").unlink()
+        (root / "tools/bun").symlink_to(bun)
+    if phase1:
+        write_stub_overlay(root)
+    return root
+
+
+def suite(root: Path, command: tuple[str, ...], name: str) -> str:
+    result = sh(root, *command)
+    # Outputs stay in the disposable sandbox. A token-shaped string is always
+    # redacted before either stream is stored.
+    import re
+    redact = re.compile(r"[0-9]{8,10}:[A-Za-z0-9_-]{35,}")
+    (root / "logs" / (name + ".stdout")).write_text(redact.sub("[redacted]", result.stdout))
+    (root / "logs" / (name + ".stderr")).write_text(redact.sub("[redacted]", result.stderr))
+    if result.returncode:
+        raise AssertionError(f"{name} exited {result.returncode}; see sandbox logs")
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    return lines[-1] if lines else "exit 0"
+
+
+def integration_suite(root: Path, name: str) -> str:
+    if name == "overlay":
+        return suite(root, ("bun", "test", "tests/poller/overlay.test.ts"), name)
+    if name == "poller":
+        suite(root, ("/bin/bash", "-c", "cd poller && bun install --frozen-lockfile"), "poller-deps")
+        return suite(root, ("bun", "test", "tests/poller/integration.test.ts"), name)
+    if name == "engine":
+        tests = sorted(set((root / "repo/tests/engine").glob("*.test.py")) |
+                       set((root / "repo/tests/engine").glob("test_*.py")))
+        if not tests:
+            raise AssertionError("tests/engine has no scenario tests")
+        for test in tests:
+            suite(root, ("python3", str(test)), "engine-" + test.stem)
+        return f"{len(tests)} engine test files passed"
+    if name == "hooks":
+        tests = sorted((root / "repo/tests/hooks").glob("*.test.py"))
+        if not tests:
+            raise AssertionError("tests/hooks has no scenario tests")
+        for test in tests:
+            suite(root, ("python3", str(test)), "hooks-" + test.stem)
+        return f"{len(tests)} hook test files passed"
+    if name == "ops":
+        return suite(root, ("python3", "tests/ops/test_ops.py"), name)
+    raise AssertionError("unknown integration suite")
+
+
+def install(root: Path) -> None:
+    result = sh(root, "/bin/bash", str(root / "repo/install.sh"), "--yes")
+    if result.returncode:
+        raise AssertionError(f"install exited {result.returncode}: {result.stderr[-500:]}")
+
+
+def scenario_1(root: Path) -> str:
+    safe = sh(root, "/bin/bash", "-c",
+              'test -z "${TELEGRAM_BOT_TOKEN+x}" && '
+              'for value in "$HOME" "$FLEET_HOME" "$TELEGRAM_STATE_DIR" "$TMPDIR"; do '
+              'case "$value" in "$TELEBOTS_SANDBOX_ROOT"/*) ;; *) exit 1 ;; esac; done')
+    assert safe.returncode == 0, "scrubbed environment leaked a live path or token"
+    dry = sh(root, "/bin/bash", str(root / "repo/install.sh"), "--dry-run")
+    assert dry.returncode == 0, dry.stderr[-500:]
+    for phrase in ("empty bots list", "required overlay", "ux.json", "No bot was started", "watchdog"):
+        assert phrase.lower() in dry.stdout.lower(), f"dry-run omitted {phrase}"
+    assert not (root / "home/.claude/telegram-fleet").exists(), "dry-run wrote fleet home"
+    install(root)
+    install(root)
+    fleet = root / "home/.claude/telegram-fleet"
+    data = json.loads((fleet / "fleet.json").read_text())
+    assert data["version"] == 2 and data["bots"] == []
+    assert (fleet / "ux.json").is_file()
+    assert (fleet / "bin/fleet-config").is_file()
+    assert not (root / "home/Library/LaunchAgents/com.claude-fleet.watchdog.plist").exists()
+    assert "launchctl" not in (root / "logs/shims.log").read_text()
+    return "empty fleet, overlay and ux.json installed; no watchdog call"
+
+
+def scenario_20(root: Path) -> str:
+    install(root)
+    agents = root / "home/Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    for name in ("com.claude-fleet.watchdog.plist", "com.claude-fleet.voice.plist"):
+        (agents / name).write_text("sandbox plist\n")
+    dry = sh(root, "/bin/bash", str(root / "repo/uninstall.sh"), "--dry-run")
+    assert dry.returncode == 0, dry.stderr[-500:]
+    assert len(list(agents.glob("*.plist"))) == 2, "dry run removed a plist"
+    assert (root / "home/.claude/telegram-fleet").is_dir(), "dry run removed fleet home"
+    real = sh(root, "/bin/bash", str(root / "repo/uninstall.sh"), "--yes")
+    assert real.returncode == 0, real.stderr[-500:]
+    assert not list(agents.glob("*.plist")), "uninstall left a plist"
+    assert not (root / "home/.claude/telegram-fleet").exists()
+    slot = root / "home/.claude/plugins/cache/claude-plugins-official/telegram/0.0.7"
+    expected_stock = root / "inputs/stock-server.ts"
+    if expected_stock.exists():
+        assert (slot / "server.ts").read_bytes() == expected_stock.read_bytes()
+    else:
+        assert (slot / "server.ts").read_text() == "stock sandbox fixture\n"
+    assert (root / "logs/shims.log").read_text().count("launchctl") == 2
+    return "stock restored; watchdog and voice plists removed; state kept"
+
+
+def scenario_21(root: Path) -> str:
+    result = sh(root, "/bin/bash", str(root / "repo/install.sh"), "--dry-run", fake_uname="Linux")
+    assert result.returncode == 1, f"expected exit 1, got {result.returncode}"
+    assert "macOS only" in result.stderr
+    assert not (root / "home/.claude/telegram-fleet").exists()
+    assert "claude" not in (root / "logs/shims.log").read_text()
+    return "exit 1; macOS-only message; no CLI or file write"
+
+
+def scenario_stub(root: Path, number: int, title: str, required: tuple[str, ...]) -> str:
+    missing = [name for name in required if not (root / "repo" / name).exists()]
+    # The command is deliberately executed through sbenv. It exercises the
+    # sandbox launcher and preserves a per-scenario receipt without claiming
+    # that an absent package passed its behavior test.
+    marker = root / "logs" / f"scenario-{number:02d}.stub"
+    result = sh(root, "/bin/bash", "-c", 'printf "stub\\n" > "$1"', "_", str(marker))
+    assert result.returncode == 0 and marker.read_text() == "stub\n"
+    return "missing " + ", ".join(missing) if missing else "integration assertions pending"
+
+
+def snapshot(real_home: Path | None, main: Path | None) -> dict[str, object]:
+    """Record static infrastructure and root listings, excluding live logs."""
+    found: dict[str, object] = {}
+    if real_home:
+        roots = [
+            (real_home / ".claude", 1),
+            (real_home / ".claude/hooks", 2),
+            (real_home / ".claude/plugins/cache/claude-plugins-official", 5),
+            (real_home / "Library/LaunchAgents", 2),
+            (real_home / ".local/bin", 2),
+        ]
+        for path, depth in roots:
+            if not path.exists():
+                found[str(path)] = "absent"
+                continue
+            items: dict[str, str] = {}
+            for dirname, dirs, files in os.walk(path):
+                current = Path(dirname)
+                level = len(current.relative_to(path).parts)
+                for name in dirs:
+                    sub = current / name
+                    if len(sub.relative_to(path).parts) <= depth:
+                        items[str(sub.relative_to(path)) + "/"] = "directory"
+                if level >= depth:
+                    dirs[:] = []
+                for name in files:
+                    sub = current / name
+                    if len(sub.relative_to(path).parts) > depth:
+                        continue
+                    if sub.is_symlink():
+                        items[str(sub.relative_to(path))] = "link:" + os.readlink(sub)
+                    elif sub.is_file():
+                        items[str(sub.relative_to(path))] = hashlib.sha256(sub.read_bytes()).hexdigest()
+            found[str(path)] = items
+    if main:
+        for verb in (["rev-parse", "HEAD"], ["status", "--short"], ["branch", "--show-current"]):
+            r = subprocess.run(["/usr/bin/git", "-C", str(main), *verb], text=True,
+                               capture_output=True, check=False,
+                               env={"HOME": str(real_home or Path.home()), "PATH": "/usr/bin:/bin"})
+            found["git:" + " ".join(verb)] = (r.returncode, r.stdout)
+    try:
+        process_list = subprocess.run(["/bin/ps", "-axo", "pid=,command="], text=True,
+                                      capture_output=True, check=False,
+                                      env={"HOME": str(real_home or Path.home()), "PATH": "/usr/bin:/bin"})
+    except OSError:
+        process_list = None
+    if process_list is None or process_list.returncode:
+        found["live-daemon-pids"] = "unavailable"
+    else:
+        matches = ("channel-watchdog-loop", "Telebots Bar", "transcribe-voice-daemon")
+        found["live-daemon-pids"] = sorted({line.split(None, 1)[0] for line in process_list.stdout.splitlines()
+                                           if any(name in line for name in matches) and line.split()})
+    return found
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base", required=True, type=Path, help="directory for test sandboxes")
+    parser.add_argument("--phase1", action="store_true", help="allow honest STUB results while other packages build")
+    parser.add_argument("--real-home", type=Path, help="read-only infrastructure snapshot target")
+    parser.add_argument("--main-checkout", type=Path, help="read-only git snapshot target")
+    parser.add_argument("--stock-server", type=Path, help="verified upstream 0.0.7 server.ts for integration")
+    args = parser.parse_args()
+    if not args.real_home or not args.main_checkout:
+        parser.error("--real-home and --main-checkout are required for the untouched check")
+    stock = args.stock_server.resolve() if args.stock_server else None
+    bun = Path(shutil.which("bun") or "").resolve() if shutil.which("bun") else None
+    if not args.phase1:
+        if not stock or not stock.is_file():
+            parser.error("integration requires --stock-server")
+        if hashlib.sha256(stock.read_bytes()).hexdigest() != STOCK_SHA:
+            parser.error("stock server.ts does not match the 0.0.7 pin")
+        if not bun or not bun.is_file():
+            parser.error("integration requires Bun")
+    base = args.base.expanduser().resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    if args.real_home and (base == args.real_home.resolve() or args.real_home.resolve() in base.parents):
+        parser.error("sandbox base cannot be inside the real home")
+    before = snapshot(args.real_home, args.main_checkout)
+    total = {"PASS": 0, "STUB": 0, "FAIL": 0}
+    for turn in (1, 2):
+        pass_dir = Path(tempfile.mkdtemp(prefix=f"wp5-pass-{turn}-", dir=base))
+        results = []
+        group_results: dict[str, tuple[str, str]] = {}
+        print(f"PASS {turn} root={pass_dir}", flush=True)
+        for number, title, required in SCENARIOS:
+            root = sandbox(pass_dir, number, args.phase1, stock, bun)
+            try:
+                if number == 1:
+                    detail = scenario_1(root)
+                    status = "PASS"
+                elif number == 20:
+                    detail = scenario_20(root)
+                    status = "PASS"
+                elif number == 21:
+                    detail = scenario_21(root)
+                    status = "PASS"
+                elif not args.phase1:
+                    group = (
+                        "overlay" if number == 2 else
+                        "engine" if number in (3, 5, 16) else
+                        "poller" if 4 <= number <= 15 else
+                        "hooks" if number == 17 else
+                        "ops"
+                    )
+                    if group not in group_results:
+                        try:
+                            detail = integration_suite(root, group)
+                            group_results[group] = ("PASS", detail)
+                        except (AssertionError, OSError) as exc:
+                            group_results[group] = ("FAIL", str(exc))
+                    status, detail = group_results[group]
+                else:
+                    detail = scenario_stub(root, number, title, required)
+                    status = "STUB"
+            except (AssertionError, OSError) as exc:
+                detail = str(exc)
+                status = "FAIL"
+            total[status] += 1
+            results.append({"id": number, "title": title, "status": status, "detail": detail})
+            print(f"  {number:02d} {status} {title}: {detail}", flush=True)
+        (pass_dir / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+    after = snapshot(args.real_home, args.main_checkout)
+    files_untouched = before == after
+    pid_verified = before.get("live-daemon-pids") != "unavailable"
+    state = "PASS" if files_untouched and pid_verified else "PARTIAL" if files_untouched else "FAIL"
+    print(f"UNTOUCHED {state}", flush=True)
+    if not pid_verified:
+        print("  live daemon PID check unavailable in this execution sandbox", flush=True)
+    if not files_untouched:
+        for key in before.keys() | after.keys():
+            if before.get(key) != after.get(key):
+                print(f"  changed: {key}", flush=True)
+                if key == "live-daemon-pids":
+                    print(f"  daemon PIDs before={before.get(key)} after={after.get(key)}", flush=True)
+    print("TOTAL " + " ".join(f"{k}={v}" for k, v in total.items()), flush=True)
+    return 0 if files_untouched and not total["FAIL"] and (args.phase1 or (not total["STUB"] and pid_verified)) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

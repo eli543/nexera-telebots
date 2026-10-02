@@ -1,0 +1,3 @@
+# Exact permitted exceptions. Weekdays are accepted only with a full written date.
+README.md|owner name
+NOTICE.md|owner name

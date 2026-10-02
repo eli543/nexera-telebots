@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Run one test command with no inherited credentials or live state.
+# Usage: sbenv SANDBOX_ROOT command [args...]
+set -euo pipefail
+
+if [ "$#" -lt 2 ]; then
+  printf 'Usage: sbenv SANDBOX_ROOT command [args...]\n' >&2
+  exit 2
+fi
+root="$1"
+shift
+case "$root" in /*) ;; *) printf 'Sandbox root must be absolute.\n' >&2; exit 2 ;; esac
+[ -f "$root/.telebots-sandbox" ] || {
+  printf 'Sandbox marker is missing.\n' >&2
+  exit 2
+}
+root="$(cd "$root" && pwd -P)"
+case "$root" in /|"$HOME"|"$HOME"/.claude*|"$HOME"/Library*|"$HOME"/.local*)
+  printf 'Refusing a live-home sandbox root.\n' >&2
+  exit 2 ;;
+esac
+for dir in home tmp cache tools shims logs; do
+  [ -d "$root/$dir" ] || { printf 'Sandbox directory is missing: %s\n' "$dir" >&2; exit 2; }
+  resolved="$(cd "$root/$dir" && pwd -P)"
+  case "$resolved" in "$root"/*) ;; *) printf 'Sandbox directory escapes root: %s\n' "$dir" >&2; exit 2 ;; esac
+done
+if ! /usr/bin/python3 - "$root" <<'PY'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1]).resolve()
+for relative in ("home", "tmp", "cache", "tools", "shims", "logs", "home/.claude/telegram-fleet"):
+    if root not in Path(root, relative).resolve().parents:
+        raise SystemExit(1)
+PY
+then
+  printf 'Sandbox path escapes root.\n' >&2
+  exit 2
+fi
+mkdir -p "$root/home/.claude/channels/sandbox"
+
+# Nothing from the parent environment survives except the chosen fake uname.
+exec env -i \
+  HOME="$root/home" \
+  TMPDIR="$root/tmp" \
+  XDG_CACHE_HOME="$root/cache" \
+  PYTHONPYCACHEPREFIX="$root/cache/pycache" \
+  BUN_INSTALL_CACHE_DIR="$root/cache/bun" \
+  FLEET_HOME="$root/home/.claude/telegram-fleet" \
+  TELEGRAM_STATE_DIR="$root/home/.claude/channels/sandbox" \
+  TELEBOTS_TEST=1 \
+  TELEBOTS_SANDBOX_ROOT="$root" \
+  TELEBOTS_STOCK_SERVER="$root/inputs/stock-server.ts" \
+  WP4_SANDBOX="$root" \
+  TELEBOTS_SHIM_LOG="$root/logs/shims.log" \
+  TELEBOTS_FAKE_UNAME="${TELEBOTS_FAKE_UNAME:-Darwin}" \
+  PATH="$root/shims:$root/tools:/usr/bin:/bin:/usr/sbin:/sbin" \
+  "$@"

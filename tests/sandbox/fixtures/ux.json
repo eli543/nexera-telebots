@@ -1,0 +1,20 @@
+{
+  "reactions": [],
+  "commands": [
+    {"command": "esc", "description": "Interrupt the current task"},
+    {"command": "fresh", "description": "Start a fresh chat"},
+    {"command": "update", "description": "Restart on the latest build"},
+    {"command": "key", "description": "Show the controls"},
+    {"command": "inbox", "description": "Open the inbox"},
+    {"command": "opus", "description": "Switch to Opus"},
+    {"command": "fable", "description": "Switch to Fable"},
+    {"command": "model", "description": "Choose a model"},
+    {"command": "effort", "description": "Choose effort"},
+    {"command": "context", "description": "Show context"},
+    {"command": "compact", "description": "Compact this chat"},
+    {"command": "usage", "description": "Show usage"},
+    {"command": "resume", "description": "Choose a recent chat"}
+  ],
+  "quick_bar": [["/esc", "/model"], ["/usage", "/fresh"]],
+  "key_extra": []
+}

@@ -11,85 +11,76 @@ permissions:
 
 jobs:
   lint-and-test:
-    name: Lint and test
+    name: Static checks and unit tests
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install shellcheck
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
-
-      - name: Collect shell scripts
-        id: shells
+      - name: Stage the pinned stock Telegram server for offline tests
+        shell: bash
         run: |
-          set -eu
-          # All *.sh files plus any file with a bash/sh shebang (voice scripts
-          # have no extension).
-          { find . -path ./.git -prune -o -name '*.sh' -type f -print
-            grep -rIlE '^#!.*(bash|/sh)( |$)' . --exclude-dir=.git 2>/dev/null || true
-          } | sort -u > /tmp/shell-files.txt
-          echo "Shell files:"
-          cat /tmp/shell-files.txt
+          set -euo pipefail
+          curl --fail --location --silent --show-error \
+            https://raw.githubusercontent.com/anthropics/claude-plugins-official/main/external_plugins/telegram/server.ts \
+            --output "$RUNNER_TEMP/stock-server.ts"
+          printf '%s  %s\n' 'd902d7195a527b579b889cfdbf251fc24fd224a68e319ac6b7c3b691515c3458' \
+            "$RUNNER_TEMP/stock-server.ts" | sha256sum --check
+      - name: Run local static and unit checks in a scrubbed home
+        env:
+          TELEBOTS_SANDBOX_BASE: ${{ runner.temp }}/telebots-unit
+          TELEBOTS_STOCK_SERVER_SOURCE: ${{ runner.temp }}/stock-server.ts
+        run: bash tests/run.sh --unit-only
 
-      - name: bash -n (syntax) and shellcheck
+  macos-sandbox:
+    name: macOS shell engines and sandbox
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install ShellCheck
+        run: brew install shellcheck
+      - name: Stage the pinned stock Telegram server for offline tests
+        shell: bash
         run: |
-          set -eu
-          rc=0
-          while IFS= read -r f; do
-            [ -f "$f" ] || continue
-            bash -n "$f" || rc=1
-            # Hard-fail on real errors; report style and warnings non-blocking.
-            shellcheck -S error "$f" || rc=1
-            shellcheck -S style "$f" || true
-          done < /tmp/shell-files.txt
-          exit "$rc"
-
-      - name: Collect python files
+          set -euo pipefail
+          curl --fail --location --silent --show-error \
+            https://raw.githubusercontent.com/anthropics/claude-plugins-official/main/external_plugins/telegram/server.ts \
+            --output "$RUNNER_TEMP/stock-server.ts"
+          actual="$(shasum -a 256 "$RUNNER_TEMP/stock-server.ts" | awk '{print $1}')"
+          test "$actual" = 'd902d7195a527b579b889cfdbf251fc24fd224a68e319ac6b7c3b691515c3458'
+      - name: Shell engines and unit checks
+        env:
+          TELEBOTS_SANDBOX_BASE: ${{ runner.temp }}/telebots-unit
+          TELEBOTS_STOCK_SERVER_SOURCE: ${{ runner.temp }}/stock-server.ts
+        run: bash tests/run.sh --static-only
+      - name: Run all 21 sandbox scenarios twice
+        shell: bash
         run: |
-          set -eu
-          { find . -path ./.git -prune -o -name '*.py' -type f -print
-            grep -rIlE '^#!.*python' . --exclude-dir=.git 2>/dev/null || true
-          } | sort -u > /tmp/py-files.txt
-          echo "Python files:"
-          cat /tmp/py-files.txt
-
-      - name: python3 -m py_compile
-        run: |
-          set -eu
-          rc=0
-          while IFS= read -r f; do
-            [ -f "$f" ] || continue
-            python3 -m py_compile "$f" || rc=1
-          done < /tmp/py-files.txt
-          exit "$rc"
-
-      - name: Validate JSON
-        run: |
-          set -eu
-          for f in .claude-plugin/marketplace.json \
-                   plugin/.claude-plugin/plugin.json \
-                   config/fleet.example.json \
-                   config/fleet.example-fleet.json; do
-            [ -f "$f" ] || continue
-            python3 -m json.tool "$f" > /dev/null
-          done
-
-      - name: Run offline test harness
-        run: |
-          set -eu
-          if [ -f tests/run.sh ]; then
-            bash tests/run.sh
+          set -euo pipefail
+          base="$RUNNER_TEMP/telebots-scenarios"
+          if [ -f poller/telebots.ts ] && [ -f engine/fleet-add-bot ] && \
+             [ -f plugin/hooks/telebots-rules.sh ] && [ -d tests/ops ]; then
+            bash tests/sandbox/run.sh --base "$base" --real-home "$HOME" \
+              --main-checkout "$GITHUB_WORKSPACE" --stock-server "$RUNNER_TEMP/stock-server.ts"
+          elif [ "$GITHUB_REF_NAME" = main ]; then
+            echo "Required integration packages are missing on main." >&2
+            exit 1
           else
-            echo "tests/run.sh not present; skipping."
+            bash tests/sandbox/run.sh --base "$base" --real-home "$HOME" \
+              --main-checkout "$GITHUB_WORKSPACE" --phase1
           fi
 
   secret-scan:
-    name: Secret scan (gitleaks)
+    name: Secret scan
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Gitleaks
