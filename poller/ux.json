@@ -1,0 +1,32 @@
+{
+  "reactions": [
+    { "emoji": "❤", "phrase": "Save everything to my notes", "key_line": "❤️ save everything to your notes folder" },
+    { "emoji": "👍", "phrase": "Yes, go ahead", "key_line": "👍 yes, go ahead" },
+    { "emoji": "👎", "phrase": "No, stop", "key_line": "👎 no, stop" },
+    { "emoji": "🔥", "phrase": "Priority: put this at the top of my list", "key_line": "🔥 priority: put this at the top of my list" },
+    { "emoji": "👏", "phrase": "Wrap it up: done, then save everything", "key_line": "👏 wrap it up: mark it done, then save everything" },
+    { "emoji": "😁", "phrase": "Explain this simply", "key_line": "😁 explain it simply" },
+    { "emoji": "🥰", "phrase": "Watch this", "key_line": "🥰 watch this: buzz me when it changes" }
+  ],
+  "commands": [
+    { "command": "esc", "description": "Interrupt the current task - read my newest message now" },
+    { "command": "fresh", "description": "Restart this bot blank (fresh context, default model)" },
+    { "command": "update", "description": "Reload this chat in place: same conversation, newest Claude Code + skills" },
+    { "command": "key", "description": "The key: what every reaction, bubble and command does" },
+    { "command": "inbox", "description": "Your top threads as cards: Reply / Archive / Snooze by tap" },
+    { "command": "opus", "description": "Switch this chat to Opus at max effort (conversation kept)" },
+    { "command": "fable", "description": "Switch this chat to Fable at max effort (conversation kept)" },
+    { "command": "model", "description": "Show or switch model + effort (e.g. /model fable high)" },
+    { "command": "effort", "description": "Pick effort for this chat: low / medium / high / xhigh / max (conversation kept)" },
+    { "command": "context", "description": "Show context usage - how full this chat is" },
+    { "command": "compact", "description": "Compact this bot's context (optional focus after it)" },
+    { "command": "usage", "description": "Plan limits left + fleet token burn (today / 7 days)" },
+    { "command": "resume", "description": "List recent chats across all bots / reopen one" }
+  ],
+  "quick_bar": [["/esc", "/model"], ["/usage", "/fresh"]],
+  "key_extra": [
+    "Bubbles under a message: a tap is your answer.",
+    "Email goes out only after an exact preview, ✉️ Send it, then ✅ Confirm send. Reactions and ordinary bubbles cannot authorize email.",
+    "Handoff: at 60 / 70 / 80 / 90% full, pick another bot, review the handoff, then confirm. A single-bot fleet offers Keep going and Compact now."
+  ]
+}
