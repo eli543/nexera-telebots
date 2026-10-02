@@ -27,12 +27,13 @@ export class FakeClaudeClient {
     mkdirSync(bin, { recursive: true, mode: 0o700 })
     const executable = join(bin, 'claude')
     if (!existsSync(executable)) symlinkSync(process.execPath, executable)
+    const shimLog = requireSandboxPath(process.env.TELEBOTS_SHIM_LOG ?? process.env.SHIM_LOG ?? join(root, 'shim-calls.log'))
     const env: Record<string, string> = {
       HOME: requireSandboxPath(process.env.HOME!), TMPDIR: requireSandboxPath(process.env.TMPDIR!),
       PATH: process.env.PATH!, BUN_INSTALL_CACHE_DIR: requireSandboxPath(process.env.BUN_INSTALL_CACHE_DIR!),
       FLEET_HOME: options.fleetHome, TELEGRAM_STATE_DIR: options.state,
       TELEBOTS_TEST: '1', TELEBOTS_SANDBOX_ROOT: process.env.TELEBOTS_SANDBOX_ROOT!,
-      TELEBOTS_API_ROOT: options.apiRoot, SHIM_LOG: process.env.SHIM_LOG!, TZ: 'America/New_York',
+      TELEBOTS_API_ROOT: options.apiRoot, SHIM_LOG: shimLog, TELEBOTS_SHIM_LOG: shimLog, TZ: 'America/New_York',
     }
     if (options.accessMode) env.TELEGRAM_ACCESS_MODE = options.accessMode
     this.child = Bun.spawn([
