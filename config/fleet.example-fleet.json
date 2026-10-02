@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "bots": [
     {
       "name": "Main",
@@ -26,8 +26,13 @@
   "options": {
     "watchdog": true,
     "voice": "auto",
+    "voice_daemon": false,
     "tldr_judge": false,
     "grid": false,
+    "notes_dir": "~/Telebots Notes",
+    "rich_stream": true,
+    "guardian_thresholds": "60,70,80,90",
+    "email": false,
     "alert_bot": "main"
   }
 }

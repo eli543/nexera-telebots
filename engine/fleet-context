@@ -22,10 +22,11 @@
 #
 # Env: CC_CTX_DRYRUN=1 prints the report to the log instead of sending it.
 # Python 3.9+, stdlib only. Logs to $FLEET_HOME/logs/context.log.
+# Exit codes: 0 report sent or dry run, 1 missing args, 2 unknown workdir.
 
 set -uo pipefail
 
-usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; }
 case "${1:-}" in -h|--help) usage; exit 0 ;; esac
 
 FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"

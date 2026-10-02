@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Report one bot session's context fill from its transcript.
+
+Usage: fleet-context-pct <transcript.jsonl> [model-state-file]
+       fleet-context-pct --help
+Output: 0-100, or ?? when unknown.
+Exit codes: 0 known percent, 1 wrong arguments, 2 unknown percent.
+The latest non-sidechain assistant usage block determines the percentage.
+"""
+import json
+import os
+import stat
+import sys
+
+# 5 MB, the same tail budget fleet-context uses. Usage records
+# are frequent, so this reaches far past the newest one even mid-heavy-session. A partial
+# first line is dropped; reverse parsing skips any fragment that is not complete JSON.
+TAIL_BYTES = 5_000_000
+
+USAGE = (
+    "usage: fleet-context-pct <transcript.jsonl> [model-state-file]\n"
+    "       fleet-context-pct --help\n"
+)
+
+
+def configured_model(model_state: str) -> str:
+    """The MODEL= value out of a bot's two-line model-state file."""
+    for line in (model_state or "").splitlines():
+        if line.strip().upper().startswith("MODEL="):
+            return line.split("=", 1)[1].strip()
+    text = (model_state or "").strip()
+    return text.splitlines()[0] if text else ""
+
+
+def context_cap(served_model: str, model_state: str) -> int:
+    """tg-stream.py's _context_cap, verbatim in behaviour. 200k is the safe fallback."""
+    serving = str(served_model or "").lower()
+    configured = str(model_state or "").lower()
+    if "[1m]" in configured or "fable" in configured or "fable" in serving:
+        return 1_000_000
+    if "haiku" in configured or "haiku" in serving:
+        return 200_000
+    return 200_000
+
+
+def usage_token(value) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    try:
+        if value != value or value in (float("inf"), float("-inf")):  # NaN / inf
+            return 0
+    except Exception:
+        return 0
+    return max(0, int(value))
+
+
+def context_pct(transcript: str, model_state: str):
+    """Returns an int 0-100, or None when the answer is genuinely unknown."""
+    configured = configured_model(model_state)
+    try:
+        if not transcript:
+            return None
+        info = os.stat(transcript)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        start = max(0, int(info.st_size) - TAIL_BYTES)
+        with open(transcript, "rb") as handle:
+            if start:
+                handle.seek(start)
+            payload = handle.read(TAIL_BYTES)
+        if start:
+            boundary = payload.find(b"\n")
+            payload = payload[boundary + 1:] if boundary >= 0 else b""
+        for raw in reversed(payload.splitlines()):
+            try:
+                record = json.loads(raw.decode("utf-8", "replace"))
+            except Exception:
+                continue
+            if not isinstance(record, dict):
+                continue
+            if record.get("isSidechain") is True or record.get("type") != "assistant":
+                continue
+            message = record.get("message")
+            message = message if isinstance(message, dict) else {}
+            usage = message.get("usage")
+            usage = usage if isinstance(usage, dict) else {}
+            if "input_tokens" not in usage:
+                continue
+            used = (usage_token(usage.get("input_tokens"))
+                    + usage_token(usage.get("cache_read_input_tokens"))
+                    + usage_token(usage.get("cache_creation_input_tokens")))
+            cap = context_cap(message.get("model") or configured, model_state)
+            if not cap:
+                return None
+            return max(0, min(100, int(round((used / cap) * 100))))
+    except Exception:
+        return None
+    # Read whole and nothing found = a fresh chat at 0%. Tail-truncated and nothing
+    # found = the scan simply did not reach it, which is not the same claim.
+    return 0 if start == 0 else None
+
+
+def main(argv) -> int:
+    args = [a for a in argv[1:]]
+    if not args or args[0] in ("-h", "--help"):
+        sys.stdout.write(__doc__ or USAGE)
+        return 0 if args else 1
+    if len(args) > 2:
+        sys.stderr.write(USAGE)
+        return 1
+    transcript = args[0]
+    model_state = ""
+    if len(args) == 2 and args[1]:
+        try:
+            with open(args[1], "r", encoding="utf-8", errors="replace") as handle:
+                model_state = handle.read()
+        except Exception:
+            model_state = ""
+    pct = context_pct(transcript, model_state)
+    if pct is None:
+        print("??")
+        return 2
+    print(pct)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

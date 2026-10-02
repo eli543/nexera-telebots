@@ -30,10 +30,12 @@
 #
 # Env: CC_USAGE_DRYRUN=1 prints the report to the log instead of sending it.
 # Python 3.9+, stdlib only. Logs to $FLEET_HOME/logs/usage.log.
+# Exit codes: 0 report sent or dry run, 1 missing args, 2 unknown workdir,
+# 3 empty fleet, 4 no bot token for delivery.
 
 set -uo pipefail
 
-usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 case "${1:-}" in -h|--help) usage; exit 0 ;; esac
 
 FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
@@ -88,7 +90,10 @@ mkdir -p "$LOG_DIR" 2>/dev/null || true
   # Fetch plan limits with the user's own Claude Code OAuth token (Keychain).
   # The token stays in this variable only - never logged, never echoed, never
   # written anywhere. Any failure -> empty JSON -> soft-degrade in the report.
-  OAUTH_TOK=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null | /usr/bin/python3 -c "import json,sys; print(json.load(sys.stdin).get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null)
+  OAUTH_TOK=""
+  if [ "${TELEBOTS_TEST:-0}" != 1 ] || [ -z "${CC_USAGE_LIMITS_FILE:-}" ]; then
+    OAUTH_TOK=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null | /usr/bin/python3 -c "import json,sys; print(json.load(sys.stdin).get('claudeAiOauth',{}).get('accessToken',''))" 2>/dev/null)
+  fi
   LIMITS_JSON=""
   if [ -n "$OAUTH_TOK" ]; then
     LIMITS_JSON=$(curl -s -m 15 "https://api.anthropic.com/api/oauth/usage" \
@@ -99,9 +104,13 @@ mkdir -p "$LOG_DIR" 2>/dev/null || true
   else
     echo "limits fetch: no OAuth token available"
   fi
+  if [ "${TELEBOTS_TEST:-0}" = 1 ] && [ -n "${CC_USAGE_LIMITS_FILE:-}" ]; then
+    LIMITS_JSON=$(cat "$CC_USAGE_LIMITS_FILE" 2>/dev/null || true)
+    echo "limits fixture: $([ -n "$LIMITS_JSON" ] && echo loaded || echo missing)"
+  fi
 
   MSG=$(LIMITS_JSON="$LIMITS_JSON" FLEET_BOTS="$FLEET_BOTS" /usr/bin/python3 <<'PY'
-import json, os, glob, time
+import json, os, glob, time, math
 from datetime import datetime, timedelta
 
 BOTS = []
@@ -118,15 +127,21 @@ week_cutoff_ts = time.time() - 7 * 86400
 per_bot_today = {}
 fleet = {"today_out": 0, "today_in": 0, "week_out": 0, "week_in": 0, "today_turns": 0, "week_turns": 0}
 models_week = {}
+subagent_files = 0
+seen = set()
 
 for bot, proj in BOTS:
     t_out = t_turns = 0
-    for f in glob.glob(os.path.join(proj, "*.jsonl")):
+    files = glob.glob(os.path.join(proj, "*.jsonl"))
+    subagents = glob.glob(os.path.join(proj, "*", "subagents", "*.jsonl"))
+    for f in files + subagents:
         try:
             if os.path.getmtime(f) < week_cutoff_ts:
                 continue
+            if f in subagents:
+                subagent_files += 1
             with open(f, "rb") as fh:
-                for raw in fh:
+                for line_number, raw in enumerate(fh, 1):
                     if b'"usage"' not in raw or b'"assistant"' not in raw:
                         continue
                     try:
@@ -139,6 +154,12 @@ for bot, proj in BOTS:
                     u = m.get("usage") or {}
                     if "output_tokens" not in u:
                         continue
+                    mid = m.get("id")
+                    request_id = o.get("requestId")
+                    identity = (mid, request_id) if mid and request_id else ("uuid", o.get("uuid") or (f, line_number))
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
                     ts = o.get("timestamp", "")
                     try:
                         dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
@@ -146,8 +167,8 @@ for bot, proj in BOTS:
                         continue
                     if dt.timestamp() < week_cutoff_ts:
                         continue
-                    out = u.get("output_tokens", 0)
-                    fresh = u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
+                    out = int(u.get("output_tokens", 0) or 0)
+                    fresh = int(u.get("input_tokens", 0) or 0) + int(u.get("cache_creation_input_tokens", 0) or 0)
                     fleet["week_out"] += out
                     fleet["week_in"] += fresh
                     fleet["week_turns"] += 1
@@ -172,9 +193,9 @@ def k(n):
 # -- Plan limits (same source as the terminal /usage screen) ------------------
 # Meter style: orange = used, black = left, each limit in its own labeled
 # block. Emoji squares are the only "color" Telegram text has.
-def bar(pct, segs=10):
-    filled = max(0, min(segs, round(pct / 100 * segs)))
-    return "🟧" * filled + "⬛" * (segs - filled)
+def bar(pct, segs=20):
+    filled = max(0, min(segs, math.floor(pct / 100 * segs + 0.5)))
+    return "█" * filled + "░" * (segs - filled)
 
 def fmt_reset(iso):
     try:
@@ -204,9 +225,21 @@ try:
             if not scope:
                 continue
             icon, label = "✴️", f"WEEK - {scope.upper()}"
-        limit_blocks.append(
-            f"{icon} {label}\n{bar(pct)}\n↳ {pct}% used · {100 - pct}% left · resets {fmt_reset(lim.get('resets_at', ''))}"
-        )
+        reset = datetime.fromisoformat(lim.get("resets_at", "").replace("Z", "+00:00")).astimezone()
+        remaining = max(0, (reset - now).total_seconds())
+        period = 5 * 3600 if kind == "session" else 7 * 86400
+        budget = max(0, min(100, (period - remaining) / period * 100))
+        gap = abs(pct - budget)
+        pace = (f"{gap:.0f}% over budget" if pct > budget else
+                f"{gap:.0f}% under budget" if pct < budget else "right on budget")
+        if kind == "session":
+            detail = f"{bar(pct)} {pct:.0f}% used · {pace}"
+        else:
+            elapsed_days = max(0, min(7, (period - remaining) / 86400))
+            today_index = min(6, int(elapsed_days))
+            day_boxes = " ".join("█" * 3 if i < int(pct / 100 * 7) else "░" * 3 for i in range(7))
+            detail = f"{day_boxes}\n{bar(pct)} {pct:.0f}% used · {pace} · {max(0, ((today_index + 1) / 7 * 100 - pct)):.0f}% left today"
+        limit_blocks.append(f"{icon} {label}\n{detail}\n↳ resets {fmt_reset(lim.get('resets_at', ''))}")
 except Exception:
     limit_blocks = []
 
@@ -230,7 +263,8 @@ top = [(m, v) for m, v in sorted(models_week.items(), key=lambda x: -x[1]) if v 
 if top:
     lines.append("  ▪️ by model: " + ", ".join(f"{m} {k(v)}" for m, v in top))
 lines.append("")
-lines.append("(Limits come from your Claude plan - the same numbers as the terminal /usage screen. Burn is measured from the bots' session records, subagents included.)")
+source = "subagents included" if subagent_files else "no subagent transcripts found"
+lines.append(f"(Limits come from your Claude plan. Burn is measured from the bots' session records; {source}.)")
 print("\n".join(lines))
 PY
 )

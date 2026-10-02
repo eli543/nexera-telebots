@@ -1,0 +1,61 @@
+#!/bin/bash
+# fleet-start <key> [uuid|continue|fresh-keep|fresh-reset]
+# Open one bot in a new Terminal window through fleet-fresh's restart lock.
+# Exit codes: 0 started or dry run, 1 missing bot or token, 2 invalid arguments,
+# 7 bot already running or restart in flight, 8 process state could not be checked.
+# CC_START_DRYRUN=1 validates and prints the action without opening Terminal.
+set -uo pipefail
+
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
+  sed -n '2,6p' "$0" | sed 's/^# *//'
+  exit 0
+fi
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
+FC="$FLEET_HOME/bin/fleet-config"
+[[ -x "$FC" ]] || FC="$SELF_DIR/fleet-config"
+FRESH="$FLEET_HOME/bin/fleet-fresh"
+[[ -x "$FRESH" ]] || FRESH="$SELF_DIR/fleet-fresh"
+KEY="${1:-}"
+RESUME="${2:-fresh-keep}"
+[[ $# -le 2 && "$KEY" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || { echo 'fleet-start: provide a valid bot key' >&2; exit 2; }
+if [[ "$RESUME" != fresh-keep && "$RESUME" != fresh-reset && "$RESUME" != continue && ! "$RESUME" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+  echo 'fleet-start: resume must be a UUID, continue, fresh-keep or fresh-reset' >&2
+  exit 2
+fi
+"$FC" validate >/dev/null || exit 2
+WORKDIR="$("$FC" bot "$KEY" workdir 2>/dev/null)" || { echo "fleet-start: unknown bot key $KEY" >&2; exit 1; }
+STATE="$("$FC" bot "$KEY" state_dir)" || exit 1
+[[ -f "$STATE/.env" ]] || { echo 'fleet-start: add this bot and validate its token first' >&2; exit 1; }
+if [[ "$RESUME" == continue ]]; then
+  sid="$(head -1 "$STATE/session.id" 2>/dev/null | tr -d '[:space:]')"
+  project="$("$FC" project-dir "$KEY")" || exit 1
+  if [[ "$sid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ && -f "$project/$sid.jsonl" ]]; then
+    RESUME="$sid"
+  else
+    echo 'fleet-start: no saved session to continue' >&2
+    exit 1
+  fi
+fi
+
+# A live named Claude session for this exact workdir is a double launch. The
+# fresh engine repeats discovery while holding the per-bot restart lock.
+processes="$(ps -axo pid=,command= 2>/dev/null)" || { echo 'fleet-start: process list unavailable' >&2; exit 8; }
+while read -r pid command; do
+  [[ "$pid" =~ ^[0-9]+$ && "$command" == *"--channels plugin:telegram@claude-plugins-official"* ]] || continue
+  [[ "$command" == *"--name telebots-$KEY"* ]] || continue
+  cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
+  if [[ "$cwd" == "$WORKDIR" ]]; then
+    echo "fleet-start: $KEY already has a running session (pid $pid)" >&2
+    exit 7
+  fi
+done <<< "$processes"
+
+if [[ "${CC_START_DRYRUN:-0}" == 1 ]]; then
+  echo "DRYRUN would open a Terminal window for $KEY via fleet-fresh, resume=$RESUME"
+  CC_FRESH_DRYRUN=1 "$FRESH" 999999 "$WORKDIR" "$RESUME"
+  exit $?
+fi
+
+"$FRESH" 999999 "$WORKDIR" "$RESUME"

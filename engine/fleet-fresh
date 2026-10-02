@@ -59,7 +59,7 @@
 #      timeout or doubt leaves the window open and the log says why.
 #
 # Exit codes (the caller's source of truth):
-#   0  restarted, and the new poller was confirmed live
+#   0  restarted; heartbeat proof with overlay OK, named PID proof otherwise
 #   1  missing args
 #   2  an argument failed validation (unknown workdir, a pid that is not a plain
 #      positive number, a resume argument outside the list above, or a 4th
@@ -84,7 +84,7 @@
 set -uo pipefail
 
 usage() {
-  sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,79p' "$0" | sed 's/^# \{0,1\}//'
 }
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
@@ -129,7 +129,7 @@ MANUAL_LOG_DIR="$FLEET_HOME/watchdog-state"
 # Who called us, captured before anything else. Any token-shaped string is
 # redacted before it can reach a log line.
 CALLER_PID="$PPID"
-CALLER_CMD="$(ps -o command= -p "$PPID" 2>/dev/null | head -1 | sed -E 's/[0-9]{6,}:[A-Za-z0-9_-]{20,}/<redacted>/g' | cut -c1-200)"
+CALLER_CMD="$(ps -o comm= -p "$PPID" 2>/dev/null | head -1 | cut -c1-80)"
 KEY=""
 STATE_DIR=""
 LOCK_DIR=""
@@ -243,7 +243,7 @@ on_exit() {
       echo "$(date "+%F %T") restart lock left in place ($KEY): its pid file no longer names this run (pid $$), so it is not this run's to remove" >> "$LOG"
     fi
   fi
-  if [ -n "$MANUAL_LOG" ] && [ "${CC_FRESH_DRYRUN:-}" != "1" ]; then
+  if [ -n "$MANUAL_LOG" ] && [ "${CC_FRESH_DRYRUN:-}" != "1" ] && [ "${CC_FRESH_READY_DRYRUN:-}" != "1" ]; then
     mkdir -p "$MANUAL_LOG_DIR" 2>/dev/null || true
     printf '%s pid=%s cwd=%s resume=%s quiet=%s caller_pid=%s caller=%s exit=%s\n' \
       "$(date '+%F %T')" "$TARGET_PID" "$TARGET_CWD" "${RESUME_ID:-}" "${QUIET:-none}" \
@@ -267,6 +267,31 @@ tg_notice() {   # tg_notice <text>
     --data-urlencode "text=$1" \
     && echo "$(date '+%F %T') notice sent: $1" \
     || echo "$(date '+%F %T') notice curl failed"
+}
+
+send_ready_ping() {
+  local tok chat base
+  tok="$(token_of_state "$STATE_DIR")"
+  chat="$(chat_id_of_state "$STATE_DIR")"
+  if [ -z "$tok" ] || [ -z "$chat" ]; then
+    echo "$(date '+%F %T') back-online ping skipped: no token/chat for $KEY"
+    return 1
+  fi
+  base=https://api.telegram.org
+  if [ "${TELEBOTS_TEST:-0}" = 1 ] && [[ "${TELEBOTS_API_BASE:-}" =~ ^http://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?/?$ ]]; then
+    base="${TELEBOTS_API_BASE%/}"
+  fi
+  local args=()
+  if [[ "$RESUME_ID" =~ $UUID_RE ]]; then
+    args+=(--data-urlencode 'reply_markup={"inline_keyboard":[[{"text":"Continue","callback_data":"qr:0:0"}]]}')
+  fi
+  if curl -s -o /dev/null --max-time 10 -X POST "$base/bot$tok/sendMessage" \
+    --data-urlencode "chat_id=$chat" --data-urlencode "text=⚡ Back and ready" "${args[@]}" 2>/dev/null; then
+    echo "$(date '+%F %T') back-online ping sent"
+  else
+    echo "$(date '+%F %T') back-online ping curl failed"
+    return 1
+  fi
 }
 
 # ---- bash-native command timeout ---------------------------------------------
@@ -702,11 +727,21 @@ OSA
   MANUAL_LOG="$MANUAL_LOG_DIR/$KEY.manual_restart_log"
   trap 'on_exit $?' EXIT
 
+  OVERLAY_STATUS=$(head -1 "$FLEET_HOME/overlay.status" 2>/dev/null || true)
+  [[ "$OVERLAY_STATUS" == OK ]] && PROOF_MODE=heartbeat || PROOF_MODE=pid-only
+
   # Verification seam: print the decision and stop, before any lock, kill or launch.
   if [ "${CC_FRESH_DRYRUN:-}" = "1" ]; then
     echo "$(date '+%F %T') DRYRUN key=$KEY cwd=$TARGET_CWD state=$STATE_DIR pid=$TARGET_PID resume=$RESUME_ID quiet=${QUIET:-none} caller_pid=$CALLER_PID caller='${CALLER_CMD:-unknown}'"
+    echo "$(date '+%F %T') DRYRUN poller proof mode=$PROOF_MODE overlay=${OVERLAY_STATUS:-missing}"
+    echo "$(date '+%F %T') DRYRUN ready text: ⚡ Back and ready; Continue bubble: $([[ "$RESUME_ID" =~ $UUID_RE ]] && echo yes || echo no)"
     echo "$(date '+%F %T') DRYRUN nothing locked, nothing killed, nothing launched"
     exit 0
+  fi
+  if [ "${CC_FRESH_READY_DRYRUN:-0}" = 1 ] && [ "${TELEBOTS_TEST:-0}" = 1 ] && [[ "${FLEET_HOME}" == "${TELEBOTS_SANDBOX_ROOT:-/nonexistent}"/* ]] && [[ "${TELEBOTS_API_BASE:-}" =~ ^http://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?/?$ ]]; then
+    echo "$(date '+%F %T') TEST ready ping only; no process or Terminal action"
+    send_ready_ping
+    exit $?
   fi
 
   # A restart already in flight for this bot gets a visible answer, not silence.
@@ -897,7 +932,7 @@ OSA
   # The launcher command line, single-quoted for the new window's shell and handed
   # to osascript as an argument: the arguments are never interpreted as shell or
   # AppleScript text, whatever they hold.
-  LAUNCH_CMD="/usr/bin/env $(shq "FLEET_HOME=$FLEET_HOME") $(shq "FLEET_CONFIG=$FLEET_CONFIG") $(shq "$LAUNCHER") $(shq "$TARGET_CWD") $(shq "$RESUME_ID")"
+  LAUNCH_CMD="/usr/bin/env $(shq "FLEET_HOME=$FLEET_HOME") $(shq "FLEET_CONFIG=$FLEET_CONFIG") $(shq 'CC_LAUNCH_IN_TERMINAL=1') $(shq "$LAUNCHER") $(shq "$TARGET_CWD") $(shq "$RESUME_ID")"
   echo "$(date '+%F %T') opening Terminal -> $LAUNCH_CMD"
 
   # Everything the new session writes must be NEWER than this stamp, which is what
@@ -931,16 +966,29 @@ OSA
     [ -n "$NEW_PID" ] && break
   done
 
-  # A claude pid is NOT proof of a working bot: a session can start fine and never
-  # load its telegram plugin, so it reads nothing and answers nothing. Real proof
-  # is the poller's own files, written after LAUNCH_EPOCH: bot.pid (written once at
-  # poller startup) naming a live process, and a heartbeat since the launch
-  # carrying a fresh epoch. Missing heartbeat never counts as confirmed ready.
+  # With overlay OK, a Claude pid alone is insufficient: require bot.pid and a
+  # new heartbeat. A changed plugin may not write those files; degraded mode
+  # accepts only the new named Claude process in this bot's workdir.
+  echo "$(date '+%F %T') poller proof mode=$PROOF_MODE overlay=${OVERLAY_STATUS:-missing}"
   POLLER_OK=0
   POLLER_PID=""
   WAITED=0
   if [ -n "$NEW_PID" ]; then
-    echo "$(date '+%F %T') new claude pid=$NEW_PID; waiting up to ${POLLER_WAIT}s for its poller"
+    echo "$(date '+%F %T') new claude pid=$NEW_PID; proof mode=$PROOF_MODE"
+    if [ "$PROOF_MODE" = pid-only ]; then
+      # A changed official plugin may not write bot.pid or the Telebots
+      # heartbeat. Check the freshly launched, named Claude process itself.
+      sleep 2
+      new_cmd=$(ps -p "$NEW_PID" -o command= 2>/dev/null || true)
+      new_cwd=$(lsof -a -p "$NEW_PID" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+      if kill -0 "$NEW_PID" 2>/dev/null && [[ "$new_cmd" == *"--channels plugin:telegram@claude-plugins-official"* ]] \
+          && [[ "$new_cmd" == *"--name telebots-$KEY"* ]] && [ "$new_cwd" = "$TARGET_CWD" ]; then
+        POLLER_OK=1
+        POLLER_PID="$NEW_PID"
+        echo "$(date '+%F %T') pid-only proof: named Claude process in the bot workdir; channel traffic not confirmed"
+      fi
+    else
+    echo "$(date '+%F %T') waiting up to ${POLLER_WAIT}s for its poller"
     for _ in $(seq 1 "$POLLER_WAIT"); do
       sleep 1
       WAITED=$(( WAITED + 1 ))
@@ -951,16 +999,18 @@ OSA
       [ -n "$bp" ] || continue
       kill -0 "$bp" 2>/dev/null || continue
       kill -0 "$NEW_PID" 2>/dev/null || continue
-      [ -f "$STATE_DIR/poller.heartbeat" ] || continue
-      hb_mt=$(stat -f %m "$STATE_DIR/poller.heartbeat" 2>/dev/null || echo 0)
-      [ "$hb_mt" -ge "$LAUNCH_EPOCH" ] || continue
-      hb_ts=$(head -1 "$STATE_DIR/poller.heartbeat" 2>/dev/null | tr -cd '0-9')
-      [ -n "$hb_ts" ] || continue
-      [ "$hb_ts" -ge "$LAUNCH_EPOCH" ] || continue
-      now=$(date +%s)
-      [[ "$hb_ts" =~ ^[0-9]{1,12}$ ]] || continue
-      [ "$hb_ts" -le "$((now + 2))" ] || continue
-      [ "$((now - hb_ts))" -le 60 ] || continue
+      if [ "$PROOF_MODE" = heartbeat ]; then
+        [ -f "$STATE_DIR/poller.heartbeat" ] || continue
+        hb_mt=$(stat -f %m "$STATE_DIR/poller.heartbeat" 2>/dev/null || echo 0)
+        [ "$hb_mt" -ge "$LAUNCH_EPOCH" ] || continue
+        hb_ts=$(head -1 "$STATE_DIR/poller.heartbeat" 2>/dev/null | tr -cd '0-9')
+        [ -n "$hb_ts" ] || continue
+        [ "$hb_ts" -ge "$LAUNCH_EPOCH" ] || continue
+        now=$(date +%s)
+        [[ "$hb_ts" =~ ^[0-9]{1,12}$ ]] || continue
+        [ "$hb_ts" -le "$((now + 2))" ] || continue
+        [ "$((now - hb_ts))" -le 60 ] || continue
+      fi
       kill -0 "$NEW_PID" 2>/dev/null || continue
       kill -0 "$bp" 2>/dev/null || continue
       poller_belongs_to "$bp" "$NEW_PID" || continue
@@ -968,26 +1018,17 @@ OSA
       POLLER_PID="$bp"
       break
     done
+    fi
   fi
 
   if [ "$POLLER_OK" = "1" ]; then
-    echo "$(date '+%F %T') poller live (pid=$POLLER_PID, waited ${WAITED}s)"
+    echo "$(date '+%F %T') restart proof accepted mode=$PROOF_MODE pid=$POLLER_PID waited=${WAITED}s"
     if [ "$QUIET" = "quiet" ]; then
       echo "$(date '+%F %T') back-online ping suppressed (quiet mode; caller will notify)"
     else
       # The bot token is read only here, on the path that sends the ping: a quiet
       # run - every watchdog restart - never opens the .env.
-      BOT_TOKEN="$(token_of_state "$STATE_DIR")"
-      CHAT_ID="$(chat_id_of_state "$STATE_DIR")"
-      if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ]; then
-        curl -s -o /dev/null -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-          --data-urlencode "chat_id=${CHAT_ID}" \
-          --data-urlencode "text=Back and ready." \
-          && echo "$(date '+%F %T') back-online ping sent" \
-          || echo "$(date '+%F %T') back-online ping curl failed"
-      else
-        echo "$(date '+%F %T') back-online ping skipped: no token/chat for $KEY"
-      fi
+      send_ready_ping
     fi
   elif [ -n "$NEW_PID" ]; then
     echo "$(date '+%F %T') *** POLLER DID NOT COME UP within ${POLLER_WAIT}s (claude pid=$NEW_PID is running but its telegram poller is not) - NO ping sent, exiting 6 ***"
