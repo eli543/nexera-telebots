@@ -190,14 +190,25 @@ def scenario_1(root: Path) -> str:
     assert data["version"] == 2 and data["bots"] == []
     assert (fleet / "ux.json").is_file()
     assert (fleet / "bin/fleet-config").is_file()
+    for name in ("install-overlay.sh", "verify-overlay.sh", "restore-stock.sh",
+                 "overlay-common.sh", "seam-0.0.7.patch", "telebots.ts",
+                 "email.ts", "contracts.ts", "ux.json"):
+        assert (fleet / "bin" / name).is_file(), f"installed overlay support missing: {name}"
+    verified = sh(root, str(fleet / "bin/verify-overlay.sh"), "--status")
+    assert verified.returncode == 0 and verified.stdout.strip() == "OK", verified.stderr
+    reapplied = sh(root, str(fleet / "bin/install-overlay.sh"))
+    assert reapplied.returncode == 0, reapplied.stderr
+    assert "launchctl" not in (root / "logs/shims.log").read_text()
+    doctor = sh(root, str(fleet / "bin/fleet-doctor"))
+    assert doctor.returncode == 0, doctor.stdout + doctor.stderr
+    assert "[ ok ]  overlay status" in doctor.stdout and "[warn]  bots" in doctor.stdout
     assert (fleet / "templates/com.claude-fleet.watchdog.plist.template").is_file()
     with (fleet / "templates/com.claude-fleet.voice.plist.template").open("rb") as stream:
         voice = plistlib.load(stream)
     assert voice["ProgramArguments"] == [str(interpreter), str(fleet / "bin/transcribe-voice-daemon")]
     assert voice["EnvironmentVariables"]["FLEET_HOME"] == str(fleet)
     assert not (root / "home/Library/LaunchAgents/com.claude-fleet.watchdog.plist").exists()
-    assert "launchctl" not in (root / "logs/shims.log").read_text()
-    return "empty fleet, overlay, watchdog and rendered voice templates; no watchdog call"
+    return "empty fleet, installed overlay verifier, watchdog and rendered voice templates; no watchdog call"
 
 
 EVIDENCE = {
@@ -224,6 +235,7 @@ EVIDENCE = {
 
 def scenario_20(root: Path) -> str:
     install(root)
+    prior_launchctl = (root / "logs/shims.log").read_text().count("launchctl")
     agents = root / "home/Library/LaunchAgents"
     agents.mkdir(parents=True)
     for name in ("com.claude-fleet.watchdog.plist", "com.claude-fleet.voice.plist"):
@@ -242,7 +254,7 @@ def scenario_20(root: Path) -> str:
         assert (slot / "server.ts").read_bytes() == expected_stock.read_bytes()
     else:
         assert (slot / "server.ts").read_text() == "stock sandbox fixture\n"
-    assert (root / "logs/shims.log").read_text().count("launchctl") == 2
+    assert (root / "logs/shims.log").read_text().count("launchctl") - prior_launchctl == 2
     return "stock restored; watchdog and voice plists removed; state kept"
 
 

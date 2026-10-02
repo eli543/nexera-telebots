@@ -92,7 +92,11 @@ overlay="$REPO_DIR/poller/install-overlay.sh"
 verify="$REPO_DIR/poller/verify-overlay.sh"
 if [ "$DRY_RUN" -eq 0 ]; then
   for required in "$REPO_DIR/engine" "$REPO_DIR/daemon/watchdog.sh" \
-    "$REPO_DIR/daemon/watchdog-loop.sh" "$overlay" "$verify" "$REPO_DIR/poller/ux.json"; do
+    "$REPO_DIR/daemon/watchdog-loop.sh" "$overlay" "$verify" \
+    "$REPO_DIR/poller/restore-stock.sh" "$REPO_DIR/poller/overlay-common.sh" \
+    "$REPO_DIR/poller/seam-0.0.7.patch" "$REPO_DIR/poller/telebots.ts" \
+    "$REPO_DIR/poller/email.ts" "$REPO_DIR/poller/contracts.ts" \
+    "$REPO_DIR/poller/ux.json"; do
     if [ ! -e "$required" ]; then
       printf 'Required install component is missing: %s\n' "$required" >&2
       exit 1
@@ -104,6 +108,11 @@ say "Install directories and scripts"
 run mkdir -p "$FLEET_HOME/bin" "$FLEET_HOME/templates" "$FLEET_HOME/logs" "$FLEET_HOME/watchdog-state" "$FLEET_HOME/restart-state"
 run cp -R "$REPO_DIR/engine/." "$FLEET_HOME/bin/"
 run cp "$REPO_DIR/daemon/watchdog.sh" "$REPO_DIR/daemon/watchdog-loop.sh" "$FLEET_HOME/bin/"
+run cp "$REPO_DIR/poller/install-overlay.sh" "$REPO_DIR/poller/verify-overlay.sh" \
+  "$REPO_DIR/poller/restore-stock.sh" "$REPO_DIR/poller/overlay-common.sh" \
+  "$REPO_DIR/poller/seam-0.0.7.patch" "$REPO_DIR/poller/telebots.ts" \
+  "$REPO_DIR/poller/email.ts" "$REPO_DIR/poller/contracts.ts" \
+  "$REPO_DIR/poller/ux.json" "$FLEET_HOME/bin/"
 run cp "$REPO_DIR/daemon/com.claude-fleet.watchdog.plist.template" "$FLEET_HOME/templates/"
 for voice_script in transcribe-voice transcribe-voice-mlx transcribe-voice-faster transcribe-voice-daemon; do
   if [ -f "$REPO_DIR/voice/$voice_script" ]; then run cp "$REPO_DIR/voice/$voice_script" "$FLEET_HOME/bin/"; fi
