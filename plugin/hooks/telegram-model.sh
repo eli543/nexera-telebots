@@ -9,7 +9,7 @@
 #                                 -> change only the effort, keep the current model.
 #
 # All the real logic (parse, validate, write state, restart-resume) lives in
-# $FLEET_HOME/bin/fleet-model, which the stock plugin's server.ts intercept (patch 05)
+# $FLEET_HOME/bin/fleet-model, which the poller intercept
 # ALSO calls - so the mid-task path and this idle path can never drift. This hook only
 # detects the command and hands off, passing the AUTHORITATIVE session_id so the restart
 # resumes THIS exact conversation.
@@ -21,12 +21,13 @@
 # handled). No `set -e`: a scripting error must NEVER block a normal prompt.
 
 set -u
+[ -n "${TELEGRAM_STATE_DIR:-}" ] || exit 0
 
-FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
+FLEET_HOME="${FLEET_HOME:-${HOME:-}/.claude/telegram-fleet}"
 FLEET_BIN="$FLEET_HOME/bin"
 CONFIG="$FLEET_BIN/fleet-config"
 MODEL_ENGINE="$FLEET_BIN/fleet-model"
-LOG="$FLEET_HOME/logs/model-hook.log"
+LOG="$TELEGRAM_STATE_DIR/logs/model-hook.log"
 
 log() {
   printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null || true
@@ -80,7 +81,7 @@ case "$bl" in
   *) exit 0 ;;
 esac
 
-mkdir -p "$FLEET_HOME/logs" 2>/dev/null || true
+mkdir -p "$TELEGRAM_STATE_DIR/logs" 2>/dev/null || true
 
 # chat_id fallback from access.json allowFrom[0].
 if [ -z "$chat_id" ] && [ -f "$TELEGRAM_STATE_DIR/access.json" ]; then
@@ -94,7 +95,7 @@ except Exception:
 " "$TELEGRAM_STATE_DIR/access.json" 2>/dev/null)"
 fi
 
-log "TRIGGER key=$key workdir=$workdir chat_id=$chat_id args='$args' session_id=$session_id"
+log "TRIGGER key=$key workdir=$workdir chat_id=$chat_id session_id=$session_id"
 
 # Run detached: the engine may kill and relaunch this very session, so it must outlive
 # the hook (same detach /fresh and /resume use). Args: workdir chat_id raw_args session.
