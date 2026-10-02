@@ -49,6 +49,7 @@ exec env -i \
   TELEGRAM_STATE_DIR="$root/home/.claude/channels/sandbox" \
   TELEBOTS_TEST=1 \
   TELEBOTS_SANDBOX_ROOT="$root" \
+  SANDBOX_ROOT="$root" \
   TELEBOTS_STOCK_SERVER="$root/inputs/stock-server.ts" \
   WP4_SANDBOX="$root" \
   TELEBOTS_SHIM_LOG="$root/logs/shims.log" \

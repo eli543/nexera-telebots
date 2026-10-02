@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Start with `~/.claude/telegram-fleet/bin/fleet-doctor`. It checks the official plugin version, overlay, bot config, token validity, duplicate tokens, Claude Code version and per-bot health. Then run `~/.claude/telegram-fleet/bin/fleet-checklist <key>` for a per-feature result. Report `PASS`, `FAIL` or an explained `SKIP` for each applicable row; an installed file alone does not prove phone delivery.
+Start with `~/.claude/telegram-fleet/bin/fleet-doctor`. It checks the official plugin version, overlay, bot config, token validity, duplicate tokens, Claude Code version and per-bot health. Then run `~/.claude/telegram-fleet/bin/fleet-checklist <key>` for a per-feature result. Report each row as `Passed`, `Failed`, `Needs your action` or `Not configured` with its reason; an installed file alone does not prove phone delivery.
 
 ## The bot does not reply or pairing never arrives
 
