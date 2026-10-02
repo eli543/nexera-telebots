@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # Unit tests for tldr-nudge (pure classifiers + offline judge guards).
-# Run: python3 tests/tldr-nudge.test.py   -- offline, never sends an API request.
+# Run: python3 tests/hooks/tldr-nudge.test.py   -- offline, never sends an API request.
 # Loads the hook from ../plugin/hooks/tldr-nudge.py so it works from the repo root.
 import importlib.util, os, sys, tempfile
 
 _here = os.path.dirname(os.path.abspath(__file__))
-_root = os.path.dirname(_here)
+_root = os.path.dirname(os.path.dirname(_here))
 _hook = os.path.join(_root, "plugin", "hooks", "tldr-nudge.py")
 _spec = importlib.util.spec_from_file_location("tldr_nudge", _hook)
 tn = importlib.util.module_from_spec(_spec)
@@ -92,7 +92,7 @@ case("tldr numbers exceed body markers", L("Two separate things for you.",
 
 # TLDR numbered but body topics unmarked (prose body) -> MAP
 case("tldr-only key, prose body", L("Formation is done and everything is filed and tracked.",
-     "", "TLDR", "① Entity formed", "② Papers filed in the vault", "③ Next deadline 2028"), MAP)
+     "", "TLDR", "① Entity formed", "② Papers filed in the notes", "③ Next deadline 2028"), MAP)
 
 # body marked but TLDR not mirrored -> MAP
 case("body-only key, prose tldr", L(

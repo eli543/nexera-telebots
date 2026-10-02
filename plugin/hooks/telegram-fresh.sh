@@ -9,7 +9,7 @@
 # All bot facts (key, workdir, token, chat id) come from fleet.json + the per-bot state
 # dir at runtime.
 #
-# Companion mid-task path: the stock plugin's server.ts intercept (patch 04) handles a
+# Companion mid-task path: the poller intercept handles a
 # /fresh that arrives mid-turn, when this idle hook cannot fire. Both call the same
 # engine ($FLEET_HOME/bin/fleet-fresh), so they can never drift.
 #
@@ -20,12 +20,13 @@
 # IMPORTANT: no `set -e`. A scripting error must NEVER block a normal prompt.
 
 set -u
+[ -n "${TELEGRAM_STATE_DIR:-}" ] || exit 0
 
-FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
+FLEET_HOME="${FLEET_HOME:-${HOME:-}/.claude/telegram-fleet}"
 FLEET_BIN="$FLEET_HOME/bin"
 CONFIG="$FLEET_BIN/fleet-config"
 RESTART_ENGINE="$FLEET_BIN/fleet-fresh"
-LOG="$FLEET_HOME/logs/fresh-hook.log"
+LOG="$TELEGRAM_STATE_DIR/logs/fresh-hook.log"
 
 log() {
   printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null || true
@@ -72,7 +73,7 @@ print(mc.group(1) if mc else '')
 # Body must be exactly /fresh.
 [ "$body" = "/fresh" ] || exit 0
 
-mkdir -p "$FLEET_HOME/logs" 2>/dev/null || true
+mkdir -p "$TELEGRAM_STATE_DIR/logs" 2>/dev/null || true
 
 # Token from THIS bot's state .env; chat_id from the tag, else access.json allowFrom[0].
 bot_token=""
@@ -110,10 +111,8 @@ log "target_pid=$target_pid"
 
 # Ack "starting fresh" via the CORRECT bot for this session (neutral wording).
 if [ -n "$bot_token" ] && [ -n "$chat_id" ]; then
-  curl -s -m 5 -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
-    --data-urlencode "chat_id=${chat_id}" \
-    --data-urlencode "text=Starting a fresh session... back in ~5s." \
-    >> "$LOG" 2>&1 || log "WARN telegram ack failed"
+  HOOK_LIB="$(cd "$(dirname "$0")" && pwd)/telebots_hooklib.py"
+  CHAT="$chat_id" python3 -c 'import json,os; print(json.dumps({"chat_id":os.environ["CHAT"], "text":"Starting a fresh session... back in about 5s."}))' | python3 "$HOOK_LIB" send >/dev/null 2>&1 || true
 fi
 
 # Spawn the detached restart engine. macOS ships no setsid, so:

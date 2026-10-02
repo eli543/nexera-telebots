@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [ -n \"$TELEGRAM_STATE_DIR\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-stream.py\" pre; fi; true",
+            "command": "if [ -n \"${TELEGRAM_STATE_DIR:-}\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-stream.py\" pre; fi",
             "timeout": 20
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tldr-nudge.py\"",
+            "command": "if [ -n \"${TELEGRAM_STATE_DIR:-}\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tldr-nudge.py\"; fi",
             "timeout": 15
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [ -n \"$TELEGRAM_STATE_DIR\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-stream.py\" post; fi; true",
+            "command": "if [ -n \"${TELEGRAM_STATE_DIR:-}\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-stream.py\" post; fi",
             "timeout": 20
           }
         ]
@@ -38,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-deliver-nudge.py\" 2>/dev/null || true",
+            "command": "if [ -n \"${TELEGRAM_STATE_DIR:-}\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-deliver-nudge.py\"; fi",
             "timeout": 10
           }
         ]
@@ -48,7 +48,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-reply-guard.py\" reply",
+            "command": "if [ -n \"${TELEGRAM_STATE_DIR:-}\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-reply-guard.py\" reply; fi",
             "timeout": 10
           }
         ]
@@ -59,7 +59,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [ -n \"$TELEGRAM_STATE_DIR\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-stream.py\" stop; fi; true",
+            "command": "if [ -n \"${TELEGRAM_STATE_DIR:-}\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-stream.py\" stop; fi",
             "timeout": 20
           }
         ]
@@ -68,7 +68,16 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-reply-guard.py\" stop",
+            "command": "if [ -n \"${TELEGRAM_STATE_DIR:-}\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-reply-guard.py\" stop; fi",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -n \"${TELEGRAM_STATE_DIR:-}\" ]; then bash \"${CLAUDE_PLUGIN_ROOT}/hooks/context-guardian.sh\"; fi",
             "timeout": 15
           }
         ]
@@ -79,7 +88,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [ -n \"$TELEGRAM_STATE_DIR\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/telegram-ack.py\"; fi; true",
+            "command": "if [ -n \"${TELEGRAM_STATE_DIR:-}\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/telegram-ack.py\"; fi",
             "timeout": 10
           }
         ]
@@ -88,7 +97,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/telegram-fresh.sh\""
+            "command": "if [ -n \"${TELEGRAM_STATE_DIR:-}\" ]; then bash \"${CLAUDE_PLUGIN_ROOT}/hooks/telegram-fresh.sh\"; fi",
+            "timeout": 10
           }
         ]
       },
@@ -96,7 +106,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/telegram-resume.sh\""
+            "command": "if [ -n \"${TELEGRAM_STATE_DIR:-}\" ]; then bash \"${CLAUDE_PLUGIN_ROOT}/hooks/telegram-resume.sh\"; fi",
+            "timeout": 25
           }
         ]
       },
@@ -104,7 +115,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/telegram-model.sh\""
+            "command": "if [ -n \"${TELEGRAM_STATE_DIR:-}\" ]; then bash \"${CLAUDE_PLUGIN_ROOT}/hooks/telegram-model.sh\"; fi",
+            "timeout": 10
           }
         ]
       },
@@ -112,7 +124,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [ -n \"$TELEGRAM_STATE_DIR\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-stream.py\" prompt; fi; true",
+            "command": "if [ -n \"${TELEGRAM_STATE_DIR:-}\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-stream.py\" prompt; fi",
             "timeout": 20
           }
         ]
@@ -121,8 +133,52 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-reply-guard.py\" prompt",
+            "command": "if [ -n \"${TELEGRAM_STATE_DIR:-}\" ]; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/tg-reply-guard.py\" prompt; fi",
             "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -n \"${TELEGRAM_STATE_DIR:-}\" ]; then bash \"${CLAUDE_PLUGIN_ROOT}/hooks/compact-notify.sh\" pre; fi",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact|fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -n \"${TELEGRAM_STATE_DIR:-}\" ]; then bash \"${CLAUDE_PLUGIN_ROOT}/hooks/record-session-id.sh\"; fi",
+            "timeout": 2
+          }
+        ]
+      },
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -n \"${TELEGRAM_STATE_DIR:-}\" ]; then bash \"${CLAUDE_PLUGIN_ROOT}/hooks/telebots-rules.sh\"; fi",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -n \"${TELEGRAM_STATE_DIR:-}\" ]; then bash \"${CLAUDE_PLUGIN_ROOT}/hooks/compact-notify.sh\" post; fi",
+            "timeout": 20
           }
         ]
       }

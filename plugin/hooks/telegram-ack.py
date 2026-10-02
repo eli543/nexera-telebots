@@ -22,13 +22,13 @@ import sys
 import os
 import re
 import json
-from urllib import request, parse
+from telebots_hooklib import telegram, event_log
 
 HTTP_TIMEOUT = 4
-FALLBACK = "\U0001F440"  # 👀 - always whitelist-valid
+FALLBACK = "\U0001F440"
 
-# default rotation for messages with no clear sentiment (varied, not static)
-DEFAULTS = ["\U0001F440", "\U0001F525", "\U0001F44D", "\U0001FAE1", "\U0001F4AF"]  # 👀 🔥 👍 🫡 💯
+
+DEFAULTS = ["\U0001F440", "\U0001F525", "\U0001F44D", "\U0001FAE1", "\U0001F4AF"]
 
 
 def hard_exit():
@@ -63,31 +63,31 @@ def pick_emoji(text, state_dir):
     """Content-aware pick from the user's inbound message; rotates a varied default."""
     t = (text or "").lower()
     try:
-        # explicit emoji-in-message checks (real emoji chars - raw-regex \U would be literal)
+
         if any(e in t for e in ("\U0001F525", "\U0001F4AA", "\U00002764", "\U0001F60D")):
-            return "\U0001F525"  # 🔥/💪/❤/😍 -> 🔥
+            return "\U0001F525"
         if "\U0001F389" in t or "\U0001F38A" in t:
-            return "\U0001F389"  # 🎉/🎊 -> 🎉
+            return "\U0001F389"
         if "\U0001F64F" in t:
-            return "\U0001F64F"  # 🙏
+            return "\U0001F64F"
         if re.search(r"\b(thank|thanks|thx|appreciate|grateful)\b", t):
-            return "\U0001F64F"  # 🙏
+            return "\U0001F64F"
         if re.search(r"(amazing|incredible|awesome|perfect|love (it|this|that)|brilliant|genius|"
                      r"nailed it|so good|great (job|work|stuff)|well done|looks great|beautiful|"
                      r"killer|legend)", t):
-            return "\U0001F525"  # 🔥
+            return "\U0001F525"
         if re.search(r"\b(done|shipped|it works|works now|working now|fixed|live now|let'?s go|"
                      r"congrats|we did it|finally|deployed)\b", t):
-            return "\U0001F389"  # 🎉
+            return "\U0001F389"
         if re.search(r"\b(exactly|spot on|100%|correct|agreed|yep|yes\b.*\!|nailed)\b", t):
-            return "\U0001F4AF"  # 💯
+            return "\U0001F4AF"
         if re.search(r"\b(do it|build it|fix it|send it|go ahead|make it|proceed|ship it|"
                      r"go for it|let'?s do it|get it done|run it)\b", t):
-            return "\U0001FAE1"  # 🫡
+            return "\U0001FAE1"
         if "?" in t or re.search(r"^\s*(how|why|what|can|could|should|would|is|are|does|do|did|"
                                  r"where|when|who|which|will)\b", t):
-            return "\U0001F440"  # 👀
-        # default: rotate for visible variety
+            return "\U0001F440"
+
         cf = os.path.join(state_dir, "ack-rotate")
         n = 0
         try:
@@ -107,20 +107,12 @@ def pick_emoji(text, state_dir):
 
 
 def set_reaction(token, chat_id, message_id, emoji):
-    url = "https://api.telegram.org/bot%s/setMessageReaction" % token
-    params = {
-        "chat_id": str(chat_id),
-        "message_id": str(message_id),
-        "reaction": json.dumps([{"type": "emoji", "emoji": emoji}]),
-    }
-    try:
-        body = parse.urlencode(params).encode()
-        req = request.Request(url, data=body)
-        with request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
-            data = json.loads(r.read().decode())
-            return bool(data and data.get("ok"))
-    except Exception:
-        return False
+    result = telegram("setMessageReaction", {
+        "chat_id": str(chat_id), "message_id": str(message_id),
+        "reaction": [{"type": "emoji", "emoji": emoji}],
+    }, timeout=HTTP_TIMEOUT, token=token)
+    event_log("ack.log", "ACK", ok=result.get("ok") is True)
+    return result.get("ok") is True
 
 
 def main():
@@ -147,7 +139,7 @@ def main():
 
     s = ptext.lstrip()
     if not s.startswith("<channel"):
-        hard_exit()  # only react to real inbound channel messages
+        hard_exit()
 
     m_mid = re.search(r'message_id="(\d+)"', s)
     if not m_mid:
@@ -163,13 +155,12 @@ def main():
     end = s.rfind("</channel>")
     body = s[gt + 1:end].strip() if (gt != -1 and end != -1 and end > gt) else ""
     if body.startswith("/"):
-        hard_exit()  # slash-command -> no reaction
+        hard_exit()
 
     emoji = pick_emoji(body, state_dir)
 
     if os.environ.get("ACK_DRY") == "1":
-        sys.stderr.write("[DRY] react %s -> chat %s msg %s | body: %s\n"
-                         % (emoji, chat_id, message_id, body[:70]))
+        sys.stderr.write("[DRY] ACK emoji=%s\n" % emoji)
         hard_exit()
 
     ok = set_reaction(token, chat_id, message_id, emoji)

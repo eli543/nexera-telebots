@@ -1,55 +1,25 @@
 #!/usr/bin/env python3
-# tg-deliver-nudge.py - PostToolUse hook
-#
-# Purpose: the instant Claude CREATES a document (Write / NotebookEdit), tap it
-# on the shoulder so it hands the file to the user itself - tappable in Telegram,
-# or opened/printed in a terminal/desktop session - instead of leaving a file path
-# they can't reach. Claude keeps full judgment about whether the document is a real
-# deliverable; this hook only injects a reminder at the exact moment it matters,
-# which is far more reliable than a session-start rule that fades as the session
-# fills up.
-#
-# SAFETY CONTRACT (this hook must never break a single thing):
-#   - It runs AFTER the tool already executed, so it cannot block, undo, or
-#     interrupt anything.
-#   - On ANY error it emits nothing and exits 0 (fail-silent).
-#   - It writes to stdout ONLY on the success path, and only a single valid JSON
-#     object. Every no-op path writes nothing.
-#   - It never sends anything and never touches the user's files. It only adds a
-#     note to Claude's context.
-#   - Kill switch: create $FLEET_HOME/deliver-nudge.off to disable (FLEET_HOME
-#     defaults to ~/.claude/telegram-fleet). This lives OUTSIDE the plugin dir on
-#     purpose: the plugin cache is replaced on every update, so a kill switch kept
-#     inside it would silently reset - the fleet home is stable across updates.
-#
-# Output schema (Claude Code PostToolUse additionalContext):
-#   {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "..."}}
-
 import sys
 import os
 import json
+import stat
+import time
 
-FLEET_HOME = os.environ.get("FLEET_HOME") or os.path.expanduser("~/.claude/telegram-fleet")
-KILL_SWITCH = os.path.join(FLEET_HOME, "deliver-nudge.off")
+KILL_SWITCH = os.path.join(os.environ.get("FLEET_HOME") or os.path.expanduser("~/.claude/telegram-fleet"), "deliver-nudge.off")
 
-# Tools that bring a document into existence with content. Deliberately NOT
-# "Edit" - iterative edits would fire repeat nudges, and a document almost always
-# comes into being via Write (or NotebookEdit for notebooks).
+
 CREATE_TOOLS = ("Write", "NotebookEdit")
 
-# Deliverable-ish document extensions. Things the user might read, send, or copy-paste.
+
 DOC_EXTS = (
     ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls",
     ".csv", ".md", ".markdown", ".txt", ".rtf", ".html", ".htm",
     ".odt", ".ipynb",
 )
 
-# Path fragments that are NEVER a user deliverable - skip the nudge entirely so
-# it stays quiet on internal housekeeping. (Lowercased substring match against
-# the absolute path with a trailing slash.) Note: /tmp is intentionally NOT here
-# - generated PDFs/images are routinely staged in /tmp.
+
 EXCLUDE_FRAGMENTS = (
-    os.path.expanduser("~").lower() + "/.claude/",  # memory, hooks, settings, specs
+    os.path.expanduser("~").lower() + "/.claude/",
     "/.git/",
     "/node_modules/",
     "/dist/",
@@ -60,35 +30,84 @@ EXCLUDE_FRAGMENTS = (
 )
 
 
-def build_message(filename, is_telegram):
-    if is_telegram:
-        deliver = (
-            "Hand it to the user in your Telegram reply - attach it via the reply tool's "
-            "files=[...] so it lands as a tappable file, not a path. If it is something "
-            "they would read or forward (proposal, report, summary, any formatted doc), "
-            "give it as a PDF - that is their default for anything they would look at or "
-            "send. If it is something they would copy-paste (a handoff prompt for a person "
-            "/ another AI / another session, or a snippet), put the text in the message or "
-            "attach it as plain text so it is easy to copy."
-        )
-    else:
-        deliver = (
-            "Present it to the user directly - print the full content inline and/or open "
-            "the file on screen so they can read or grab it now, never just a path. "
-            "Read/forward docs should be a PDF; copy-paste material should be shown as text."
-        )
+RATE_STATE_FILE = "ratelimit.json"
+RATE_COOLDOWN_MAX = 86400.0
+RATE_MAX_BYTES = 1000000
+
+
+COOLDOWN_SUPPRESS_MIN = 60.0
+
+
+def _small_json(path):
+    """Parse a small regular JSON file, else None. Stats before it opens, so a FIFO, a
+    directory or an oversized file is skipped instead of read."""
+    try:
+        st = os.stat(path)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > RATE_MAX_BYTES:
+            return None
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _cooldown_until(state):
+    """Epoch seconds when this chat's flood-ban cooldown expires, 0.0 if none is live."""
+    try:
+        sidecar = _small_json(os.path.join(state, "stream", RATE_STATE_FILE)) or {}
+        cooldown = sidecar.get("cooldown")
+        if not isinstance(cooldown, dict) or not cooldown:
+            return 0.0
+        access = _small_json(os.path.join(state, "access.json")) or {}
+        allow = access.get("allowFrom") or []
+        row = cooldown.get(str(allow[0])) if allow else None
+        if not isinstance(row, dict):
+            return 0.0
+        until = float(row.get("until") or 0)
+        remaining = until - time.time()
+        if remaining < COOLDOWN_SUPPRESS_MIN or remaining > RATE_COOLDOWN_MAX:
+            return 0.0
+        return until
+    except Exception:
+        return 0.0
+
+
+def _clock(epoch):
+    """Wall-clock label for an epoch in the machine's own zone ."""
+    try:
+        t = time.localtime(epoch)
+        stamp = "%d:%02d%s %s" % (t.tm_hour % 12 or 12, t.tm_min,
+                                  "am" if t.tm_hour < 12 else "pm",
+                                  time.strftime("%Z", t))
+        if t.tm_yday != time.localtime().tm_yday:
+            stamp = time.strftime("%A ", t) + stamp
+        return stamp
+    except Exception:
+        return ""
+
+
+def cooldown_note(filename, until):
+    when = _clock(until)
     return (
-        "DELIVERABLE NUDGE (automatic, from the document-surfacing hook). "
-        "You just created the document \"%s\". Before you finish this turn, decide whether "
-        "the user would actually want it - something they asked you to produce, or would "
-        "want to read, send, or copy-paste. Lean toward giving it to them. %s "
-        "Skip ONLY pure-internal artifacts they cannot use: setups-log entries, vault "
-        "housekeeping, your own memory/scratch notes, or code/config files. If you have "
-        "already surfaced it, ignore this."
-    ) % (filename, deliver)
+        "delivery guard: chat under Telegram cooldown%s, not nudging. Telegram is "
+        "rejecting sends for this chat (HTTP 429), so do not try to deliver \"%s\" "
+        "over Telegram until the cooldown clears."
+    ) % ((" until " + when) if when else "", filename)
+
+
+def build_message(filename, is_telegram=True):
+    return (
+        "DELIVERABLE NUDGE: You created the document \"%s\". If it is a requested "
+        "deliverable, attach it with the Telegram reply tool files=[...] so the user can "
+        "open it. Use PDF for a formatted document when appropriate, and plain text for "
+        "copy-paste material. Skip internal notes and code/config files. If you already "
+        "delivered it, ignore this reminder."
+    ) % filename
 
 
 def main():
+    if not os.environ.get("TELEGRAM_STATE_DIR"):
+        return
     if os.path.exists(KILL_SWITCH):
         return
 
@@ -100,8 +119,7 @@ def main():
     if not isinstance(data, dict):
         return
 
-    # Only nudge the main thread. A subagent writing a file has no Telegram chat
-    # to reply to, and the main agent is what talks to the user.
+
     if data.get("agent_id") or data.get("agentId"):
         return
 
@@ -127,8 +145,12 @@ def main():
             return
 
     filename = os.path.basename(fp)
-    is_tg = bool(os.environ.get("TELEGRAM_STATE_DIR"))
-    msg = build_message(filename, is_tg)
+    state = os.environ.get("TELEGRAM_STATE_DIR") or ""
+    until = _cooldown_until(state) if state else 0.0
+    if until > 0:
+        msg = cooldown_note(filename, until)
+    else:
+        msg = build_message(filename, bool(state))
     out = {
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
@@ -142,6 +164,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        # Fail-silent: never break a turn. Emit nothing.
+
         pass
     sys.exit(0)
