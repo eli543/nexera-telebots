@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Approve a pairing code in the selected bot's state directory."""
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def atomic_write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(
+        prog="fleet-pair",
+        description="Approve one pending code for a named bot, then optionally lock access to the allowlist.",
+        epilog="Exit codes: 0 paired, 1 missing bot or state, 2 invalid arguments, 3 missing or expired code."
+    )
+    parser.add_argument("key", help="bot key from fleet.json")
+    parser.add_argument("code", help="six-character code shown by the bot")
+    parser.add_argument("--lock", action="store_true", help="set allowlist policy and enroll this bot in the watchdog")
+    args = parser.parse_args(argv)
+    if not re.fullmatch(r"[A-Za-z0-9]{6}", args.code):
+        print("fleet-pair: code must be six letters or numbers", file=sys.stderr)
+        return 2
+    home = Path(os.environ.get("FLEET_HOME", "~/.claude/telegram-fleet")).expanduser().resolve()
+    helper = home / "bin" / "fleet-config"
+    if not os.access(helper, os.X_OK):
+        helper = Path(__file__).resolve().parent / "fleet-config"
+    try:
+        resolved = subprocess.run([str(helper), "bot", args.key, "state_dir"],
+                                  capture_output=True, text=True, timeout=8)
+        if resolved.returncode or not resolved.stdout.strip():
+            raise FileNotFoundError("bot key is not in fleet.json")
+        state = Path(resolved.stdout.strip()).expanduser().resolve()
+        with (state / ".pair.lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            access_path = state / "access.json"
+            access = json.loads(access_path.read_text(encoding="utf-8"))
+            pending = access.get("pending")
+            item = pending.get(args.code) if isinstance(pending, dict) else None
+            if not isinstance(item, dict) or item.get("expiresAt", 0) < int(time.time() * 1000):
+                print("fleet-pair: code is missing or expired", file=sys.stderr)
+                return 3
+            sender = str(item.get("senderId", ""))
+            chat = str(item.get("chatId", ""))
+            if not re.fullmatch(r"[0-9]{1,20}", sender) or not re.fullmatch(r"-?[0-9]{1,20}", chat):
+                print("fleet-pair: pending entry has an invalid sender or chat", file=sys.stderr)
+                return 3
+            allowed = access.setdefault("allowFrom", [])
+            if sender not in allowed:
+                allowed.append(sender)
+            del pending[args.code]
+            if args.lock:
+                access["dmPolicy"] = "allowlist"
+            atomic_write(access_path, json.dumps(access, indent=2) + "\n")
+            atomic_write(state / "approved" / sender, chat + "\n")
+            if args.lock:
+                atomic_write(state / ".enrolled", "1\n")
+            print("Paired bot " + args.key + (" and locked access to its allowlist." if args.lock else "."))
+            return 0
+    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as exc:
+        print("fleet-pair: " + (str(exc) if isinstance(exc, FileNotFoundError) else "could not read bot pairing state"), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

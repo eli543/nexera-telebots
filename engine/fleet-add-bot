@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Add one validated Telegram bot to a local Telebots fleet."""
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+import urllib.request
+
+
+KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+TOKEN_RE = re.compile(r"^[0-9]{8,10}:[A-Za-z0-9_-]{35,}$")
+
+
+def fail(message, code=1):
+    print("fleet-add-bot: " + message, file=sys.stderr)
+    return code
+
+
+def atomic_write(path, content, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def token_input():
+    if os.environ.get("TELEBOTS_TEST") == "1":
+        test_file = os.environ.get("CC_ADD_BOT_TOKEN_FILE", "")
+        if test_file:
+            sandbox = Path(os.environ.get("TELEBOTS_SANDBOX_ROOT", "/nonexistent")).resolve()
+            if not Path(test_file).resolve().is_relative_to(sandbox):
+                raise ValueError("test token file must stay inside the sandbox")
+            return Path(test_file).read_text(encoding="utf-8").strip()
+    if sys.stdin.isatty():
+        import getpass
+        return getpass.getpass("Paste the BotFather token here (hidden): ").strip()
+    script = 'text returned of (display dialog "Paste the BotFather token" default answer "" with hidden answer buttons {"Cancel", "Add bot"} default button "Add bot")'
+    result = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, text=True, check=False)
+    if result.returncode:
+        raise ValueError("token entry was cancelled")
+    return result.stdout.strip()
+
+
+def api_base():
+    base = "https://api.telegram.org"
+    if os.environ.get("TELEBOTS_TEST") == "1":
+        candidate = os.environ.get("TELEBOTS_API_BASE", "")
+        parsed = urllib.parse.urlparse(candidate)
+        if parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}:
+            base = candidate.rstrip("/")
+    return base
+
+
+def get_me(token):
+    url = api_base() + "/bot" + token + "/getMe"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            data = json.load(response)
+    except Exception as exc:
+        raise ValueError("token validation failed (getMe did not respond)") from None
+    result = data.get("result") if isinstance(data, dict) and data.get("ok") is True else None
+    if not isinstance(result, dict) or not result.get("is_bot"):
+        raise ValueError("token validation failed (getMe did not confirm a bot)")
+    username = result.get("username", "")
+    if not isinstance(username, str) or not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+        raise ValueError("token validation failed (getMe returned no valid username)")
+    return username
+
+
+def existing_token(state):
+    try:
+        for line in (state / ".env").read_text(encoding="utf-8").splitlines():
+            if line.startswith("TELEGRAM_BOT_TOKEN="):
+                return line.split("=", 1)[1].strip().strip('"\'')
+    except OSError:
+        pass
+    return ""
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(
+        prog="fleet-add-bot",
+        description="Add a bot after its token passes Telegram getMe. Token entry is hidden.",
+        epilog="Exit codes: 0 added, 1 validation or I/O failed, 2 invalid arguments."
+    )
+    parser.add_argument("key", help="lowercase key, up to 31 letters, numbers or hyphens")
+    parser.add_argument("--name", help="display name (default: key)")
+    parser.add_argument("--emoji", default="🤖", help="display emoji (default: robot)")
+    args = parser.parse_args(argv)
+    if not KEY_RE.fullmatch(args.key):
+        return fail("invalid key; use lowercase letters, numbers and hyphens", 2)
+    if args.name is not None and (not args.name.strip() or any(ord(c) < 32 for c in args.name)):
+        return fail("invalid display name", 2)
+
+    home = Path(os.environ.get("FLEET_HOME", "~/.claude/telegram-fleet")).expanduser().resolve()
+    config = Path(os.environ.get("FLEET_CONFIG", str(home / "fleet.json"))).expanduser().resolve()
+    helper = home / "bin" / "fleet-config"
+    if not os.access(helper, os.X_OK):
+        helper = Path(__file__).resolve().parent / "fleet-config"
+    home.mkdir(parents=True, exist_ok=True)
+    try:
+        with (home / ".fleet-config.lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            checked = subprocess.run([str(helper), "validate"], capture_output=True, text=True,
+                                     timeout=8, env={**os.environ, "FLEET_CONFIG": str(config)})
+            if checked.returncode:
+                return fail("fleet.json is invalid: " + checked.stderr.strip())
+            data = json.loads(config.read_text(encoding="utf-8"))
+            bots = data.get("bots")
+            if not isinstance(bots, list) or data.get("version") not in (1, 2):
+                return fail("fleet.json must have version 1 or 2 and a bots array")
+            if any(bot.get("key") == args.key for bot in bots if isinstance(bot, dict)):
+                return fail("this bot key already exists")
+            workdir = (Path.home() / "claude-fleet" / args.key).resolve()
+            state = (Path.home() / ".claude" / "channels" / ("fleet-" + args.key)).resolve()
+            for bot in bots:
+                if isinstance(bot, dict) and (Path(str(bot.get("workdir", ""))).expanduser().resolve() == workdir
+                                              or Path(str(bot.get("state_dir", ""))).expanduser().resolve() == state):
+                    return fail("another bot already owns this directory")
+            if len(bots) >= 3:
+                print("BotFather may slow new bot creation after the first few. Finish one bot before creating the next.")
+
+            token = token_input()
+            if not TOKEN_RE.fullmatch(token):
+                return fail("token has the wrong format")
+            digest = hashlib.sha256(token.encode()).digest()
+            for bot in bots:
+                if not isinstance(bot, dict):
+                    continue
+                other = Path(str(bot.get("state_dir", ""))).expanduser()
+                old = existing_token(other)
+                if old and hashlib.sha256(old.encode()).digest() == digest:
+                    return fail("this token is already assigned to another bot")
+            username = get_me(token)
+
+            if workdir.exists() and any(workdir.iterdir()):
+                return fail("work directory already contains files")
+            if state.exists() and any(state.iterdir()):
+                return fail("state directory already contains files")
+            workdir.mkdir(parents=True, exist_ok=True)
+            state.mkdir(parents=True, exist_ok=True)
+            (state / "logs").mkdir(exist_ok=True)
+            atomic_write(state / ".env", "TELEGRAM_BOT_TOKEN=" + token + "\n")
+            token = ""
+            atomic_write(state / "access.json", json.dumps({"dmPolicy": "pairing", "allowFrom": [], "groups": {}, "pending": {}}, indent=2) + "\n")
+            if data.get("options", {}).get("rich_stream", True):
+                atomic_write(state / "rich-stream", "1\n")
+            settings = {"permissions": {"allow": [
+                "mcp__plugin_telegram_telegram__reply",
+                "mcp__plugin_telegram_telegram__react",
+                "mcp__plugin_telegram_telegram__edit_message",
+                "mcp__plugin_telegram_telegram__download_attachment"
+            ]}}
+            atomic_write(workdir / ".claude" / "settings.local.json", json.dumps(settings, indent=2) + "\n")
+            data["version"] = 2
+            bots.append({"name": args.name.strip() if args.name else args.key.capitalize(), "key": args.key,
+                         "workdir": str(workdir), "state_dir": str(state), "emoji": args.emoji})
+            atomic_write(config, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+            print("@" + username + " ready. Start it with fleet-start " + args.key + ".")
+            return 0
+    except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
+        return fail(str(exc) if isinstance(exc, ValueError) else "could not update the fleet")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

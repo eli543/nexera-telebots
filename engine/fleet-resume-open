@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Reopen a saved chat in one bot, after proving its current session PID.
+
+Usage: fleet-resume-open <uuid> <workdir> <chat_id>
+       fleet-resume-open --help
+Exit codes: 0 reopened/dry run, 2 invalid arguments, 4 UUID not found,
+6 source unreadable, 7 copy failed, 8 restart engine missing,
+9 target session missing or ambiguous. CC_RESUME_DRYRUN=1 is read-only.
+"""
+
+import hashlib
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
+FLEET_HOME = Path(os.environ.get("FLEET_HOME", "~/.claude/telegram-fleet")).expanduser()
+SELF_DIR = Path(__file__).resolve().parent
+
+
+def executable(name):
+    path = FLEET_HOME / "bin" / name
+    return path if os.access(path, os.X_OK) else SELF_DIR / name
+
+
+def fc(*args):
+    out = subprocess.run([str(executable("fleet-config")), *args],
+                         capture_output=True, text=True, timeout=8)
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def candidates(workdir, key):
+    if os.environ.get("TELEBOTS_TEST") == "1" and os.environ.get("CC_RESUME_DRYRUN") == "1":
+        value = os.environ.get("CC_RESUME_TEST_PID", "")
+        if re.fullmatch(r"[1-9][0-9]*", value):
+            return [value]
+    out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=10)
+    if out.returncode:
+        return []
+    pids = []
+    for line in out.stdout.splitlines():
+        match = re.match(r"\s*([0-9]+)\s+(.*)", line)
+        if not match:
+            continue
+        pid, command = match.groups()
+        if "--channels plugin:telegram@claude-plugins-official" not in command or "--name telebots-" + key not in command:
+            continue
+        cwd = subprocess.run(["lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"],
+                             capture_output=True, text=True, timeout=10)
+        if cwd.returncode == 0 and ("n" + workdir) in cwd.stdout.splitlines():
+            pids.append(pid)
+    return pids
+
+
+def digest(path):
+    value = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            value.update(chunk)
+    return value.digest()
+
+
+def copy_atomic(source, target):
+    if source.resolve() == target.resolve():
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        if digest(source) != digest(target):
+            raise OSError("destination transcript already has different content")
+        return
+    fd, temp = tempfile.mkstemp(prefix="." + target.stem + ".", dir=target.parent)
+    try:
+        with os.fdopen(fd, "wb") as output, source.open("rb") as inp:
+            shutil.copyfileobj(inp, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp, target)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def main(argv):
+    if argv and argv[0] in ("--help", "-h"):
+        print(__doc__.strip())
+        return 0
+    if len(argv) != 3 or not UUID_RE.fullmatch(argv[0]) or not re.fullmatch(r"-?[0-9]+", argv[2]):
+        print("fleet-resume-open: need UUID, known workdir and chat_id", file=sys.stderr)
+        return 2
+    uuid, workdir, _chat = argv
+    key = fc("bot-by-workdir", workdir, "key")
+    if not key or fc("bot", key, "workdir") != workdir:
+        print("fleet-resume-open: unknown destination workdir", file=sys.stderr)
+        return 2
+    lister = executable("fleet-sessions")
+    resolved = subprocess.run([str(lister), "resolve-uuid", uuid, "--bot", key],
+                              capture_output=True, text=True, timeout=15)
+    if resolved.returncode:
+        print("fleet-resume-open: saved chat not found", file=sys.stderr)
+        return 4 if resolved.returncode in (3, 4) else 6
+    fields = resolved.stdout.strip().split("\t")
+    if len(fields) != 4 or fields[0] != uuid:
+        return 6
+    source = Path(fields[3]).resolve()
+    projects = {Path(fc("project-dir", row)).resolve() for row in fc("bots").splitlines()}
+    if source.name != uuid + ".jsonl" or source.parent not in projects:
+        print("fleet-resume-open: saved transcript is outside the configured fleet", file=sys.stderr)
+        return 6
+    try:
+        with source.open("rb") as handle:
+            handle.read(1)
+    except OSError:
+        print("fleet-resume-open: saved transcript is unreadable", file=sys.stderr)
+        return 6
+    fresh = executable("fleet-fresh")
+    if not os.access(fresh, os.X_OK):
+        return 8
+    pids = candidates(workdir, key)
+    if len(pids) != 1:
+        print("fleet-resume-open: expected exactly one running destination session", file=sys.stderr)
+        return 9
+    project = Path(fc("project-dir", key))
+    dest = project / (uuid + ".jsonl")
+    if os.environ.get("CC_RESUME_DRYRUN") == "1":
+        print(f"DRYRUN would copy {source.name} into {project} and restart {key} pid {pids[0]} on that UUID")
+        return 0
+    try:
+        copy_atomic(source, dest)
+    except OSError:
+        print("fleet-resume-open: copy failed; nothing was restarted", file=sys.stderr)
+        return 7
+    return subprocess.run([str(fresh), pids[0], workdir, uuid, "quiet"], check=False).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

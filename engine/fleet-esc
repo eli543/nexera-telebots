@@ -38,10 +38,13 @@
 # use, and until granted the engine reports the miss instead of pretending.
 # Env: CC_ESC_DRYRUN=1 resolves and prints the intended action, sends nothing.
 # Logs to $FLEET_HOME/logs/esc.log.
+# Exit codes: 0 interrupted/dry run, 1 missing args, 2 unknown bot,
+# 3 stopped pid, 4 wrong process, 5 wrong cwd, 6 wrong tty, 7 lock busy,
+# 8-10 Terminal delivery refused or failed.
 
 set -uo pipefail
 
-usage() { sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//'; }
 case "${1:-}" in -h|--help) usage; exit 0 ;; esac
 
 FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"

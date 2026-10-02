@@ -1,18 +1,15 @@
 {
-  "version": 1,
-  "bots": [
-    {
-      "name": "Main",
-      "key": "main",
-      "workdir": "~/claude-fleet/main",
-      "state_dir": "~/.claude/channels/fleet-main",
-      "emoji": "🤖"
-    }
-  ],
+  "version": 2,
+  "bots": [],
   "options": {
     "watchdog": true,
     "voice": "auto",
+    "voice_daemon": false,
     "tldr_judge": false,
-    "grid": false
+    "grid": false,
+    "notes_dir": "~/Telebots Notes",
+    "rich_stream": true,
+    "guardian_thresholds": "60,70,80,90",
+    "email": false
   }
 }

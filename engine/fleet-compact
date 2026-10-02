@@ -1,0 +1,1070 @@
+#!/bin/bash
+# fleet-compact <pid> <workdir> [focus]
+# Compact one bot in its Terminal tab after checking the live input frame.
+# CC_COMPACT_DRYRUN=1 classifies a recorded frame and takes no Terminal action.
+# Exit codes: 0 started, 1 missing args, 2 unknown workdir, 3-6 target refusal,
+# 7 lock busy, 8 busy timeout, 9 picker, 10 no proof, 11 unsent text,
+# 12 unreadable frame, 13 duplicate run, 14 not enough messages,
+# 15 session changed, 16 command queued behind a turn.
+
+set -uo pipefail
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
+  sed -n '2,8p' "$0" | sed 's/^# *//'
+  exit 0
+fi
+FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+FC_BIN="$FLEET_HOME/bin/fleet-config"
+[ -x "$FC_BIN" ] || FC_BIN="$SELF_DIR/fleet-config"
+mkdir -p "$FLEET_HOME/logs"
+
+TARGET_PID="${1:-}"
+TARGET_CWD="${2:-}"
+FOCUS_RAW="${3:-}"
+LOG="$FLEET_HOME/logs/compact.log"
+PY=/usr/bin/python3
+PCT_HELPER="$FLEET_HOME/bin/fleet-context-pct"
+[ -x "$PCT_HELPER" ] || PCT_HELPER="$SELF_DIR/fleet-context-pct"
+DRYRUN="${CC_COMPACT_DRYRUN:-0}"
+
+BUSY_WAIT_MAX=1800
+BUSY_POLL=5
+INFLIGHT_TTL=600
+BOTLOCK_STALE=2100
+PROOF_WAIT=10
+SETTLE_WAIT=3
+RETURN_TRIES=3
+
+if [ -f "$LOG" ]; then
+  _logsz=$(stat -f %z "$LOG" 2>/dev/null || echo 0)
+  if [ "${_logsz:-0}" -gt 1048576 ] 2>/dev/null; then
+    { tail -c 262144 "$LOG" > "${LOG}.trim" && cat "${LOG}.trim" > "$LOG" && rm -f "${LOG}.trim"; } 2>/dev/null || true
+  fi
+fi
+
+{
+  echo ""
+  echo "=== $(date '+%F %T') compact pid=$TARGET_PID cwd=$TARGET_CWD focus_len=${#FOCUS_RAW} dryrun=$DRYRUN ==="
+
+  if [ -z "$TARGET_PID" ] || [ -z "$TARGET_CWD" ]; then
+    echo "ERROR missing args (need: pid, cwd, [focus])"
+    exit 1
+  fi
+
+  KEY="$("$FC_BIN" bot-by-workdir "$TARGET_CWD" key 2>/dev/null || true)"
+  if [ -z "$KEY" ]; then
+    echo "REFUSE unknown workdir: $TARGET_CWD"
+    exit 2
+  fi
+  STATE_DIR="$("$FC_BIN" bot "$KEY" state_dir)"
+  BOT="$("$FC_BIN" bot "$KEY" name)"
+  [ -n "$BOT" ] || BOT="$KEY"
+  PROJ="$("$FC_BIN" project-dir "$KEY")"
+
+  FOCUS=""
+  if [ -n "$FOCUS_RAW" ]; then
+    FOCUS=$(FOCUS_IN="$FOCUS_RAW" "$PY" -c '
+import os, sys, unicodedata
+s = os.environ.get("FOCUS_IN", "")
+s = "".join(" " if ch in "\r\n\t" else ch
+            for ch in s
+            if ch in "\r\n\t" or unicodedata.category(ch)[0] != "C")
+s = " ".join(s.split())[:300]
+sys.stdout.write(s)
+' 2>/dev/null)
+    echo "focus sanitized: ${#FOCUS} chars"
+  fi
+
+  CHAT_ID=$("$PY" -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    lst = d.get("allowFrom")
+    if isinstance(lst, list) and lst and isinstance(lst[0], str):
+        print(lst[0])
+except Exception:
+    pass
+' "$STATE_DIR/access.json" 2>/dev/null | head -1 | tr -dc '0-9-')
+  [ -n "$CHAT_ID" ] || echo "WARN no chat id in $STATE_DIR/access.json - nothing can be sent"
+
+  tg() {
+    local msg="$1" token resp
+    if [ "$DRYRUN" = "1" ]; then
+      echo "DRYRUN would send Telegram status (${#msg} characters)"
+      return 0
+    fi
+    if [ -z "$CHAT_ID" ]; then
+      echo "NOT SENT (no chat id): $msg"
+      return 1
+    fi
+    token=""
+    if [ -f "$STATE_DIR/.env" ]; then
+      token=$(grep -E '^TELEGRAM_BOT_TOKEN=' "$STATE_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]')
+    fi
+    if [ -z "$token" ]; then
+      echo "NOT SENT (no bot token in $STATE_DIR/.env): $msg"
+      return 1
+    fi
+    resp=$(/usr/bin/curl -s -m 8 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+      --data-urlencode "chat_id=${CHAT_ID}" \
+      --data-urlencode "text=${msg}" 2>/dev/null)
+    echo "sent"
+    echo "telegram send attempted"
+    return 0
+  }
+
+  if [ "$DRYRUN" = 1 ] && [ "${TELEBOTS_TEST:-0}" = 1 ]; then
+    [ -n "${CC_COMPACT_FRAME_FILE:-}" ] || { echo "REFUSE test dry run needs a sandbox frame"; exit 2; }
+    case "$CC_COMPACT_FRAME_FILE" in
+      "${TELEBOTS_SANDBOX_ROOT:-/nonexistent}"/*) : ;;
+      *) echo "REFUSE frame fixture outside sandbox"; exit 2 ;;
+    esac
+    cmd=claude; cwd="$TARGET_CWD"; TTY=ttys999
+    echo "TEST dry run: synthetic target identity; no process was probed"
+  else
+  if ! kill -0 "$TARGET_PID" 2>/dev/null; then
+    echo "REFUSE target pid $TARGET_PID not running"
+    tg "Can't compact $BOT: its session isn't running right now."
+    exit 3
+  fi
+  cmd=$(ps -p "$TARGET_PID" -o comm= 2>/dev/null | tr -d '[:space:]')
+  cwd=$(lsof -a -p "$TARGET_PID" -d cwd 2>/dev/null | awk 'NR>1 {print $NF}')
+  TTY=$(ps -p "$TARGET_PID" -o tty= 2>/dev/null | tr -d '[:space:]')
+  echo "target: bot=$BOT pid=$TARGET_PID comm=$cmd cwd=$cwd tty=$TTY"
+  if [[ "$cmd" != *"claude"* ]]; then
+    echo "REFUSE target is not claude (comm=$cmd)"
+    tg "Can't compact $BOT: the process I was pointed at isn't a Claude session, so I left it alone."
+    exit 4
+  fi
+  if [ "$cwd" != "$TARGET_CWD" ]; then
+    echo "REFUSE target cwd '$cwd' != expected '$TARGET_CWD' (protecting sibling worktree)"
+    tg "Can't compact $BOT: the session I was pointed at is running somewhere else, so I left it alone."
+    exit 5
+  fi
+  if [[ ! "$TTY" =~ ^ttys[0-9]+$ ]]; then
+    echo "REFUSE implausible tty '$TTY'"
+    tg "Can't compact $BOT: I couldn't find the terminal its session is running in."
+    exit 6
+  fi
+  fi
+  DEVTTY="/dev/$TTY"
+
+  PCT=""
+  SID=$(cat "$STATE_DIR/session.id" 2>/dev/null | tr -dc 'A-Za-z0-9._-' | head -c 100)
+  TRANSCRIPT=""
+  if [ -n "$SID" ] && [ -f "$PROJ/$SID.jsonl" ]; then
+    TRANSCRIPT="$PROJ/$SID.jsonl"
+  fi
+  if [ -n "$TRANSCRIPT" ] && [ -x "$PCT_HELPER" ]; then
+    PCT=$("$PY" "$PCT_HELPER" "$TRANSCRIPT" "$STATE_DIR/model-state" 2>/dev/null | head -1 | tr -dc '0-9')
+  fi
+  echo "session=$SID transcript=${TRANSCRIPT:-none} pct=${PCT:-unknown}"
+
+  frame_probe() {
+    SCREEN_TTY="$DEVTTY" PROBE_TEXT="${TEXT:-}" "$PY" - <<'PY' 2>/dev/null
+import os, subprocess, sys
+
+import re as _re
+
+RULE0 = _re.compile(r"^─{10,}\s*$")      # ────── , anchored at COLUMN 0
+PROMPT = "❯"                             # ❯
+FOOTER = "⏵⏵"                       # ⏵⏵ , the permission-mode footer under the box
+NUMBERED = _re.compile(r"^❯\s*\d+\.")    # ❯ 1.  - a highlighted numbered option
+
+PICKER_FOOTERS = (
+    "Esc to cancel",
+    "Enter to select",
+    "Enter to confirm",
+    "↑/↓ to navigate",             # ↑/↓ to navigate
+    "Enter to set as default",
+)
+
+PICKER_BORDERS = (
+    "▔▔▔",                    # ▔▔▔ , a picker's top border
+    "No, exit",
+    "Yes, proceed",
+    "Yes, I trust this folder",
+)
+
+PLACEHOLDERS = (
+    "Press up to edit queued messages, Enter to send them immediately:",
+    "Press up to select a queued message to edit, or Enter to send them now",
+    "Press up to select a queued message, then Enter to edit it",
+    "Press up to edit queued messages",
+    "? for shortcuts",
+)
+
+BLOCK_GLYPHS = "⎿⏺✻✽✳✶※!"
+
+NOT_ENOUGH = "Not enough messages to compact."
+COMPACTING = ("Compacting conversation", "Compacted (ctrl+o")
+
+TAIL_LINES = 15       # how far up a picker's highlighted row is still quoted back
+PICKER_TAIL_INK = 2   # a picker OWNS the bottom of the frame: its footer or border sits on the
+FOOTER_GAP = 3        # how far above the footer the box's closing rule may sit
+BOX_MAX_ROWS = 16     # how many wrapped rows a normal box holds
+BOX_SCAN_ROWS = 60    # how far up the opening rule is still looked for, so a box wrapped over
+OVER_QUOTE = 60
+
+
+def _last_ink(lines):
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip():
+            return i
+    return -1
+
+
+def _ink_tail(lines, n):
+    """The indices of the last n non-blank lines, oldest first."""
+    out = []
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip():
+            out.append(i)
+            if len(out) >= n:
+                break
+    out.reverse()
+    return out
+
+
+def _tail_box(lines):
+    """The box as it looks with NO ⏵⏵ footer drawn under it: a closing rule sitting at the very
+    tail of the frame, an opening rule above it, and a ❯ row between them.
+
+    Without this every footerless frame had no box at all, and no box meant PICKER - so a bot
+    whose footer had simply not been drawn yet was refused with the wrong reason.
+    """
+    close = _last_ink(lines)
+    if close < 1 or not RULE0.match(lines[close]):
+        return None
+    for i in range(close - 1, max(-1, close - 1 - BOX_SCAN_ROWS), -1):
+        if RULE0.match(lines[i]):
+            if any(lines[j].strip().startswith(PROMPT) for j in range(i + 1, close)):
+                return i, close
+            return None
+    return None
+
+
+def find_box(lines):
+    """(opening rule, closing rule) of the LIVE input box, or None.
+
+    Anchored to the tail: the last footer line, the rule directly above it, and the rule
+    above that. Both rules must start at column 0. Claude Code indents everything it echoes,
+    so a saved frame printed into the conversation can never satisfy this - which is the
+    whole point, because a printed frame is exactly what used to fool the old search.
+
+    With no footer to anchor to, _tail_box takes over and reads the rule / ❯ / rule triple at
+    the very tail of the frame instead.
+    """
+    foot = None
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].lstrip().startswith(FOOTER):
+            foot = i
+            break
+    if foot is None:
+        return _tail_box(lines)
+    close = None
+    for i in range(foot - 1, max(-1, foot - 1 - FOOTER_GAP), -1):
+        if RULE0.match(lines[i]):
+            close = i
+            break
+    if close is None:
+        return _tail_box(lines)
+    for i in range(close - 1, max(-1, close - 1 - BOX_SCAN_ROWS), -1):
+        if RULE0.match(lines[i]):
+            return i, close
+    return _tail_box(lines)
+
+
+def picker_visible(lines, box):
+    """The picker footer or border sitting at the BOTTOM of the frame, or ''.
+
+    A picker owns the bottom: it draws over where the input box would be and hangs its own
+    footer under it. So a signature only counts on the last ink line or the one above it, and
+    only when find_box found no box at all. The old whole-frame-tail search made a liar of the
+    engine twice over - it refused an idle bot that had merely PRINTED "Esc to cancel", and it
+    refused a mid-turn bot whose screen carried those words instead of waiting for it.
+    """
+    if box is not None:
+        return ""
+    tail = _ink_tail(lines, PICKER_TAIL_INK)
+    if not tail:
+        return ""
+    foot = ""
+    for i in tail:
+        s = lines[i].strip()
+        if any(sign in s for sign in PICKER_FOOTERS):
+            foot = s[:80]
+            break
+    if foot:
+        last = _last_ink(lines)
+        for i in range(last, max(-1, last - TAIL_LINES), -1):
+            if NUMBERED.match(lines[i].strip()):
+                return lines[i].strip()[:80]
+        return foot
+    for i in tail:
+        s = lines[i].strip()
+        if any(sign in s for sign in PICKER_BORDERS):
+            return s[:80]
+    return ""
+
+
+def box_text(lines, box):
+    """What is really typed in the box: every row between the rules, wraps joined, whitespace
+    collapsed, the prompt glyph dropped, and Claude Code's own placeholders read as empty."""
+    opn, close = box
+    parts = []
+    for i in range(opn + 1, close):
+        s = lines[i].strip()
+        if not s:
+            continue
+        if s.startswith(PROMPT):
+            s = s[len(PROMPT):].strip()
+            if not s:
+                continue
+        parts.append(s)
+    text = " ".join(" ".join(parts).split())
+    if not text:
+        return ""
+    for ph in PLACEHOLDERS:
+        if text.startswith(ph):
+            return ""
+    return text
+
+
+def answer_under_echo(lines, text, needles):
+    """True when the newest line carrying one of `needles` is hung under the echo of `text`.
+
+    Anchored to the echo, not counted: the frame scrolls, so a count of a line can stay flat
+    while a fresh one arrives, and a marker left over from an earlier command can sit there
+    for ages. Claude Code echoes a submitted command as a ❯ line (its wrap continuations
+    carry no indent) and hangs the answer under it, so the test is whether the echo directly
+    above the newest answer is the command this engine delivered.
+    """
+    if not text:
+        return False
+    want = "".join(text.split())
+    last = -1
+    for i in range(len(lines) - 1, -1, -1):
+        if any(nd in lines[i] for nd in needles):
+            last = i
+            break
+    if last <= 0:
+        return False
+    parts = []
+    for i in range(last - 1, max(-1, last - 1 - 12), -1):
+        s = lines[i].strip()
+        if s.startswith(PROMPT):
+            parts.insert(0, s[len(PROMPT):].strip())
+            return "".join("".join(parts).split()) == want
+        if not s:
+            continue                      # Claude Code leaves a blank row under a wrapped echo
+        if s[0] in BLOCK_GLYPHS or len(parts) >= 10:
+            return False                  # this answer belongs to some other block
+        parts.insert(0, s)
+    return False
+
+
+def echo_present(lines, text, box):
+    """True when the echo of `text` is on the frame: a ❯ row, its wrap continuations included,
+    that reads back as exactly what was delivered.
+
+    Claude Code echoes a command the moment it TAKES it, whether it runs it now or queues it
+    behind the turn it is already in. So this echo, on a frame that is still BUSY, with no
+    answer hung under it, is what a QUEUED /compact looks like - and calling that "nothing
+    changed" is a lie this engine has already told once, forty seconds before Claude Code ran
+    the queued command anyway. The box's own interior is excluded: text still sitting unsent
+    in the box was never taken, so it is not an echo.
+    """
+    if not text:
+        return False
+    want = "".join(text.split())
+    inner = set(range(box[0], box[1] + 1)) if box else set()
+    for i in range(len(lines) - 1, -1, -1):
+        if i in inner:
+            continue
+        s = lines[i].strip()
+        if not s.startswith(PROMPT):
+            continue
+        parts = [s[len(PROMPT):].strip()]
+        if "".join("".join(parts).split()) == want:
+            return True
+        for j in range(i + 1, min(len(lines), i + 1 + 12)):
+            if j in inner:
+                break
+            t = lines[j].strip()
+            if not t or t.startswith(PROMPT) or t[0] in BLOCK_GLYPHS:
+                break
+            parts.append(t)
+            if "".join("".join(parts).split()) == want:
+                return True
+    return False
+
+
+def classify(screen):
+    if not screen or not screen.strip():
+        return "UNREADABLE"
+    lines = screen.splitlines()
+    box = find_box(lines)
+    if box is not None:
+        footer = [ln for ln in lines[box[1] + 1:] if ln.strip()][:3]
+        if any("esc to interrupt" in ln for ln in footer):
+            return "BUSY"
+        typed = box_text(lines, box)
+        if box[1] - box[0] - 1 > BOX_MAX_ROWS:
+            if typed:
+                return "TYPING:" + typed[:OVER_QUOTE]
+            return "UNREADABLE"
+        if typed:
+            return "TYPING:" + typed[:400]
+        return "IDLE"
+    if picker_visible(lines, None):
+        return "PICKER"
+    return "UNREADABLE"
+
+OSA = '''on run argv
+  set targetTty to item 1 of argv
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with tb in tabs of w
+        try
+          if tty of tb is targetTty then return history of tb
+        end try
+      end repeat
+    end repeat
+  end tell
+  return ""
+end run'''
+
+try:
+    if os.environ.get("TELEBOTS_TEST") == "1" and os.environ.get("CC_COMPACT_FRAME_FILE"):
+        screen = open(os.environ["CC_COMPACT_FRAME_FILE"], encoding="utf-8").read()
+    else:
+        run = subprocess.run(
+            ["/usr/bin/osascript", "-", os.environ["SCREEN_TTY"]],
+            input=OSA, capture_output=True, text=True, timeout=8,
+        )
+        screen = run.stdout
+except Exception:
+    print("UNREADABLE")
+    print(0)
+    print(0)
+    print(0)
+    print(0)
+    sys.exit(0)
+
+print(classify(screen))
+print(1 if any(m in screen for m in COMPACTING) else 0)
+_lines = screen.splitlines()
+_text = os.environ.get("PROBE_TEXT", "")
+print(1 if answer_under_echo(_lines, _text, (NOT_ENOUGH,)) else 0)
+print(1 if answer_under_echo(_lines, _text, COMPACTING) else 0)
+print(1 if echo_present(_lines, _text, find_box(_lines)) else 0)
+PY
+  }
+
+  screen_state() { frame_probe | /usr/bin/sed -n '1p'; }
+  frame_marker() { frame_probe | /usr/bin/sed -n '2p'; }
+  frame_notenough() { frame_probe | /usr/bin/sed -n '3p'; }
+
+  if [ "$DRYRUN" = "1" ]; then
+    STATE_NOW=$(screen_state)
+    TEXT_PREVIEW="/compact"
+    [ -n "$FOCUS" ] && TEXT_PREVIEW="/compact $FOCUS"
+    echo "DRYRUN screen state on $DEVTTY: ${STATE_NOW:-UNREADABLE}"
+    echo "DRYRUN would take the per-bot lock /tmp/telebots-compact-${KEY}.lock"
+    case "${STATE_NOW:-UNREADABLE}" in
+      BUSY|IDLE)
+        echo "DRYRUN would ack in chat $CHAT_ID with context ${PCT:-?}% and focus length ${#FOCUS}"
+        echo "DRYRUN would write the in-flight marker $STATE_DIR/compact-inflight"
+        ;;
+    esac
+    case "${STATE_NOW:-UNREADABLE}" in
+      BUSY)       echo "DRYRUN would then say '$BOT is mid-task. I'll compact the moment this turn ends.' and poll every ${BUSY_POLL}s for up to $((BUSY_WAIT_MAX / 60)) minutes" ;;
+      IDLE)
+        echo "DRYRUN would then re-check the pid, its comm, its cwd and its tty, and stand down if a compaction ran by itself while it waited"
+        echo "DRYRUN would then deliver, path A: Terminal 'do script' into the tab on $DEVTTY, with the ${#TEXT_PREVIEW}-character command travelling as item 2 of argv"
+        echo "DRYRUN would then re-read the frame about a second later, and if Claude Code's paste handling left that text sitting in the box it would send lone Returns by pty write (no keystrokes, no focus change), ONE AT A TIME with a fresh look at the frame between them and at most ${RETURN_TRIES} of them - Claude Code 2.1.280 swallows the first CR-burst after a paste and takes the second"
+        ;;
+      PICKER)     echo "DRYRUN would REFUSE before acking (exit 9), one message only: Can't compact $BOT: a picker is open in its terminal." ;;
+      TYPING:*)   echo "DRYRUN would REFUSE before acking (exit 11), one message only: Can't compact $BOT: there's unsent text typed in its terminal, and compacting would send it. Clear that line and try again." ;;
+      *)          echo "DRYRUN would REFUSE before acking (exit 12), one message only: Can't compact $BOT: couldn't read its terminal window." ;;
+    esac
+    echo "DRYRUN nothing was typed, nothing was sent, no file was written"
+    echo "=== dryrun done ==="
+    exit 0
+  fi
+
+  BOTLOCK="/tmp/telebots-compact-${KEY}.lock"
+  if ! mkdir "$BOTLOCK" 2>/dev/null; then
+    lockage=$(( $(date +%s) - $(stat -f %m "$BOTLOCK" 2>/dev/null || echo 0) ))
+    if [ "$lockage" -ge "$BOTLOCK_STALE" ]; then
+      echo "stale per-bot lock (${lockage}s) - taking over"
+      rmdir "$BOTLOCK" 2>/dev/null || true
+      if ! mkdir "$BOTLOCK" 2>/dev/null; then
+        echo "REFUSE per-bot lock still held after stale takeover"
+        tg "A /compact for $BOT is already running. Give it a moment."
+        exit 13
+      fi
+    else
+      echo "REFUSE per-bot lock held (${lockage}s old)"
+      tg "A /compact for $BOT is already running. Give it a moment."
+      exit 13
+    fi
+  fi
+  trap 'rmdir "$BOTLOCK" 2>/dev/null || true' EXIT
+
+  INFLIGHT="$STATE_DIR/compact-inflight"
+  if [ -f "$INFLIGHT" ]; then
+    started=$(cat "$INFLIGHT" 2>/dev/null | tr -dc '0-9' | head -c 20)
+    [ -n "$started" ] || started=0
+    age=$(( $(date +%s) - started ))
+    if [ "$age" -ge 0 ] && [ "$age" -lt "$INFLIGHT_TTL" ]; then
+      echo "REFUSE in-flight marker is ${age}s old (<${INFLIGHT_TTL}s)"
+      tg "A compaction is already in flight for $BOT."
+      exit 7
+    fi
+    echo "in-flight marker is stale (${age}s) - clearing it"
+    rm -f "$INFLIGHT" 2>/dev/null || true
+  fi
+
+  STARTED_FLAG="$STATE_DIR/compact-started"
+
+  STARTED_BEFORE=0
+  [ -f "$STARTED_FLAG" ] && STARTED_BEFORE=$(stat -f %m "$STARTED_FLAG" 2>/dev/null || echo 0)
+  echo "compact-started watermark before the wait: $STARTED_BEFORE"
+
+  FIRST_LOOK="$(screen_state)"
+  echo "first look at $DEVTTY: ${FIRST_LOOK:-UNREADABLE}"
+  case "$FIRST_LOOK" in
+    IDLE|BUSY) ;;
+    PICKER)
+      echo "REFUSE (pre-ack) picker or modal open on $DEVTTY"
+      tg "Can't compact $BOT: a picker is open in its terminal."
+      exit 9
+      ;;
+    TYPING:*)
+      echo "REFUSE (pre-ack) unsent typed text in the input box: ${FIRST_LOOK#TYPING:}"
+      tg "Can't compact $BOT: there's unsent text typed in its terminal, and compacting would send it. Clear that line and try again."
+      exit 11
+      ;;
+    *)
+      echo "REFUSE (pre-ack) screen unreadable on $DEVTTY (got '${FIRST_LOOK:-}')"
+      tg "Can't compact $BOT: couldn't read its terminal window."
+      exit 12
+      ;;
+  esac
+
+  if [ -n "$PCT" ]; then
+    if [ -n "$FOCUS" ]; then
+      tg "Compacting $BOT now (context ${PCT}%), focus: ${FOCUS}. I'll ping when it's done."
+    else
+      tg "Compacting $BOT now (context ${PCT}%). I'll ping when it's done."
+    fi
+  else
+    if [ -n "$FOCUS" ]; then
+      tg "Compacting $BOT now, focus: ${FOCUS}. I'll ping when it's done."
+    else
+      tg "Compacting $BOT now. I'll ping when it's done."
+    fi
+  fi
+
+  waited=0
+  told_busy=0
+  while : ; do
+    SCREEN="$(screen_state)"
+    case "$SCREEN" in
+      IDLE)
+        echo "screen IDLE after ${waited}s - delivering"
+        break
+        ;;
+      BUSY)
+        if [ "$told_busy" = "0" ]; then
+          echo "screen BUSY - notifying once, then polling every ${BUSY_POLL}s"
+          tg "$BOT is mid-task. I'll compact the moment this turn ends."
+          told_busy=1
+        fi
+        if [ "$waited" -ge "$BUSY_WAIT_MAX" ]; then
+          echo "GIVE UP: still busy after ${waited}s"
+          tg "Gave up waiting to compact $BOT: it has been mid-task for $((BUSY_WAIT_MAX / 60)) minutes. Nothing changed. Send /compact again when it's free."
+          rm -f "$INFLIGHT" 2>/dev/null || true
+          exit 8
+        fi
+        sleep "$BUSY_POLL"
+        waited=$((waited + BUSY_POLL))
+        ;;
+      PICKER)
+        echo "REFUSE picker or modal open on $DEVTTY"
+        tg "Can't compact $BOT: a picker is open in its terminal."
+        exit 9
+        ;;
+      TYPING:*)
+        echo "REFUSE unsent typed text in the input box: ${SCREEN#TYPING:}"
+        tg "Can't compact $BOT: there's unsent text typed in its terminal, and compacting would send it. Clear that line and try again."
+        exit 11
+        ;;
+      *)
+        echo "REFUSE screen unreadable on $DEVTTY (got '${SCREEN:-}')"
+        tg "Can't compact $BOT: couldn't read its terminal window."
+        exit 12
+        ;;
+    esac
+  done
+
+  STARTED_NOW=0
+  [ -f "$STARTED_FLAG" ] && STARTED_NOW=$(stat -f %m "$STARTED_FLAG" 2>/dev/null || echo 0)
+  if [ "${STARTED_NOW:-0}" -gt "${STARTED_BEFORE:-0}" ]; then
+    echo "STAND DOWN: compact-started moved from $STARTED_BEFORE to $STARTED_NOW during the ${waited}s wait - the bot compacted itself"
+    tg "A compaction just ran on $BOT by itself, so I'm standing down."
+    rm -f "$INFLIGHT" 2>/dev/null || true
+    exit 0
+  fi
+
+  revalidate_failed=""
+  if ! kill -0 "$TARGET_PID" 2>/dev/null; then
+    revalidate_failed="pid $TARGET_PID is gone"
+  else
+    cmd2=$(ps -p "$TARGET_PID" -o comm= 2>/dev/null | tr -d '[:space:]')
+    cwd2=$(lsof -a -p "$TARGET_PID" -d cwd 2>/dev/null | awk 'NR>1 {print $NF}')
+    tty2=$(ps -p "$TARGET_PID" -o tty= 2>/dev/null | tr -d '[:space:]')
+    if [[ "$cmd2" != *"claude"* ]]; then
+      revalidate_failed="pid $TARGET_PID is no longer a claude (comm=$cmd2)"
+    elif [ "$cwd2" != "$TARGET_CWD" ]; then
+      revalidate_failed="its cwd is now '$cwd2', not '$TARGET_CWD'"
+    elif [[ ! "$tty2" =~ ^ttys[0-9]+$ ]]; then
+      revalidate_failed="its tty is now implausible ('$tty2')"
+    elif [ "$tty2" != "$TTY" ]; then
+      echo "re-validate: tty moved from $TTY to $tty2 during the wait - re-resolving"
+      TTY="$tty2"
+      DEVTTY="/dev/$tty2"
+    fi
+  fi
+  if [ -n "$revalidate_failed" ]; then
+    echo "REFUSE re-validation failed after a ${waited}s wait: $revalidate_failed"
+    tg "Can't compact $BOT: its session changed while I was waiting for it to be free, so I didn't type anything. Send /compact again."
+    rm -f "$INFLIGHT" 2>/dev/null || true
+    exit 15
+  fi
+  echo "re-validated after ${waited}s: pid=$TARGET_PID tty=$TTY cwd=$TARGET_CWD"
+
+  RECHECK="$(screen_state)"
+  if [ "$RECHECK" != "IDLE" ]; then
+    echo "REFUSE the screen stopped being IDLE between the wait and delivery (got '${RECHECK:-}')"
+    case "$RECHECK" in
+      PICKER)   tg "Can't compact $BOT: a picker opened in its terminal just before I typed. Nothing changed." ; rm -f "$INFLIGHT" 2>/dev/null || true; exit 9 ;;
+      TYPING:*) tg "Can't compact $BOT: text appeared in its terminal just before I typed, and compacting would send it. Nothing changed." ; rm -f "$INFLIGHT" 2>/dev/null || true; exit 11 ;;
+      BUSY)     tg "Can't compact $BOT: it picked up new work just before I typed. Nothing changed. Send /compact again when it's free." ; rm -f "$INFLIGHT" 2>/dev/null || true; exit 8 ;;
+      *)        tg "Can't compact $BOT: couldn't read its terminal window. Nothing changed." ; rm -f "$INFLIGHT" 2>/dev/null || true; exit 12 ;;
+    esac
+  fi
+
+  TEXT="/compact"
+  [ -n "$FOCUS" ] && TEXT="/compact $FOCUS"
+  echo "text to deliver: ${#TEXT} characters"
+
+  MARKER_BEFORE=$(frame_probe | /usr/bin/sed -n '2p')
+  [ -n "$MARKER_BEFORE" ] || MARKER_BEFORE=0
+  if [ "$MARKER_BEFORE" = "1" ]; then
+    echo "NOTE the compaction marker is already on this screen before delivery - the screen half of the landing proof is disabled for this run, leaving compact-started as the only proof"
+  fi
+  echo "pre-delivery: marker=$MARKER_BEFORE"
+
+  DELIVER_AT=$(date +%s)
+  echo "$DELIVER_AT" > "$INFLIGHT" 2>/dev/null || true
+
+  box_is_ours() {
+    BOX_IN="$1" TEXT_IN="$TEXT" "$PY" -c '
+import os, sys
+box = os.environ.get("BOX_IN", "")
+txt = os.environ.get("TEXT_IN", "")
+squash = lambda s: "".join(s.split())
+b, t = squash(box), squash(txt)
+sys.exit(0 if b and b == t else 1)
+' 2>/dev/null
+  }
+
+  delivery_verdict() {
+    local probe state marker nec cmp echoed m
+    probe=$(frame_probe)
+    state=$(printf '%s' "$probe" | /usr/bin/sed -n '1p')
+    marker=$(printf '%s' "$probe" | /usr/bin/sed -n '2p')
+    nec=$(printf '%s' "$probe" | /usr/bin/sed -n '3p')
+    cmp=$(printf '%s' "$probe" | /usr/bin/sed -n '4p')
+    echoed=$(printf '%s' "$probe" | /usr/bin/sed -n '5p')
+    if [ -f "$STARTED_FLAG" ]; then
+      m=$(stat -f %m "$STARTED_FLAG" 2>/dev/null || echo 0)
+      if [ "${m:-0}" -ge "$((DELIVER_AT - 1))" ]; then
+        echo "LANDED"
+        return 0
+      fi
+    fi
+    if [ "$MARKER_BEFORE" = "0" ] && [ "${marker:-0}" = "1" ]; then
+      echo "LANDED"
+      return 0
+    fi
+    case "$state" in
+      TYPING:*)
+        if box_is_ours "${state#TYPING:}"; then
+          echo "PENDING"
+          return 0
+        fi
+        ;;
+    esac
+    if [ "${cmp:-0}" = "1" ]; then
+      echo "LANDED"
+      return 0
+    fi
+    if [ "${nec:-0}" = "1" ]; then
+      echo "NOTENOUGH"
+      return 0
+    fi
+    case "$state" in
+      TYPING:*)  echo "OTHER:the box holds something this engine did not put there: ${state#TYPING:}" ;;
+      IDLE)      echo "EMPTY" ;;
+      BUSY)
+        if [ "${echoed:-0}" = "1" ]; then
+          echo "QUEUED"
+        else
+          echo "OTHER:the bot is mid-turn"
+        fi
+        ;;
+      PICKER)    echo "OTHER:a picker or modal is on its screen" ;;
+      *)         echo "OTHER:its screen could not be read" ;;
+    esac
+    return 0
+  }
+
+  settle() {
+    local deadline v last
+    deadline=$(( $(date +%s) + $1 ))
+    last="OTHER:nothing was observed"
+    while : ; do
+      v=$(delivery_verdict)
+      case "$v" in
+        LANDED|NOTENOUGH|PENDING) echo "$v"; return 0 ;;
+      esac
+      last="$v"
+      [ "$(date +%s)" -ge "$deadline" ] && break
+      sleep 1
+    done
+    echo "$last"
+    return 0
+  }
+
+  lone_return() {
+    /usr/bin/osascript - "$DEVTTY" <<'OSA' 2>&1
+on run argv
+  set targetTty to item 1 of argv
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with tb in tabs of w
+        try
+          if tty of tb is targetTty then
+            do script "" in tb
+            return "OK"
+          end if
+        end try
+      end repeat
+    end repeat
+  end tell
+  return "NOWINDOW"
+end run
+OSA
+  }
+
+  submit_pending() {
+    local ret
+    RETURNS_SENT=0
+    RETURN_OSA_FAIL=0
+    SUBMIT_VERDICT="PENDING"
+    while [ "$RETURNS_SENT" -lt "$RETURN_TRIES" ]; do
+      ret=$(lone_return)
+      RETURNS_SENT=$((RETURNS_SENT + 1))
+      echo "$(date '+%F %T') lone Return #${RETURNS_SENT} of at most ${RETURN_TRIES} result: ${ret:-OSAERROR}"
+      if [ "${ret:-}" != "OK" ]; then
+        RETURN_OSA_FAIL=1
+        return 0
+      fi
+      sleep 1
+      SUBMIT_VERDICT=$(settle "$PROOF_WAIT")
+      echo "verdict after lone Return #${RETURNS_SENT}: $SUBMIT_VERDICT"
+      [ "$SUBMIT_VERDICT" = "PENDING" ] || return 0
+    done
+    return 0
+  }
+
+  clear_box() {
+    /usr/bin/osascript - "$DEVTTY" <<'OSA' >/dev/null 2>&1
+on run argv
+  set targetTty to item 1 of argv
+  set killer to ""
+  repeat 16 times
+    set killer to killer & (ASCII character 21)
+  end repeat
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with tb in tabs of w
+        try
+          if tty of tb is targetTty then
+            do script killer in tb
+            return "OK"
+          end if
+        end try
+      end repeat
+    end repeat
+  end tell
+  return "NOWINDOW"
+end run
+OSA
+    sleep 1
+    case "$(screen_state)" in
+      IDLE) return 0 ;;
+      *)    return 1 ;;
+    esac
+  }
+
+  report_failure() {
+    local reason="$1" state tail
+    state="$(screen_state)"
+    case "$state" in
+      TYPING:*)
+        if box_is_ours "${state#TYPING:}"; then
+          if clear_box; then
+            tail="I cleared the line it left in ${BOT}'s input box."
+          else
+            tail="There is still text in the box that I couldn't clear - worth a look at ${BOT}'s terminal."
+          fi
+        else
+          tail="There is text in ${BOT}'s input box that I didn't put there, so I left it alone."
+        fi
+        ;;
+      *)
+        tail="Nothing changed."
+        ;;
+    esac
+    echo "FAILED: $reason ($tail)"
+    tg "The /compact for $BOT didn't land: ${reason} ${tail}"
+    rm -f "$INFLIGHT" 2>/dev/null || true
+  }
+
+  say_queued() {
+    echo "=== done (the /compact is queued behind the turn $BOT was already in) ==="
+    tg "$BOT was mid-task when the command went in, so it's queued behind that work and will compact when it finishes. I'll ping when it's done."
+    exit 16
+  }
+
+  say_not_enough() {
+    echo "=== done (Claude Code answered: Not enough messages to compact) ==="
+    tg "Nothing to compact yet on $BOT - the conversation is too short."
+    rm -f "$INFLIGHT" 2>/dev/null || true
+    exit 14
+  }
+
+  RESULT_A=$(/usr/bin/osascript - "$DEVTTY" "$TEXT" <<'OSA' 2>&1
+on run argv
+  set targetTty to item 1 of argv
+  set theText to item 2 of argv
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with tb in tabs of w
+        try
+          if tty of tb is targetTty then
+            do script theText in tb
+            return "OK"
+          end if
+        end try
+      end repeat
+    end repeat
+  end tell
+  return "NOWINDOW"
+end run
+OSA
+)
+  echo "$(date '+%F %T') path A (do script) result: ${RESULT_A:-OSAERROR}"
+
+  if [ "${RESULT_A:-}" = "OK" ]; then
+    sleep 1
+    VERDICT=$(settle "$SETTLE_WAIT")
+    echo "verdict after path A: $VERDICT"
+    case "$VERDICT" in
+      LANDED)
+        echo "=== done (path A delivered a ${#TEXT}-character /compact to $DEVTTY) ==="
+        exit 0
+        ;;
+      NOTENOUGH)
+        say_not_enough
+        ;;
+      PENDING)
+        echo "path A's text is sitting in the box unsent (Claude Code read it as a paste) - sending lone Returns by pty write, one at a time, until it takes them"
+        submit_pending
+        if [ "$RETURN_OSA_FAIL" = "1" ]; then
+          report_failure "the text went in but the Return that submits it couldn't be delivered."
+          exit 10
+        fi
+        VERDICT="$SUBMIT_VERDICT"
+        case "$VERDICT" in
+          LANDED)
+            echo "=== done (path A plus ${RETURNS_SENT} lone Return(s) delivered a ${#TEXT}-character /compact to $DEVTTY) ==="
+            exit 0
+            ;;
+          NOTENOUGH) say_not_enough ;;
+          QUEUED)    say_queued ;;
+          PENDING)
+            report_failure "the text went in and ${RETURNS_SENT} Returns went in, but Claude Code never took it."
+            exit 10
+            ;;
+          *)
+            report_failure "the text went in but Claude Code never started compacting."
+            exit 10
+            ;;
+        esac
+        ;;
+      *)
+        VERDICT=$(settle "$PROOF_WAIT")
+        echo "verdict after the proof wait: $VERDICT"
+        case "$VERDICT" in
+          LANDED)
+            echo "=== done (path A delivered a ${#TEXT}-character /compact to $DEVTTY) ==="
+            exit 0
+            ;;
+          NOTENOUGH) say_not_enough ;;
+          QUEUED)    say_queued ;;
+          PENDING)
+            echo "the text turned up in the box late - sending lone Returns by pty write, one at a time, until it takes them"
+            submit_pending
+            VERDICT="$SUBMIT_VERDICT"
+            echo "verdict after the late lone Returns: $VERDICT"
+            case "$VERDICT" in
+              LANDED)    echo "=== done (path A plus ${RETURNS_SENT} lone Return(s) delivered a ${#TEXT}-character /compact to $DEVTTY) ==="; exit 0 ;;
+              NOTENOUGH) say_not_enough ;;
+              QUEUED)    say_queued ;;
+              *)         report_failure "the text went in but Claude Code never started compacting."; exit 10 ;;
+            esac
+            ;;
+          *)
+            report_failure "the text went in but Claude Code never started compacting."
+            exit 10
+            ;;
+        esac
+        ;;
+    esac
+  fi
+
+  echo "path A did not run (${RESULT_A:-OSAERROR}) - nothing was typed, falling back to path B (keystrokes)"
+
+  PRE_B="$(screen_state)"
+  echo "frame before path B: ${PRE_B:-UNREADABLE}"
+  if [ "$PRE_B" != "IDLE" ]; then
+    echo "REFUSE path B: the input box is not empty (got '${PRE_B:-}')"
+    tg "The /compact for $BOT didn't land: its terminal wouldn't take the text and the fallback wasn't safe to use. Nothing changed."
+    rm -f "$INFLIGHT" 2>/dev/null || true
+    exit 10
+  fi
+
+  GLOCK="/tmp/fleet-esc-global.lock"
+  gwaited=0
+  while ! mkdir "$GLOCK" 2>/dev/null; do
+    glockage=$(( $(date +%s) - $(stat -f %m "$GLOCK" 2>/dev/null || echo 0) ))
+    if [ "$glockage" -ge 10 ]; then
+      echo "stale global keystroke lock (${glockage}s) - taking over"
+      rmdir "$GLOCK" 2>/dev/null || true
+      continue
+    fi
+    if [ "$gwaited" -ge 8 ]; then
+      echo "REFUSE global keystroke lock busy ${gwaited}s"
+      tg "The /compact for $BOT didn't land: another keystroke was mid-flight and the fallback couldn't run. Nothing changed."
+      rm -f "$INFLIGHT" 2>/dev/null || true
+      exit 10
+    fi
+    sleep 1; gwaited=$((gwaited + 1))
+  done
+
+  FRONT=$(/usr/bin/osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true' 2>/dev/null)
+  echo "frontmost before path B: ${FRONT:-unknown}"
+
+  RESULT_B=$(/usr/bin/osascript - "$DEVTTY" "$TEXT" <<'OSA' 2>&1
+on run argv
+  set targetTty to item 1 of argv
+  set theText to item 2 of argv
+  set found to false
+  tell application "Terminal"
+    activate
+    repeat with w in windows
+      repeat with tb in tabs of w
+        try
+          if tty of tb is targetTty then
+            set frontmost of w to true
+            set selected tab of w to tb
+            set found to true
+          end if
+        end try
+      end repeat
+    end repeat
+  end tell
+  if not found then return "NOWINDOW"
+  delay 0.35
+  tell application "System Events"
+    set frontApp to name of first application process whose frontmost is true
+  end tell
+  if frontApp is not "Terminal" then return "NOTFRONT:" & frontApp
+  set seltty to ""
+  tell application "Terminal"
+    try
+      set seltty to tty of selected tab of front window
+    end try
+  end tell
+  if seltty is not targetTty then return "WRONGTAB:" & seltty
+  tell application "System Events"
+    keystroke theText
+    delay 0.15
+    key code 36
+  end tell
+  return "OK"
+end run
+OSA
+)
+  rmdir "$GLOCK" 2>/dev/null || true
+  echo "$(date '+%F %T') path B (keystroke) result: ${RESULT_B:-OSAERROR}"
+
+  if [ -n "${FRONT:-}" ] && [ "$FRONT" != "Terminal" ]; then
+    /usr/bin/osascript -e 'on run argv' -e 'tell application "System Events" to set frontmost of process (item 1 of argv) to true' -e 'end run' -- "$FRONT" 2>/dev/null || true
+    echo "restored focus to: $FRONT"
+  fi
+
+  if [ "${RESULT_B:-}" = "OK" ]; then
+    VERDICT=$(settle "$PROOF_WAIT")
+    echo "verdict after path B: $VERDICT"
+    case "$VERDICT" in
+      LANDED)
+        echo "=== done (path B delivered a ${#TEXT}-character /compact to $DEVTTY) ==="
+        exit 0
+        ;;
+      NOTENOUGH) say_not_enough ;;
+      QUEUED)    say_queued ;;
+      PENDING)
+        echo "path B's text is sitting in the box unsent - sending lone Returns by pty write, one at a time, until it takes them"
+        submit_pending
+        VERDICT="$SUBMIT_VERDICT"
+        echo "verdict after the lone Returns: $VERDICT"
+        case "$VERDICT" in
+          LANDED)    echo "=== done (path B plus ${RETURNS_SENT} lone Return(s) delivered a ${#TEXT}-character /compact to $DEVTTY) ==="; exit 0 ;;
+          NOTENOUGH) say_not_enough ;;
+          QUEUED)    say_queued ;;
+          *)         report_failure "the keystrokes went in but Claude Code never started compacting."; exit 10 ;;
+        esac
+        ;;
+      *)
+        report_failure "the keystrokes went in but Claude Code never started compacting."
+        exit 10
+        ;;
+    esac
+  fi
+
+  case "${RESULT_B:-OSAERROR}" in
+    NOWINDOW)   REASON="no Terminal window is carrying this bot's tty." ;;
+    NOTFRONT:*) REASON="the Mac wouldn't bring the bot's window forward (screen locked?)." ;;
+    WRONGTAB:*) REASON="the wrong tab came forward, so nothing was typed." ;;
+    *)          REASON="window targeting failed (${RESULT_B:-no answer from AppleScript})." ;;
+  esac
+  report_failure "$REASON"
+  exit 10
+} >> "$LOG" 2>&1

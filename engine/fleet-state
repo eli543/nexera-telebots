@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""Read the configured bots' health, activity, context and model.
+
+Usage: fleet-state [--json] | --help
+Exit codes: 0 report printed, 1 invalid argument, 2 config unavailable,
+3 context helper unavailable (report still printed with unknown context).
+CC_FLEETSTATE_DRYRUN=1 prints resolved bot paths without reading state.
+"""
+
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+
+FLEET_HOME = Path(os.environ.get("FLEET_HOME", "~/.claude/telegram-fleet")).expanduser()
+SELF_DIR = Path(__file__).resolve().parent
+FC = FLEET_HOME / "bin" / "fleet-config"
+if not os.access(FC, os.X_OK):
+    FC = SELF_DIR / "fleet-config"
+PCT = FLEET_HOME / "bin" / "fleet-context-pct"
+if not os.access(PCT, os.X_OK):
+    PCT = SELF_DIR / "fleet-context-pct"
+
+
+def fc(*args):
+    try:
+        out = subprocess.run([str(FC), *args], capture_output=True, text=True, timeout=8)
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def first(path):
+    try:
+        return path.read_text(encoding="utf-8").splitlines()[0].strip()
+    except (OSError, IndexError):
+        return ""
+
+
+def epoch_age(value):
+    try:
+        return max(-1, int(time.time()) - int(value))
+    except (TypeError, ValueError):
+        return -1
+
+
+def named_session_live(key, workdir):
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=8)
+        if out.returncode:
+            return False
+        for line in out.stdout.splitlines():
+            match = re.match(r"\s*([1-9][0-9]*)\s+(.*)", line)
+            if not match:
+                continue
+            pid, command = match.groups()
+            if ("--channels plugin:telegram@claude-plugins-official" not in command
+                    or "--name telebots-" + key not in command):
+                continue
+            cwd = subprocess.run(["lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"],
+                                 capture_output=True, text=True, timeout=8)
+            if cwd.returncode == 0 and "n" + workdir in cwd.stdout.splitlines():
+                return True
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return False
+
+
+def busy(path):
+    try:
+        with path.open("rb") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            finally:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return False
+
+
+def model_state(path):
+    values = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key] = value.strip()
+    except OSError:
+        pass
+    return values.get("MODEL", "?"), values.get("EFFORT", "?")
+
+
+def context_percent(project, sid, model_path):
+    if not os.access(PCT, os.X_OK) or not re.fullmatch(r"[0-9a-fA-F-]{36}", sid):
+        return None
+    transcript = project / (sid + ".jsonl")
+    if not transcript.is_file():
+        return None
+    try:
+        out = subprocess.run([str(PCT), str(transcript), str(model_path)],
+                             capture_output=True, text=True, timeout=8)
+        value = out.stdout.strip()
+        return int(value) if out.returncode == 0 and value.isdigit() else None
+    except Exception:
+        return None
+
+
+def age_text(seconds):
+    if seconds < 0:
+        return "-"
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h{seconds % 3600 // 60}m"
+    return f"{seconds // 86400}d{seconds % 86400 // 3600}h"
+
+
+def main(argv):
+    if argv and argv[0] in ("--help", "-h"):
+        print(__doc__.strip())
+        return 0
+    if len(argv) > 1 or (argv and argv[0] != "--json"):
+        print("fleet-state: use --json or --help", file=sys.stderr)
+        return 1
+    keys = fc("bots").splitlines()
+    if not keys and fc("validate") == "":
+        # An empty version 2 fleet is valid. A missing config is reported by
+        # checking its resolved path rather than treating zero bots as an error.
+        path = fc("path")
+        if not path or not Path(path).is_file():
+            return 2
+    rows = []
+    overlay = first(FLEET_HOME / "overlay.status")
+    for key in keys:
+        name = fc("bot", key, "name") or key
+        state = Path(fc("bot", key, "state_dir"))
+        workdir = fc("bot", key, "workdir")
+        project = Path(fc("project-dir", key))
+        if os.environ.get("CC_FLEETSTATE_DRYRUN") == "1":
+            print(f"DRYRUN key={key} state={state} workdir={workdir} project={project}")
+            continue
+        hb_age = epoch_age(first(state / "poller.heartbeat"))
+        if overlay == "OK":
+            up = 0 <= hb_age <= 30
+        else:
+            up = named_session_live(key, workdir)
+        mdl, effort = model_state(state / "model-state")
+        sid = first(state / "session.id")
+        row = {"key": key, "name": name, "state_name": state.name,
+               "state_dir": str(state), "worktree": workdir, "up": up,
+               "busy": busy(state / "stream" / "anim.lock") if up else False,
+               "context_pct": context_percent(project, sid, state / "model-state"),
+               "model": mdl, "effort": effort, "heartbeat_age_s": hb_age,
+               "last_inbound_age_s": epoch_age(first(state / "last-inbound")),
+               "session_id": sid}
+        rows.append(row)
+    if os.environ.get("CC_FLEETSTATE_DRYRUN") == "1":
+        return 0
+    if argv:
+        print(json.dumps(rows, ensure_ascii=False))
+    else:
+        for row in rows:
+            pct = "??" if row["context_pct"] is None else str(row["context_pct"]) + "%"
+            print(f"{row['name']:<12} {'up' if row['up'] else 'down':<4} "
+                  f"{'busy' if row['busy'] else 'idle':<4} {pct:>4}  "
+                  f"{row['model']}/{row['effort']}  last-in {age_text(row['last_inbound_age_s'])}")
+    return 0 if os.access(PCT, os.X_OK) else 3
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

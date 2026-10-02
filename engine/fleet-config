@@ -22,6 +22,7 @@
 #   project-dir <key>                 full path to the bot's Claude Code project dir
 #   path                              the absolute resolved config file path
 #   validate                          exit 0 if the config is well-formed, else 1
+#   --help                            print arguments and exit codes
 #
 # Python 3.9+, standard library only. No secrets are ever read or printed here;
 # tokens live only in each bot's state-dir .env and are never referenced.
@@ -40,8 +41,13 @@ KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 OPTION_DEFAULTS = {
     "watchdog": "true",
     "voice": "auto",
+    "voice_daemon": "false",
     "tldr_judge": "false",
     "grid": "false",
+    "notes_dir": "~/Telebots Notes",
+    "rich_stream": "true",
+    "guardian_thresholds": "60,70,80,90",
+    "email": "false",
     "alert_bot": "",
 }
 
@@ -103,10 +109,10 @@ def get_field(bot, field):
 
 
 def project_dir_for(workdir):
-    # Claude Code names a project dir after its absolute path with every "/"
-    # turned into "-" (e.g. /Users/x/claude-fleet/main -> -Users-x-claude-fleet-main).
-    abs_wd = os.path.expanduser(str(workdir))
-    name = abs_wd.replace("/", "-")
+    # Claude Code replaces path separators and punctuation with a hyphen.
+    # A dot in the user's home directory is not kept in the project basename.
+    abs_wd = os.path.abspath(os.path.expanduser(str(workdir)))
+    name = re.sub(r"[^A-Za-z0-9-]", "-", abs_wd)
     return os.path.join(os.path.expanduser("~/.claude/projects"), name)
 
 
@@ -124,11 +130,12 @@ def option_value(data, name):
 
 def validate(data):
     problems = []
-    if data.get("version") != 1:
-        problems.append("version must be 1")
+    version = data.get("version")
+    if version not in (1, 2):
+        problems.append("version must be 1 or 2")
     bl = data.get("bots")
-    if not isinstance(bl, list) or not bl:
-        problems.append("bots must be a non-empty array")
+    if not isinstance(bl, list) or (version == 1 and not bl):
+        problems.append("bots must be an array (non-empty for version 1)")
         return problems
     seen = set()
     path_owners = {field: {} for field in PATH_FIELDS}
@@ -185,6 +192,10 @@ def emit_bot(bot, field):
 
 
 def main(argv):
+    if argv and argv[0] in ("-h", "--help"):
+        print("fleet-config bots | bot <key> <field> | bot-by-state <dir> [field] | bot-by-workdir <dir> [field] | option <name> | project-dir <key> | path | validate")
+        print("Exit codes: 0 success, 1 missing or invalid config or lookup, 2 invalid arguments.")
+        return 0
     if not argv:
         die("usage: fleet-config bots|bot|bot-by-state|bot-by-workdir|option|project-dir|path|validate ...", 2)
     cmd = argv[0]

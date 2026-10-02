@@ -1,645 +1,466 @@
 #!/usr/bin/env python3
-"""
-fleet-sessions - cross-bot session lister + resolver for the Telegram /resume
-command.
+"""List and reopen chats across the configured bots.
 
-Enumerates recent Claude Code sessions across EVERY bot in fleet.json, newest
-first, and produces a numbered, human-readable list for Telegram. A second
-subcommand resolves a picked number back to the session uuid + origin workdir so
-the caller can relaunch that bot resumed into it.
+Commands:
+  render [--limit 20] [--exclude-uuid U] [--bot KEY] [--style inline|reply|plain]
+  list [--limit 12] [--exclude-uuid U] [--bot KEY]
+  resolve N [--bot KEY] [--gen TOKEN]
+  resolve-uuid U [--bot KEY]
 
-Subcommands:
-  list [--limit N] [--exclude-uuid UUID]
-        Writes the numbered mapping to the state file and prints the human list
-        to stdout (the hook sends that text to the chat).
-  resolve N
-        Prints "UUID<TAB>WORKDIR<TAB>PERSONA<TAB>SRC" for entry N.
-        Exit 0 on success, 3 if no list exists, 4 if N is invalid, 5 if stale.
-
-Topic labels: an optional AI topic label (3-6 words) is attached per session ONLY
-when labels are enabled - the tldr_judge option is true OR $ANTHROPIC_API_KEY_TLDR
-is set - and a key resolves via the judge key chain (env ANTHROPIC_API_KEY_TLDR ->
-the calling bot's state-dir .env -> macOS Keychain service
-"nexera-telebots-judge"). Otherwise, and on ANY failure, each entry keeps
-its heuristic preview. `list` always produces output; it never errors on a
-missing key or network.
-
-Python 3.9+, standard library only. No bot tokens are read here.
+render prints JSON with text, reply_markup, count and style. Inline buttons
+use rs:<uuid>; controls use rsx:refresh and rsx:close.
+Exit codes: 0 success, 1 render failed, 2 invalid arguments, 3 no saved list,
+4 no such session, 5 stale list, 6 unreadable transcript.
 """
 
-import sys, os, json, glob, re, time, html, subprocess
-import urllib.request
 import concurrent.futures
-
-HOME = os.path.expanduser("~")
-PROJECTS = os.path.join(HOME, ".claude", "projects")
-FLEET_HOME = os.path.expanduser(os.environ.get("FLEET_HOME", "~/.claude/telegram-fleet"))
-STATE_FILE = os.path.join(FLEET_HOME, "resume-list.json")
-LABEL_CACHE_FILE = os.path.join(FLEET_HOME, "resume-labels.json")
-
-SELF_DIR = os.path.dirname(os.path.realpath(__file__))
-
-
-def _fleet_config_bin():
-    for cand in (os.path.join(FLEET_HOME, "bin", "fleet-config"),
-                 os.path.join(SELF_DIR, "fleet-config")):
-        if os.access(cand, os.X_OK):
-            return cand
-    return "fleet-config"
+import glob
+import html
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
 
 
-FLEET_CONFIG = _fleet_config_bin()
+HOME = Path.home()
+FLEET_HOME = Path(os.environ.get("FLEET_HOME", "~/.claude/telegram-fleet")).expanduser()
+SELF_DIR = Path(__file__).resolve().parent
+FC = FLEET_HOME / "bin" / "fleet-config"
+if not os.access(FC, os.X_OK):
+    FC = SELF_DIR / "fleet-config"
+CACHE = FLEET_HOME / "resume-labels.json"
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
+KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+LOW_INFO = re.compile(r"^(?:hi|hey|hello|thanks|thank you|ok|okay|yes|no|test|ping|help|start)[.!? ]*$", re.I)
+TOKEN_RE = re.compile(r"[0-9]{8,10}:[A-Za-z0-9_-]{35,}")
+KEY_SECRET_RE = re.compile(r"\b(?:sk-ant-|sk-proj-|sk-)[A-Za-z0-9_-]{12,}\b")
+ASSIGNMENT_SECRET_RE = re.compile(r"(?i)\b(password|token|api[_ -]?key|secret)\s*[:=]\s*\S+")
+STALE_AFTER = 6 * 3600
+MAX_TEXT = 3900
+BASIS = "opening-v3"
 
-ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_MODEL = "claude-haiku-4-5"
-API_TIMEOUT = 8
-LABEL_INPUT_CAP = 1500
 
-VOICE_BODIES = {
-    "(voice message)", "(audio message)", "(voice)", "(video message)",
-    "(video note)", "(photo)", "(document)", "",
-}
-
-SCAN_LINE_CAP = 200
-
-
-def _fc(*args):
+def fc(*args):
     try:
-        out = subprocess.run([FLEET_CONFIG, *args],
-                             capture_output=True, text=True, timeout=8)
-        if out.returncode == 0:
-            return out.stdout.rstrip("\n")
+        proc = subprocess.run([str(FC), *args], text=True, capture_output=True, timeout=8)
+        return proc.stdout.strip() if proc.returncode == 0 else ""
     except Exception:
-        pass
-    return ""
-
-
-def _project_dir_fallback(workdir):
-    return os.path.join(PROJECTS, os.path.expanduser(workdir).replace("/", "-"))
-
-
-def get_bots():
-    """[(persona, workdir, project_dir, emoji), ...] from fleet.json via
-    fleet-config. Empty list on any failure (list then reports none)."""
-    keys = _fc("bots").splitlines()
-    bots = []
-    for key in keys:
-        key = key.strip()
-        if not key:
-            continue
-        persona = _fc("bot", key, "name") or key
-        workdir = _fc("bot", key, "workdir")
-        emoji = _fc("bot", key, "emoji") or "•"
-        proj = _fc("project-dir", key) or _project_dir_fallback(workdir)
-        bots.append((persona, workdir, proj, emoji))
-    return bots
-
-
-# ---------------------------------------------------------------------------
-# Transcript parsing (generic; unchanged in behavior)
-# ---------------------------------------------------------------------------
-
-def _msg_text(obj):
-    msg = obj.get("message")
-    if not isinstance(msg, dict):
         return ""
-    c = msg.get("content")
-    if isinstance(c, str):
-        return c
-    if isinstance(c, list):
-        parts = []
-        for part in c:
-            if isinstance(part, dict) and part.get("type") == "text":
-                parts.append(part.get("text", ""))
-        return "\n".join(parts)
+
+
+def bot_rows():
+    rows = []
+    for key in fc("bots").splitlines():
+        if not KEY_RE.fullmatch(key):
+            continue
+        workdir = fc("bot", key, "workdir")
+        if not workdir:
+            continue
+        rows.append({"key": key, "name": fc("bot", key, "name") or key,
+                     "emoji": fc("bot", key, "emoji") or "•", "workdir": workdir,
+                     "project": fc("project-dir", key)})
+    return rows
+
+
+def scrub(value):
+    value = TOKEN_RE.sub("[redacted]", str(value))
+    value = KEY_SECRET_RE.sub("[redacted]", value)
+    value = ASSIGNMENT_SECRET_RE.sub(lambda m: m.group(1) + "=[redacted]", value)
+    value = re.sub(r"<system-reminder>.*?</system-reminder>", "", value, flags=re.S)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def msg_text(record):
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(str(p.get("text", "")) for p in content
+                         if isinstance(p, dict) and p.get("type") == "text")
     return ""
 
 
-def _clean(text):
-    text = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.DOTALL)
-    m = re.search(r"<channel\b[^>]*>(.*?)</channel>", text, flags=re.DOTALL)
-    if m:
-        text = m.group(1)
-    text = re.sub(r"\s+", " ", text).strip()
+def substantive_user(raw):
+    if not raw or "<command-name>" in raw or "<task-notification" in raw:
+        return ""
+    channel = re.search(r"<channel\b[^>]*>(.*?)</channel>", raw, re.S)
+    text = channel.group(1) if channel else raw
+    voice = re.search(r"(?:Transcript|Transcription):\s*(.+)", text, re.I | re.S)
+    if voice:
+        text = voice.group(1)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = scrub(text)
+    if not text or text.startswith("/") or LOW_INFO.fullmatch(text):
+        return ""
+    if re.fullmatch(r"\(?\s*(?:voice|audio|photo|video|document)(?: message| note)?\s*\)?", text, re.I):
+        return ""
+    if text.startswith(("Base directory for this skill:", "Caveat:")):
+        return ""
     return text
 
 
-NOISE_PREFIXES = ("Base directory for this skill:", "Caveat:")
-
-
-def classify_user(raw):
-    m = re.search(r"<channel\b[^>]*>(.*?)</channel>", raw, flags=re.DOTALL)
-    if m:
-        body = re.sub(r"\s+", " ", m.group(1)).strip()
-        if body in VOICE_BODIES or len(body) < 3:
-            return (None, True)
-        return (body, False)
-    cn = re.search(r"<command-name>\s*/?([^<\s]+)\s*</command-name>", raw)
-    if cn:
-        ca = re.search(r"<command-args>\s*(.*?)\s*</command-args>", raw, flags=re.DOTALL)
-        args = re.sub(r"\s+", " ", ca.group(1)).strip() if ca else ""
-        label = ("/" + cn.group(1) + (" " + args if args else "")).strip()
-        return (label, False)
-    txt = raw
-    for tag in ("system-reminder", "task-notification", "local-command-stdout",
-                "local-command-caveat", "command-name", "command-message",
-                "command-args", "command-output", "function_results"):
-        txt = re.sub(rf"<{tag}\b[^>]*>.*?</{tag}>", "", txt, flags=re.DOTALL)
-    txt = re.sub(r"</?[a-z][a-z0-9-]*(?:\s[^>]*)?/?>", "", txt)
-    txt = re.sub(r"\s+", " ", txt).strip()
-    if not txt or len(txt) < 3 or txt.startswith(NOISE_PREFIXES):
-        return (None, False)
-    return (txt, False)
-
-
-def _preview_first(path):
-    saw_voice = False
-    assistant_fallback = None
+def opening(path):
+    users = []
+    reply = ""
+    pending_voice = False
     try:
-        with open(path, "r", errors="replace") as fh:
-            for i, line in enumerate(fh):
-                if i >= SCAN_LINE_CAP:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for i, line in enumerate(handle):
+                if i >= 1000 or len(users) >= 3:
                     break
-                line = line.strip()
-                if not line:
-                    continue
                 try:
-                    obj = json.loads(line)
-                except Exception:
+                    record = json.loads(line)
+                except ValueError:
                     continue
-                t = obj.get("type")
-                if t == "user":
-                    label, is_voice = classify_user(_msg_text(obj))
-                    if label:
-                        return label
-                    if is_voice:
-                        saw_voice = True
-                elif t == "assistant" and assistant_fallback is None:
-                    atext = _clean(_msg_text(obj))
-                    if len(atext) >= 60:
-                        assistant_fallback = atext
-    except Exception:
-        return None
-    if saw_voice and assistant_fallback:
-        return "\U0001F3A4 " + assistant_fallback
-    if saw_voice:
-        return "\U0001F3A4 voice note"
-    if assistant_fallback:
-        return assistant_fallback
-    return None
+                kind = record.get("type")
+                if kind == "user" and not record.get("isMeta") and not record.get("isCompactSummary"):
+                    origin = record.get("origin")
+                    if isinstance(origin, dict) and origin.get("kind") == "peer":
+                        continue
+                    raw = msg_text(record)
+                    value = substantive_user(raw)
+                    if value:
+                        users.append(value)
+                        pending_voice = False
+                    elif "voice" in raw.lower() or "audio" in raw.lower():
+                        pending_voice = True
+                    if pending_voice and isinstance(record.get("message", {}).get("content"), list):
+                        for part in record["message"]["content"]:
+                            if isinstance(part, dict) and part.get("type") == "tool_result":
+                                words = substantive_user(str(part.get("content", "")))
+                                if words:
+                                    users.append(words)
+                                    pending_voice = False
+                                    break
+                elif kind == "assistant" and not reply:
+                    message = record.get("message") or {}
+                    for part in message.get("content", []) if isinstance(message.get("content"), list) else []:
+                        if not isinstance(part, dict):
+                            continue
+                        if part.get("type") == "tool_use" and str(part.get("name", "")).endswith("__reply"):
+                            reply = scrub((part.get("input") or {}).get("text", ""))
+                            break
+                    if not reply:
+                        reply = scrub(msg_text(record))
+    except OSError:
+        return [], "", False
+    return users, reply, len(users) >= 3
 
 
-def _tail_entries(path, max_bytes=600_000, max_lines=400):
-    try:
-        sz = os.path.getsize(path)
-        with open(path, "rb") as fh:
-            if sz > max_bytes:
-                fh.seek(sz - max_bytes)
-                chunk = fh.read()
-                nl = chunk.find(b"\n")
-                if nl != -1:
-                    chunk = chunk[nl + 1:]
-            else:
-                chunk = fh.read()
-    except Exception:
-        return []
-    entries = []
-    for raw in chunk.split(b"\n")[-max_lines:]:
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            entries.append(json.loads(raw.decode("utf-8", "replace")))
-        except Exception:
-            continue
-    return entries
-
-
-def _preview_recent(path):
-    entries = _tail_entries(path)
-    if not entries:
-        return None
-    recent_user = None
-    recent_assistant = None
-    for obj in reversed(entries):
-        t = obj.get("type")
-        if t == "user" and recent_user is None:
-            label, is_voice = classify_user(_msg_text(obj))
-            if is_voice:
-                recent_user = (None, True)
-            elif label:
-                recent_user = (label, False)
-        elif t == "assistant" and recent_assistant is None:
-            atext = _clean(_msg_text(obj))
-            if len(atext) >= 40:
-                recent_assistant = atext
-        if recent_user is not None and recent_assistant is not None:
-            break
-    if recent_user is not None:
-        label, is_voice = recent_user
-        if is_voice:
-            return ("\U0001F3A4 " + recent_assistant) if recent_assistant else "\U0001F3A4 voice note"
-        if len(label) < 15 and recent_assistant:
-            return recent_assistant
-        return label
-    if recent_assistant:
-        return recent_assistant
-    return None
-
-
-def extract_preview(path):
-    return _preview_recent(path) or _preview_first(path)
-
-
-# ---------------------------------------------------------------------------
-# AI topic labels (opt-in; judge key chain)
-# ---------------------------------------------------------------------------
-
-def _opening_text(path):
-    user_part = None
-    assistant_part = None
-    try:
-        with open(path, "r", errors="replace") as fh:
-            for i, line in enumerate(fh):
-                if i >= SCAN_LINE_CAP:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                t = obj.get("type")
-                if t == "user" and user_part is None:
-                    label, _is_voice = classify_user(_msg_text(obj))
-                    if label:
-                        user_part = label
-                elif t == "assistant" and assistant_part is None:
-                    atext = _clean(_msg_text(obj))
-                    if len(atext) >= 20:
-                        assistant_part = atext
-                if user_part is not None and assistant_part is not None:
-                    break
-    except Exception:
-        return None
-    parts = []
-    if user_part:
-        parts.append("User: " + user_part)
-    if assistant_part:
-        parts.append("Assistant: " + assistant_part)
-    if not parts:
-        return None
-    return "\n".join(parts)[:LABEL_INPUT_CAP]
-
-
-def _labels_enabled():
-    """True when topic labels should be attempted: the tldr_judge option is true
-    OR ANTHROPIC_API_KEY_TLDR is set in the environment."""
-    if os.environ.get("ANTHROPIC_API_KEY_TLDR", "").strip():
-        return True
-    return _fc("option", "tldr_judge").strip() == "true"
-
-
-def _get_api_key():
-    """Judge key via the same chain as the tldr hook: env -> calling bot's
-    state-dir .env -> macOS Keychain service. None on any failure."""
-    k = os.environ.get("ANTHROPIC_API_KEY_TLDR", "").strip()
-    if k:
-        return k
-    sd = os.environ.get("TELEGRAM_STATE_DIR", "")
-    if sd:
-        try:
-            with open(os.path.join(sd, ".env")) as fh:
-                for line in fh:
-                    # same two accepted line names as the tldr hook's chain
-                    if line.startswith(("ANTHROPIC_API_KEY_TLDR=", "ANTHROPIC_API_KEY=")):
-                        v = line.split("=", 1)[1].strip().strip('"').strip("'")
-                        if v:
-                            return v
-        except Exception:
-            pass
-    if sys.platform == "darwin":
-        try:
-            out = subprocess.run(
-                ["security", "find-generic-password",
-                 "-s", "nexera-telebots-judge", "-w"],
-                capture_output=True, text=True, timeout=5,
-            )
-            v = (out.stdout or "").strip()
-            if v:
-                return v
-        except Exception:
-            pass
-    return None
-
-
-LABEL_PROMPT = (
-    "Below is the MOST RECENT activity in a chat. In 3-6 words, give a topic "
-    "label for what the chat is working on now / most recently about "
-    "(e.g. \"Building the /resume command\", \"Gmail inbox cleanup\"). "
-    "Reply with ONLY the label - no quotes, no trailing punctuation, no "
-    "lead-in like \"This chat is about\", and never explain, apologize, or ask "
-    "for more context. If it's vague, give your best short guess anyway."
-    "\n\nMost recent activity:\n{opening}"
-)
-
-_LABEL_META = ("i need", "i don't", "i do not", "i can", "i cannot", "i'm ",
-               "i am ", "sorry", "this appears", "the message", "the opening",
-               "the chat is", "it's unclear", "unclear", "as an ai", "unable")
-
-
-def _looks_like_label(text):
-    if not text or len(text) > 70 or "\n" in text:
-        return False
-    low = text.lower()
-    return not any(low.startswith(p) for p in _LABEL_META)
-
-
-def _label_via_api(api_key, opening):
-    try:
-        body = json.dumps({
-            "model": ANTHROPIC_MODEL,
-            "max_tokens": 32,
-            "messages": [
-                {"role": "user", "content": LABEL_PROMPT.format(opening=opening)}
-            ],
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            ANTHROPIC_URL, data=body,
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=API_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
-        text = data["content"][0]["text"].strip()
-        text = text.strip('"“”‘’\'').strip()
-        text = text.rstrip(".").strip()
-        return text if _looks_like_label(text) else None
-    except Exception:
-        return None
-
-
-def _recent_task_text(path):
-    entries = _tail_entries(path)
-    if not entries:
-        return None
-    user_msg = None
-    assistant_msg = None
-    for obj in reversed(entries):
-        t = obj.get("type")
-        if t == "user" and user_msg is None:
-            label, is_voice = classify_user(_msg_text(obj))
-            if label and not is_voice and len(label) >= 15:
-                user_msg = label
-        elif t == "assistant" and assistant_msg is None:
-            atext = _clean(_msg_text(obj))
-            if len(atext) >= 40:
-                assistant_msg = atext
-        if user_msg is not None and assistant_msg is not None:
-            break
-    parts = []
-    if user_msg:
-        parts.append("Most recent user request: " + user_msg)
-    if assistant_msg:
-        parts.append("Most recent assistant work: " + assistant_msg)
-    if not parts:
-        return None
-    return "\n".join(parts)[:LABEL_INPUT_CAP]
-
-
-def _label_one(api_key, path):
-    try:
-        text = _recent_task_text(path) or _opening_text(path)
-        if not text:
-            return None
-        return _label_via_api(api_key, text)
-    except Exception:
-        return None
-
-
-def _load_label_cache():
-    try:
-        with open(LABEL_CACHE_FILE) as fh:
-            data = json.load(fh)
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-    return {}
-
-
-def _save_label_cache(cache):
-    try:
-        os.makedirs(os.path.dirname(LABEL_CACHE_FILE), exist_ok=True)
-        with open(LABEL_CACHE_FILE, "w") as fh:
-            json.dump(cache, fh, indent=2)
-    except Exception:
-        pass
-
-
-def _cached_label(cache, uuid, mtime):
-    ent = cache.get(uuid)
-    if isinstance(ent, dict) and ent.get("label"):
-        try:
-            if float(ent.get("mtime", 0)) >= float(mtime):
-                return ent["label"]
-        except Exception:
-            return None
-    return None
-
-
-def _apply_labels(items):
-    """Attach an AI topic label to each item when labels are enabled and a key
-    resolves; otherwise every item keeps its heuristic preview. Never raises."""
-    for it in items:  # default: heuristic preview
-        it.setdefault("label", None)
-        it["description"] = it["preview"]
-    if not items or not _labels_enabled():
-        return
-    api_key = _get_api_key()
-    if not api_key:
-        return
-    cache = _load_label_cache()
-    to_label = [it for it in items
-                if _cached_label(cache, it["uuid"], it["mtime"]) is None]
-    if to_label:
-        new = {}
-        try:
-            with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=min(8, len(to_label))) as ex:
-                futs = {ex.submit(_label_one, api_key, it["src"]): it
-                        for it in to_label}
-                for fut in concurrent.futures.as_completed(futs):
-                    try:
-                        lab = fut.result()
-                    except Exception:
-                        lab = None
-                    if lab:
-                        it = futs[fut]
-                        new[it["uuid"]] = {"label": lab, "mtime": it["mtime"]}
-        except Exception:
-            pass
-        if new:
-            cache.update(new)
-            _save_label_cache(cache)
-    for it in items:
-        lab = _cached_label(cache, it["uuid"], it["mtime"])
-        it["label"] = _shorten(str(lab), 100) if lab else None
-        it["description"] = it["label"] or it["preview"]
-
-
-def _shorten(text, limit=100):
-    text = text.strip()
-    if len(text) <= limit:
+def shorten(text, cap=42):
+    text = scrub(text)
+    if len(text) <= cap:
         return text
-    head = text[:limit]
-    cut = head.rsplit(" ", 1)[0].rstrip()
-    if len(cut) < limit // 2:
-        cut = head.rstrip()
-    return cut + "…"
+    cut = text[:cap].rsplit(" ", 1)[0]
+    return (cut if len(cut) >= cap // 2 else text[:cap]).rstrip(" ,.;:-") + "…"
 
 
-def _fmt_when(epoch):
-    lt = time.localtime(epoch)
-    s = time.strftime("%b %-d, %-I:%M%p", lt)
-    return s[:-2] + s[-2:].lower()
+def heuristic(users, reply):
+    if not users:
+        return "New conversation"
+    first = users[0]
+    if len(first) < 15 and reply:
+        return shorten(first + " - " + reply, 42)
+    return shorten(first, 42)
+
+
+def api_key():
+    direct = os.environ.get("ANTHROPIC_API_KEY_TLDR", "").strip()
+    if direct:
+        return direct
+    if fc("option", "tldr_judge") != "true":
+        return ""
+    try:
+        result = subprocess.run(["security", "find-generic-password", "-s", "nexera-telebots-judge", "-w"],
+                                capture_output=True, text=True, timeout=5)
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def ai_label(key, users, reply):
+    if not users:
+        return ""
+    endpoint = "https://api.anthropic.com/v1/messages"
+    if os.environ.get("TELEBOTS_TEST") == "1":
+        candidate = os.environ.get("TELEBOTS_ANTHROPIC_API_BASE", "")
+        parsed = urllib.parse.urlparse(candidate)
+        if parsed.scheme == "http" and parsed.hostname in ("127.0.0.1", "localhost", "::1"):
+            endpoint = candidate.rstrip("/") + "/v1/messages"
+    request = urllib.request.Request(endpoint, method="POST",
+        data=json.dumps({"model": "claude-haiku-4-5", "max_tokens": 48,
+                         "messages": [{"role": "user", "content":
+                            "Name the main topic of this chat from its opening in 3 to 6 words. Reply with the topic only.\n"
+                            + "\n".join(users[:3]) + "\nFirst reply: " + reply[:300]}]}).encode(),
+        headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            data = json.load(response)
+        value = scrub(data["content"][0]["text"]).strip('". ')
+        return value if 3 <= len(value) <= 70 and "\n" not in value else ""
+    except Exception:
+        return ""
+
+
+def read_cache():
+    try:
+        data = json.loads(CACHE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def atomic_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
 
 
 def gather(limit, exclude_uuid):
-    bots = get_bots()
-    entries = []
-    for persona, workdir, proj, _emoji in bots:
-        for path in glob.glob(os.path.join(proj, "*.jsonl")):
-            uuid = os.path.basename(path)[:-6]
-            if exclude_uuid and uuid == exclude_uuid:
+    candidates = []
+    for bot in bot_rows():
+        for src in glob.glob(os.path.join(bot["project"], "*.jsonl")):
+            uuid = Path(src).stem
+            if not UUID_RE.fullmatch(uuid) or uuid == exclude_uuid:
                 continue
             try:
-                mt = os.path.getmtime(path)
-                sz = os.path.getsize(path)
+                if Path(src).resolve().parent != Path(bot["project"]).resolve():
+                    continue
+                if os.path.getsize(src) < 50:
+                    continue
+                candidates.append((os.path.getmtime(src), bot, src, uuid))
             except OSError:
                 continue
-            if sz < 500:
-                continue
-            entries.append((mt, persona, workdir, uuid, path))
-    entries.sort(key=lambda e: e[0], reverse=True)
-
-    items = []
-    seen_uuids = set()
-    for mt, persona, workdir, uuid, path in entries:
-        if len(items) >= limit:
+    candidates.sort(reverse=True, key=lambda row: row[0])
+    items, seen = [], set()
+    for mtime, bot, src, uuid in candidates:
+        if len(items) == limit:
             break
-        if uuid in seen_uuids:
+        if uuid in seen:
             continue
-        prev = extract_preview(path)
-        if not prev:
-            continue
-        prev = _shorten(prev, 100)
-        seen_uuids.add(uuid)
-        items.append({
-            "n": len(items) + 1,
-            "uuid": uuid,
-            "worktree": workdir,
-            "persona": persona,
-            "src": path,
-            "mtime": mt,
-            "when": _fmt_when(mt),
-            "preview": prev,
-        })
-    return items, {p: e for p, _w, _pr, e in bots}
+        users, reply, locked = opening(src)
+        label = heuristic(users, reply)
+        items.append({"n": len(items) + 1, "uuid": uuid, "worktree": bot["workdir"],
+                      "persona": bot["name"], "emoji": bot["emoji"], "src": src,
+                      "mtime": mtime, "label": label, "description": label,
+                      "opening": users[:3], "first_reply": reply[:300], "locked": locked})
+        seen.add(uuid)
+    return items
 
 
-def do_list(limit, exclude_uuid):
-    items, emoji_by_persona = gather(limit, exclude_uuid)
-    try:
-        _apply_labels(items)
-    except Exception:
-        for it in items:
-            it.setdefault("label", None)
-            it.setdefault("description", it["preview"])
+def apply_labels(items):
+    cache = read_cache()
+    key = api_key()
+    changed = False
+    todo = []
+    for item in items:
+        old = cache.get(item["uuid"], {})
+        if (old.get("basis") == BASIS and (old.get("locked") or old.get("mtime") == item["mtime"])
+                and (not key or old.get("source") == "ai")):
+            item["label"] = old.get("label") or item["label"]
+        else:
+            todo.append(item)
+    ai_done = set()
+    if key and todo:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(todo))) as pool:
+            futures = {pool.submit(ai_label, key, it["opening"], it["first_reply"]): it for it in todo}
+            for future in concurrent.futures.as_completed(futures):
+                value = future.result()
+                if value:
+                    futures[future]["label"] = value
+                    ai_done.add(futures[future]["uuid"])
+    for item in todo:
+        cache[item["uuid"]] = {"basis": BASIS, "label": item["label"],
+                               "source": "ai" if item["uuid"] in ai_done else "heuristic",
+                               "mtime": item["mtime"], "locked": item["locked"]}
+        changed = True
+    if changed:
+        atomic_json(CACHE, cache)
+    for item in items:
+        item["description"] = item["label"]
+        del item["opening"]
+        del item["first_reply"]
+        del item["locked"]
 
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    with open(STATE_FILE, "w") as fh:
-        json.dump({"generated": int(time.time()), "items": items}, fh, indent=2)
 
+def state_file(bot):
+    return FLEET_HOME / ("resume-list-" + bot + ".json" if bot else "resume-list.json")
+
+
+def store_list(items, bot):
+    token = secrets.token_hex(4)
+    atomic_json(state_file(bot), {"generated": int(time.time()), "gen": token, "items": items})
+    return token
+
+
+def render_text(items):
     if not items:
-        print("No recoverable sessions found across your bots yet.")
-        return 0
+        return "No recoverable sessions found across your bots yet."
+    lines = ["<b>Your recent chats across your bots</b>", ""]
+    for item in items:
+        when = time.strftime("%a, %b %-d", time.localtime(item["mtime"]))
+        lines.append(f"<b>{item['n']}. {html.escape(item['emoji'])} {html.escape(item['persona'])}</b> · {when}")
+        lines.append("<i>" + html.escape(shorten(item["description"], 70)) + "</i>")
+        lines.append("")
+    lines.append("Tap a number to reopen it here, or reply /resume N.")
+    text = "\n".join(lines)
+    while len(text) > MAX_TEXT and len(items) > 1:
+        items.pop()
+        text = render_text(items)
+    return text
 
-    out = ["<b>Your recent chats across your bots</b>", ""]
-    for it in items:
-        emoji = emoji_by_persona.get(it["persona"], "•")
-        out.append(f"<b>{it['n']}. {emoji} {html.escape(it['persona'], quote=False)}</b>  ·  {html.escape(it['when'], quote=False)}")
-        out.append(html.escape(it.get("description") or it["preview"], quote=False))
-        out.append("")
-    out.append("Reply <b>/resume 3</b> to reopen #3 - it opens right here in this chat.")
-    print("\n".join(out))
+
+def keyboard(items, style, gen):
+    if style == "inline":
+        rows, row = [], []
+        for item in items:
+            row.append({"text": f"{item['n']} {item['emoji']}", "callback_data": "rs:" + item["uuid"]})
+            if len(row) == 4:
+                rows.append(row); row = []
+        if row:
+            rows.append(row)
+        rows.append([{"text": "🔄 Refresh", "callback_data": "rsx:refresh"},
+                     {"text": "✕ Close", "callback_data": "rsx:close"}])
+        return {"inline_keyboard": rows}
+    if style == "reply":
+        rows = [[{"text": f"/resume {it['n']} g{gen}"} for it in items[i:i + 3]]
+                for i in range(0, len(items), 3)]
+        return {"keyboard": rows, "resize_keyboard": True, "one_time_keyboard": True}
+    return None
+
+
+def do_render(limit, exclude_uuid, bot, style, text_only=False):
+    items = gather(limit, exclude_uuid)
+    apply_labels(items)
+    text = render_text(items)
+    gen = store_list(items, bot)
+    if text_only:
+        print(text)
+    else:
+        payload = {"text": text, "reply_markup": keyboard(items, style, gen),
+                   "count": len(items), "style": style}
+        print(json.dumps(payload, ensure_ascii=False))
+    logs = FLEET_HOME / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    with (logs / "sessions.log").open("a", encoding="utf-8") as handle:
+        handle.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") +
+                     f" RENDER count={len(items)} labels={sum(bool(it['label']) for it in items)}\n")
     return 0
 
 
-STALE_AFTER = 6 * 3600
-
-
-def do_resolve(n):
+def resolve_number(value, bot, gen):
     try:
-        with open(STATE_FILE) as fh:
-            state = json.load(fh)
-    except Exception:
+        data = json.loads(state_file(bot).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return 3
-    try:
-        if time.time() - float(state.get("generated", 0)) > STALE_AFTER:
-            return 5
-    except Exception:
-        pass
-    for it in state.get("items", []):
-        if it.get("n") == n:
-            print(f"{it['uuid']}\t{it['worktree']}\t{it['persona']}\t{it.get('src','')}")
+    if time.time() - float(data.get("generated", 0)) > STALE_AFTER or (gen and gen != data.get("gen")):
+        return 5
+    for item in data.get("items", []):
+        if item.get("n") == value:
+            print("\t".join(str(item.get(k, "")) for k in ("uuid", "worktree", "persona", "src")))
             return 0
     return 4
 
 
-def main():
-    args = sys.argv[1:]
-    if not args:
-        print("usage: fleet-sessions list|resolve ...", file=sys.stderr)
+def resolve_uuid(value, bot):
+    if not UUID_RE.fullmatch(value):
         return 2
-    cmd = args[0]
-    if cmd in ("-h", "--help"):
+    try:
+        data = json.loads(state_file(bot).read_text(encoding="utf-8"))
+        projects = {Path(row["project"]).resolve() for row in bot_rows()}
+        for item in data.get("items", []):
+            source = Path(str(item.get("src", ""))).resolve()
+            if (item.get("uuid") == value and source.name == value + ".jsonl"
+                    and source.parent in projects and source.is_file()):
+                print("\t".join(str(item.get(k, "")) for k in ("uuid", "worktree", "persona", "src")))
+                return 0
+    except (OSError, ValueError):
+        pass
+    for row in bot_rows():
+        path = Path(row["project"]) / (value + ".jsonl")
+        if path.is_file() and path.resolve().parent == Path(row["project"]).resolve():
+            try:
+                with path.open("rb") as handle:
+                    handle.read(1)
+            except OSError:
+                return 6
+            print("\t".join((value, row["workdir"], row["name"], str(path))))
+            return 0
+    return 4
+
+
+def main(argv):
+    if not argv or argv[0] in ("--help", "-h"):
         print(__doc__.strip())
-        return 0
-    if cmd == "list":
-        limit = 12
-        exclude_uuid = None
-        i = 1
-        while i < len(args):
-            if args[i] == "--limit" and i + 1 < len(args):
+        return 0 if argv else 2
+    bot = None
+    if "--bot" in argv:
+        index = argv.index("--bot")
+        if index + 1 >= len(argv):
+            return 2
+        bot = argv[index + 1]
+        del argv[index:index + 2]
+        if bot not in {row["key"] for row in bot_rows()}:
+            return 2
+    cmd = argv.pop(0)
+    if cmd in ("render", "list"):
+        limit = 20 if cmd == "render" else 12
+        exclude, style = None, "inline" if cmd == "render" else "plain"
+        while argv:
+            flag = argv.pop(0)
+            if not argv:
+                return 2
+            value = argv.pop(0)
+            if flag == "--limit":
                 try:
-                    limit = max(1, min(30, int(args[i + 1])))
+                    limit = max(1, min(20, int(value)))
                 except ValueError:
-                    pass
-                i += 2
-            elif args[i] == "--exclude-uuid" and i + 1 < len(args):
-                exclude_uuid = args[i + 1].strip()
-                i += 2
+                    return 2
+            elif flag == "--exclude-uuid":
+                if not UUID_RE.fullmatch(value):
+                    return 2
+                exclude = value
+            elif flag == "--style" and cmd == "render" and value in ("inline", "reply", "plain"):
+                style = value
             else:
-                i += 1
-        return do_list(limit, exclude_uuid)
-    elif cmd == "resolve":
-        if len(args) < 2:
+                return 2
+        return do_render(limit, exclude, bot, style, cmd == "list")
+    if cmd == "resolve":
+        if not argv:
             return 2
         try:
-            n = int(args[1])
+            number = int(argv.pop(0))
         except ValueError:
             return 2
-        return do_resolve(n)
-    else:
-        print(f"unknown subcommand: {cmd}", file=sys.stderr)
-        return 2
+        gen = None
+        if argv:
+            if len(argv) != 2 or argv[0] != "--gen":
+                return 2
+            gen = argv[1].removeprefix("g")
+        return resolve_number(number, bot, gen)
+    if cmd == "resolve-uuid" and len(argv) == 1:
+        return resolve_uuid(argv[0], bot)
+    return 2
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,69 @@
+#!/bin/bash
+# fleet-handoff fresh <target-key> [--force]
+# Start the target bot blank before a separately confirmed cross-session note.
+# This engine never sends the note. It never acts on a bot outside fleet.json.
+# Exit codes: 0 restarted/dry run, 1 invalid args, 2 unknown bot, 3 self target,
+# 7 target session missing or ambiguous, 8 busy without --force, 9 restart failed.
+# CC_HANDOFF_DRYRUN=1 prints the decision and invokes only fresh's dry run.
+set -uo pipefail
+
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
+  sed -n '2,7p' "$0" | sed 's/^# *//'
+  exit 0
+fi
+[[ $# -ge 2 && $# -le 3 && "$1" == fresh ]] || { echo 'fleet-handoff: use fresh <target-key> [--force]' >&2; exit 1; }
+KEY="$2"; FORCE="${3:-}"
+[[ -z "$FORCE" || "$FORCE" == --force ]] || exit 1
+FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+FC="$FLEET_HOME/bin/fleet-config"; [[ -x "$FC" ]] || FC="$SELF_DIR/fleet-config"
+FRESH="$FLEET_HOME/bin/fleet-fresh"; [[ -x "$FRESH" ]] || FRESH="$SELF_DIR/fleet-fresh"
+WORKDIR="$("$FC" bot "$KEY" workdir 2>/dev/null)" || { echo 'fleet-handoff: unknown bot' >&2; exit 2; }
+STATE="$("$FC" bot "$KEY" state_dir)" || exit 2
+SELF=""
+if [[ -n "${TELEGRAM_STATE_DIR:-}" ]]; then
+  SELF="$("$FC" bot-by-state "$TELEGRAM_STATE_DIR" key 2>/dev/null || true)"
+fi
+[[ "$SELF" != "$KEY" ]] || { echo 'fleet-handoff: refusing a handoff to this bot' >&2; exit 3; }
+mkdir -p "$FLEET_HOME/logs"
+LOG="$FLEET_HOME/logs/handoff.log"
+log() { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >> "$LOG"; }
+
+if [[ -z "$FORCE" && -f "$STATE/stream/anim.lock" ]]; then
+  if ! /usr/bin/python3 - "$STATE/stream/anim.lock" <<'PY'
+import fcntl, sys
+with open(sys.argv[1], 'rb') as handle:
+    try: fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError: sys.exit(1)
+PY
+  then
+    log "refused busy key=$KEY"
+    echo 'fleet-handoff: target is busy; use --force only after checking with the person' >&2
+    exit 8
+  fi
+fi
+
+PIDS=()
+if [[ "${TELEBOTS_TEST:-0}" == 1 && -n "${CC_HANDOFF_TEST_PID:-}" && "${CC_HANDOFF_DRYRUN:-0}" == 1 ]]; then
+  PIDS+=("$CC_HANDOFF_TEST_PID")
+else
+  while read -r pid command; do
+    [[ "$pid" =~ ^[0-9]+$ && "$command" == *"--channels plugin:telegram@claude-plugins-official"* ]] || continue
+    cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
+    [[ "$cwd" == "$WORKDIR" ]] && PIDS+=("$pid")
+  done < <(ps -axo pid=,command= 2>/dev/null)
+fi
+[[ "${#PIDS[@]}" == 1 ]] || { log "refused candidate-count=${#PIDS[@]} key=$KEY"; echo 'fleet-handoff: expected exactly one target session' >&2; exit 7; }
+
+if [[ "${CC_HANDOFF_DRYRUN:-0}" == 1 ]]; then
+  log "dryrun key=$KEY pid=${PIDS[0]}"
+  echo "DRYRUN would restart $KEY blank through fleet-fresh; no note delivered"
+  CC_FRESH_DRYRUN=1 "$FRESH" "${PIDS[0]}" "$WORKDIR" fresh-keep quiet
+  exit $?
+fi
+
+"$FRESH" "${PIDS[0]}" "$WORKDIR" fresh-keep quiet
+RC=$?
+log "fresh key=$KEY exit=$RC"
+[[ "$RC" == 0 ]] || exit 9
+echo "fleet-handoff: $KEY is ready for the confirmed note"

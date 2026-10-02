@@ -18,18 +18,21 @@
 # state-dir .env) + CLAUDE_CODE_NO_FLICKER=1, applies the sticky per-bot model /
 # effort if set (absent = your Claude Code default, no flags forced), applies the
 # fleet permission stance, optionally asks the window-grid extra to tile, then
-# exec's claude with the official telegram channel plugin.
+# opens a Terminal window through fleet-start. The new window calls this script
+# with CC_LAUNCH_IN_TERMINAL=1, which then execs Claude Code.
 #
 # Env: FLEET_HOME (default ~/.claude/telegram-fleet); CC_LAUNCH_DRYRUN=1 prints
 # the planned command and exits without launching, touching any window, or
 # writing or deleting anything (a model-state reset is only reported).
 #
-# macOS is the supported platform (Terminal.app window handling by the caller).
+# Exit codes: 0 started or dry run, 1 missing bot/workdir, 2 invalid argument
+# or config, 7 already running, 8 process state could not be checked.
+# macOS is the supported platform (Terminal.app).
 
 set -uo pipefail
 
 usage() {
-  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'
 }
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
@@ -89,7 +92,16 @@ if [ ! -d "$CWD" ]; then
   exit 1
 fi
 
+# A direct invocation must not replace the caller's shell or an assisting
+# Claude session. fleet-start takes the restart lock and opens Terminal.
+if [ "${CC_LAUNCH_IN_TERMINAL:-0}" != "1" ] && [ "${CC_LAUNCH_DRYRUN:-0}" != "1" ]; then
+  STARTER="$(resolve_bin fleet-start)"
+  if [ -z "$RESUME_ID" ]; then RESUME_ID=fresh-keep; fi
+  exec "$STARTER" "$KEY" "$RESUME_ID"
+fi
+
 # --- env wiring -------------------------------------------------------------
+unset TELEGRAM_BOT_TOKEN
 if [ -f "$STATE_DIR/.env" ]; then
   bot_token=$(grep -E '^TELEGRAM_BOT_TOKEN=' "$STATE_DIR/.env" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]')
   [ -n "$bot_token" ] && export TELEGRAM_BOT_TOKEN="$bot_token"
@@ -97,6 +109,7 @@ fi
 export TELEGRAM_STATE_DIR="$STATE_DIR"
 # Flicker-free renderer, scoped to this bot session only.
 export CLAUDE_CODE_NO_FLICKER=1
+export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
 
 # --- sticky per-bot model + effort ------------------------------------------
 # MODEL is stored as a CLASS ALIAS (opus/sonnet/fable/haiku) or a literal
@@ -128,7 +141,7 @@ if [ -f "$FLEET_HOME/permission-stance" ]; then
 fi
 
 # --- build the claude command ----------------------------------------------
-ARGS=(--channels plugin:telegram@claude-plugins-official)
+ARGS=(--channels plugin:telegram@claude-plugins-official --name "telebots-$KEY")
 case "$RESUME_ID" in
   "")          RESUME_DESC="fresh" ;;
   fresh-reset) RESUME_DESC="fresh-reset" ;;
@@ -147,7 +160,7 @@ esac
 echo "launching $KEY in $CWD (state: $STATE_DIR, model: ${BOT_MODEL:-default} effort: ${BOT_EFFORT:-default} stance: $STANCE $RESUME_DESC)"
 
 if [ "${CC_LAUNCH_DRYRUN:-}" = "1" ]; then
-  echo "DRYRUN key=$KEY cwd=$CWD argv: claude ${ARGS[*]}"
+  echo "DRYRUN would open a Terminal window for $KEY; inner argv: claude ${ARGS[*]}"
   if [ "$RESET_MODEL_STATE" = "1" ]; then
     echo "DRYRUN model-state would be reset to your default (nothing was deleted)"
   fi
