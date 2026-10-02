@@ -4,6 +4,10 @@ A native macOS menu bar monitor for a Telebots fleet. It is quiet when all is we
 and says exactly what is wrong when something is not. Swift, AppKit and SwiftUI,
 no third-party code, no Dock icon.
 
+Build with Xcode or Command Line Tools that include the macOS 26 SDK. The
+compiled app runs on macOS 14 or newer; glass effects use a material fallback
+before macOS 26.
+
 In the menu bar:
 
 - one dot per bot, filled when connected and hollow when not, next to a count
@@ -69,7 +73,7 @@ For a manual rollback after a successful install, from `menubar/`:
 
 ```sh
 launchctl bootout gui/$(id -u)/com.claude-fleet.menubar
-python3 app-lock.py python3 app-lock.py --restore-files \
+python3 app-lock.py --restore-files \
   .build.noindex/previous-install "$HOME/Applications/Telebots Bar.app" \
   "$HOME/Library/LaunchAgents/com.claude-fleet.menubar.plist"
 launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.claude-fleet.menubar.plist"
@@ -238,7 +242,7 @@ block in `fleet.json` (other tools ignore it):
   "restore_engine": "~/fleet/bin/my-restore.sh",
   "snapshot_file": "~/fleet/restart-state/snapshot.tsv",
   "snapshot_keep_watchdog": true,
-  "time_zone": "America/New_York"
+  "time_zone": "Europe/London"
 }
 ```
 
@@ -256,7 +260,7 @@ block in `fleet.json` (other tools ignore it):
 | `restore_engine` | `$FLEET_HOME/bin/fleet-restore` |
 | `snapshot_file` | `$FLEET_HOME/restart-state/snapshot.tsv` |
 | `snapshot_keep_watchdog` | `true`: Snapshot runs the engine with `--keep-watchdog`, so auto-recovery stays on. `false` lets the engine switch it off until Restore, as it does for a planned reboot |
-| `time_zone` | `America/New_York`, for the action log, uptimes and confirmations |
+| `time_zone` | The Mac's system time zone; override for the action log, uptimes and confirmations |
 
 An option this build does not know, or a value it cannot use, is logged once as a
 warning and ignored, so a config newer than the app still shows the fleet.

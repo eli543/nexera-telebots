@@ -163,7 +163,8 @@ session_age() {
 }
 
 # The final check: one bot as it is NOW, nothing remembered from before. Sets
-# FC_STATE (live | pending | failed) and FC_DETAIL. A fresh heartbeat is required.
+# FC_STATE (live | pending | failed) and FC_DETAIL. The pinned overlay needs a
+# fresh heartbeat; an upstream version change is checked by exact PIDs only.
 poller_belongs_to() {   # <poller pid> <session pid>, bounded parent-chain proof
   local child="$1" parent="$2" hops=0
   while [[ "$child" =~ ^[1-9][0-9]*$ ]] && [ "$child" -gt 1 ] && [ "$hops" -lt 16 ]; do
@@ -185,6 +186,13 @@ final_state() {   # final_state <state dir>
   wpid=$(poller_pid_for "$sdir")
   if [[ -z "$wpid" ]] || ! kill -0 "$wpid" 2>/dev/null; then
     FC_STATE=pending; FC_DETAIL="session pid $spid runs, but no Telegram poller runs for it"; return 0
+  fi
+  if [[ $(head -1 "$FLEET_HOME/overlay.status" 2>/dev/null) == VERSION_MISMATCH:* ]]; then
+    if ! poller_belongs_to "$wpid" "$spid"; then
+      FC_STATE=pending; FC_DETAIL="poller pid $wpid is not a child of session pid $spid"; return 0
+    fi
+    FC_STATE=live; FC_DETAIL="session pid $spid, poller pid $wpid, PID-only proof while overlay is paused"
+    return 0
   fi
   hb=$(head -1 "$sdir/poller.heartbeat" 2>/dev/null)
   if ! [[ "$hb" =~ ^[0-9]{1,12}$ ]]; then

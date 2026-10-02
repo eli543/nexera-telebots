@@ -1,0 +1,244 @@
+#!/usr/bin/python3
+"""transcribe-voice - print the transcript of an audio file (Whisper large-v3-turbo).
+
+Usage: transcribe-voice <audio-path> [language]    (language defaults to en)
+
+Prints only the transcript on stdout; errors go to stderr. Exit 0 on success,
+non-zero on failure. Same contract as the original bash wrapper.
+
+Warm path: asks the always-loaded daemon (LaunchAgent
+com.claude-fleet.voice) over $FLEET_HOME/voice/daemon.sock
+and waits up to 60 s for the answer (TRANSCRIBE_VOICE_DAEMON_TIMEOUT overrides,
+in seconds).
+
+Cold path: on any daemon problem it runs the original command, a fresh
+`mlx_whisper <file> --model mlx-community/whisper-large-v3-turbo --language <lang>
+--output-dir <tmp> --output-format txt` with HF_HUB_OFFLINE=1, and says so in one
+stderr line. On SIGTERM or SIGINT it stops that mlx_whisper run before exiting
+non-zero, so no orphaned transcription keeps running.
+
+Both paths trim each line exactly like the old wrapper's sed step, then apply
+the name fixes in $FLEET_HOME/voice/name-fixes.tsv (heard<TAB>correct,
+whole word, case-sensitive). TRANSCRIBE_VOICE_NO_FIXES=1 turns the fixes off.
+"""
+
+import json
+import os
+import re
+import signal
+import socket
+import sys
+import time
+
+MODEL = "mlx-community/whisper-large-v3-turbo"
+HOME = os.path.expanduser("~")
+FLEET_HOME = os.path.expanduser(os.environ.get("FLEET_HOME", "~/.claude/telegram-fleet"))
+SOCK_PATH = os.path.join(FLEET_HOME, "voice", "daemon.sock")
+FIXES_PATH = os.path.join(FLEET_HOME, "voice", "name-fixes.tsv")
+DEFAULT_TIMEOUT = 60.0
+# What [[:space:]] matches in the old wrapper's sed. That wrapper assigns the
+# language code to LANG, so sed runs in the C locale: space \t \n \v \f \r.
+SED_SPACE = " \t\n\v\f\r"
+
+
+class _Signals:
+    spawning = False  # between starting mlx_whisper and being ready to stop it
+    pending = 0       # a signal that arrived while spawning
+    stopping = False  # already on the way out because of a signal
+
+
+def _on_signal(signum, frame):
+    if _Signals.stopping:
+        return
+    if _Signals.spawning:
+        _Signals.pending = signum
+        return
+    _Signals.stopping = True
+    raise SystemExit(128 + signum)  # finally blocks stop mlx_whisper and clean up
+
+
+def ask_daemon(path, lang):
+    """Return (txt, None) from the daemon, or (None, reason) on any problem."""
+    try:
+        timeout = float(os.environ.get("TRANSCRIBE_VOICE_DAEMON_TIMEOUT") or DEFAULT_TIMEOUT)
+    except ValueError:
+        timeout = DEFAULT_TIMEOUT
+    if not timeout > 0:
+        timeout = DEFAULT_TIMEOUT
+    if not os.path.exists(SOCK_PATH):
+        return None, "no socket"
+    deadline = time.monotonic() + timeout
+    buf = b""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        sock.connect(SOCK_PATH)
+        sock.sendall(json.dumps({"path": path, "language": lang}).encode("ascii") + b"\n")
+        while b"\n" not in buf:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise socket.timeout
+            sock.settimeout(remaining)
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    except socket.timeout:
+        return None, f"no reply within {timeout:g}s"
+    except FileNotFoundError:
+        return None, "no socket"
+    except ConnectionRefusedError:
+        return None, "connection refused"
+    except OSError as exc:
+        return None, f"socket error: {exc.strerror or exc}"
+    finally:
+        sock.close()
+    if not buf:
+        return None, "daemon closed the connection without a reply"
+    try:
+        reply = json.loads(buf.split(b"\n", 1)[0])
+    except ValueError:
+        return None, "malformed reply"
+    if isinstance(reply, dict):
+        if reply.get("ok") is True and isinstance(reply.get("text"), str):
+            return reply["text"], None
+        if reply.get("ok") is False:
+            return None, "daemon error: " + " ".join(str(reply.get("error", "")).split())[:200]
+    return None, "malformed reply"
+
+
+def _stop_child(proc):
+    """Stop an interrupted mlx_whisper run: SIGTERM, then SIGKILL after 2 s."""
+    import subprocess
+
+    try:
+        proc.terminate()
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    except OSError:
+        pass
+
+
+def _run_child(cmd, env):
+    """Run mlx_whisper with its output discarded, like the old wrapper. Returns its exit code."""
+    import subprocess
+
+    proc = None
+    _Signals.spawning = True
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+    except OSError:
+        pass
+    finally:
+        _Signals.spawning = False
+    try:
+        if _Signals.pending:
+            _Signals.stopping = True
+            raise SystemExit(128 + _Signals.pending)
+        if proc is None:
+            return 127  # what bash reports for a command it cannot run
+        rc = proc.wait()
+        return 128 - rc if rc < 0 else rc  # killed by signal N: bash reports 128+N
+    finally:
+        if proc is not None and proc.poll() is None:
+            _stop_child(proc)
+
+
+def cold_path(audio, lang):
+    """Run the first installed local backend, with no remote audio service."""
+    import shutil
+    import subprocess
+    env = dict(os.environ)
+    env["PATH"] = ":".join((os.path.join(HOME, ".local", "bin"), "/opt/homebrew/bin", env.get("PATH", "")))
+    if sys.platform == "darwin" and os.uname().machine == "arm64" and shutil.which("mlx_whisper", path=env["PATH"]):
+        import tempfile
+        out_dir = tempfile.mkdtemp()
+        try:
+            rc = _run_child(["mlx_whisper", audio, "--model", MODEL, "--language", lang,
+                             "--output-dir", out_dir, "--output-format", "txt"], env)
+            if rc != 0:
+                return None, rc
+            names = [n for n in os.listdir(out_dir) if n.endswith(".txt")]
+            if len(names) != 1:
+                return None, 1
+            with open(os.path.join(out_dir, names[0]), "rb") as f:
+                return f.read().decode("utf-8", "surrogateescape"), 0
+        finally:
+            shutil.rmtree(out_dir, ignore_errors=True)
+    backend = os.path.join(os.path.dirname(__file__), "transcribe-voice-faster")
+    if os.path.isfile(backend):
+        proc = subprocess.run([sys.executable, backend, audio, lang],
+                              capture_output=True, text=True, check=False)
+        if proc.returncode == 0:
+            return proc.stdout, 0
+        if proc.stderr:
+            sys.stderr.write(proc.stderr)
+        return None, proc.returncode
+    sys.stderr.write("transcribe-voice: install mlx-whisper or faster-whisper first\n")
+    return None, 127
+
+
+def trim_lines(text):
+    """Same result as the old wrapper's: sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'"""
+    return "\n".join(line.strip(SED_SPACE) for line in text.split("\n"))
+
+
+def load_fixes(path):
+    """heard<TAB>correct rows; '#' lines are comments; a missing file means no fixes."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            rows = f.read().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+    fixes = []
+    for row in rows:
+        if not row.strip() or row.lstrip().startswith("#"):
+            continue
+        cols = row.split("\t")
+        if len(cols) < 2:
+            continue
+        heard, correct = cols[0].strip(), cols[1].strip()
+        if heard and correct:
+            fixes.append((re.compile(r"\b" + re.escape(heard) + r"\b"), correct))
+    return fixes
+
+
+def apply_fixes(text, fixes):
+    """Whole-word, case-sensitive replacements, applied in file order."""
+    for pattern, correct in fixes:
+        text = pattern.sub(lambda m, c=correct: c, text)
+    return text
+
+
+def main(argv):
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+    if len(argv) < 2:
+        sys.stderr.write("usage: transcribe-voice <audio-path> [language]\n")
+        return 2
+    audio = argv[1]
+    lang = argv[2] if len(argv) > 2 and argv[2] else "en"
+    if not os.path.isfile(audio):
+        sys.stderr.write(f"transcribe-voice: file not found: {audio}\n")
+        return 1
+
+    txt, reason = ask_daemon(os.path.abspath(audio), lang)
+    if txt is None:
+        sys.stderr.write(f"transcribe-voice: daemon unavailable ({reason}), used cold path\n")
+        sys.stderr.flush()
+        txt, code = cold_path(audio, lang)
+        if txt is None:
+            return code
+
+    text = trim_lines(txt)
+    if os.environ.get("TRANSCRIBE_VOICE_NO_FIXES") != "1":
+        text = apply_fixes(text, load_fixes(FIXES_PATH))
+    sys.stdout.buffer.write(text.encode("utf-8", "surrogateescape"))
+    sys.stdout.buffer.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

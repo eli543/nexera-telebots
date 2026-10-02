@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Optional warm voice model. Install only after the owner opts in. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.claude-fleet.voice</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__UV_TOOL_PYTHON__</string>
+    <string>__FLEET_HOME__/bin/transcribe-voice-daemon</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>FLEET_HOME</key><string>__FLEET_HOME__</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>__FLEET_HOME__/logs/voice-daemon.log</string>
+  <key>StandardErrorPath</key><string>__FLEET_HOME__/logs/voice-daemon.log</string>
+</dict>
+</plist>

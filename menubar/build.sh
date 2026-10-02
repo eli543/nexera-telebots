@@ -44,6 +44,15 @@ STAGE="$STAGED_DIR/$APP_NAME.app"
 PREVIOUS="$BUILD/previous"
 MIN_MACOS="14.0"
 
+# glassEffect is guarded for macOS 26 at runtime, but compiling its symbol
+# still requires the macOS 26 SDK or newer. The app itself runs on macOS 14+.
+SDK_VERSION="$(xcrun --show-sdk-version 2>/dev/null || true)"
+SDK_MAJOR="${SDK_VERSION%%.*}"
+if [[ ! "$SDK_MAJOR" =~ ^[0-9]+$ ]] || [ "$SDK_MAJOR" -lt 26 ]; then
+  echo "build.sh: Xcode or Command Line Tools with the macOS 26 SDK is required (found ${SDK_VERSION:-none}); the built app runs on macOS 14+." >&2
+  exit 1
+fi
+
 for tool in swiftc iconutil codesign ditto plutil python3; do
   command -v "$tool" >/dev/null 2>&1 || { echo "build.sh: $tool not found (install Xcode or the Command Line Tools)" >&2; exit 1; }
 done

@@ -1,20 +1,20 @@
 # Voice notes
 
-These scripts turn a Telegram voice or audio note into text so Claude can treat
-it as a normal prompt. Each one takes an audio path and prints only the
-transcript to stdout.
+These scripts turn a Telegram voice or audio note into text on the Mac. The
+poller runs `transcribe-voice <audio-path>` and forwards the transcript as the
+message. It prints only the transcript to stdout.
 
-The `voice-notes` skill wires this into the channel flow: when a message arrives
-with `attachment_kind` of `voice` or `audio`, Claude downloads the file with the
-plugin's `download_attachment` tool, runs the transcriber, and works from the
-transcript. Which script it runs is chosen by `fleet-config option voice`.
+The `voice-notes` skill handles a note when the poller cannot transcribe it.
+`fleet-config option voice` selects the backend. An `autotranscribe.off` marker
+in the bot's state directory disables poller transcription for that bot.
 
 ## Two backends
 
 | Script | Backend | Best on | Speed |
 |---|---|---|---|
-| `transcribe-voice-mlx` | mlx-whisper (`whisper-large-v3-turbo`) | Apple Silicon | ~1-2s warm |
-| `transcribe-voice-faster` | faster-whisper | any CPU or GPU | slower, portable |
+| `transcribe-voice` | Warm daemon, then an installed local backend | Any Mac | Depends on backend |
+| `transcribe-voice-mlx` | mlx-whisper (`whisper-large-v3-turbo`) | Apple Silicon | Fast after model load |
+| `transcribe-voice-faster` | faster-whisper | Intel Mac | Slower |
 
 The `voice` option in `fleet.json` selects the behavior:
 
@@ -38,18 +38,18 @@ decode the `.oga` files Telegram sends. The first run downloads the
 `whisper-large-v3-turbo` model (a few hundred MB), so the first transcription is
 slower than later ones.
 
-Anywhere else (Intel Mac, Linux, Windows):
+On an Intel Mac:
 
 ```
 pip install faster-whisper
 ```
 
-The first run downloads the model. On a GPU, set `TRANSCRIBE_COMPUTE=float16`
-for a large speedup.
+The first run downloads the model. Voice processing stays local.
 
 ## Usage
 
 ```
+transcribe-voice /path/to/note.oga
 transcribe-voice-mlx /path/to/note.oga
 transcribe-voice-faster /path/to/note.oga en
 ```
@@ -61,5 +61,12 @@ on the faster-whisper one.
 ## Notes
 
 - Voice transcription runs entirely on your machine. No audio leaves the Mac.
-- The installer copies both scripts into `$FLEET_HOME/bin` so they are on the
-  path the skill uses.
+- The warm daemon is optional and keeps the model in memory. Its LaunchAgent
+  template is `daemon/com.claude-fleet.voice.plist.template`; the installer
+  must replace `__UV_TOOL_PYTHON__` with the interpreter inside `uv tool dir`
+  and `__FLEET_HOME__` with the absolute fleet path. It is never loaded during
+  the standard install.
+- The daemon listens at `$FLEET_HOME/voice/daemon.sock` (mode 600). The client
+  falls back to mlx-whisper, then faster-whisper when the socket is unavailable.
+- Optional whole-word name corrections go in
+  `$FLEET_HOME/voice/name-fixes.tsv` as `heard<TAB>correct`.

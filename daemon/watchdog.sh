@@ -35,6 +35,8 @@ resolve_bin() {
 }
 FC_BIN="$(resolve_bin fleet-config)"
 FRESH="$(resolve_bin fleet-fresh)"
+VERIFY="$(resolve_bin verify-overlay.sh)"
+INSTALL_OVERLAY="$(resolve_bin install-overlay.sh)"
 fc() { "$FC_BIN" "$@"; }
 
 # ---- tunables (identical to the live watchdog) -----------------------------
@@ -57,7 +59,7 @@ ALERT_KEY="$(fc option alert_bot 2>/dev/null || true)"
 ALERT_STATE="$(fc bot "$ALERT_KEY" state_dir 2>/dev/null || true)"
 
 # Fleet-specific lock so parallel fleets (or a test run) never collide.
-LOCK="/tmp/nexera-telebots-watchdog-$(printf '%s' "$FLEET_HOME" | cksum | awk '{print $1}').lock"
+LOCK="$STATE/watchdog.lock"
 
 log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null || true; }
 say() { log "$*"; [ $DRY_RUN -eq 1 ] && printf '%s\n' "$*"; return 0; }
@@ -109,7 +111,9 @@ telegram_reachable() {
   local tok resp
   tok=$(token_of_state "$1"); [ -z "$tok" ] && return 0
   resp=$(curl -s --max-time 10 "https://api.telegram.org/bot${tok}/getWebhookInfo" 2>/dev/null)
-  case "$resp" in *'"ok"'*) return 0 ;; *) return 1 ;; esac
+  printf '%s' "$resp" | python3 -c 'import json,sys
+try: sys.exit(0 if json.load(sys.stdin).get("ok") is True else 1)
+except (ValueError,TypeError): sys.exit(1)'
 }
 
 restart_count_1h() {
@@ -199,6 +203,32 @@ if [ -f "$LOG" ] && [ "$(stat -f %z "$LOG" 2>/dev/null || echo 0)" -gt 1048576 ]
 fi
 
 now=$(date +%s)
+
+# The overlay is a fleet-wide prerequisite. A stock poller on a newer official
+# plugin has no Telebots heartbeat, so its PID is the only safe liveness proof.
+# Never try to apply the 0.0.7 seam to a different version.
+overlay_status=NOT_INSTALLED
+if [ -x "$VERIFY" ]; then
+  overlay_status=$("$VERIFY" --status 2>/dev/null || true)
+fi
+case "$overlay_status" in
+  OK|STOCK|MISSING_MODULE|TAMPERED|NOT_INSTALLED|VERSION_MISMATCH:*) ;;
+  *) overlay_status=TAMPERED ;;
+esac
+if [ "$overlay_status" = STOCK ] || [ "$overlay_status" = MISSING_MODULE ]; then
+  if [ "$DRY_RUN" -eq 0 ] && [ -x "$INSTALL_OVERLAY" ]; then
+    log "overlay $overlay_status: attempting the pinned 0.0.7 repair"
+    if "$INSTALL_OVERLAY" >> "$LOG" 2>&1; then
+      overlay_status=$("$VERIFY" --status 2>/dev/null || true)
+    fi
+  fi
+fi
+# Atomic status update, including on dry runs. Other engines read this token.
+printf '%s\n' "$overlay_status" > "$FLEET_HOME/overlay.status.tmp.$$"
+mv "$FLEET_HOME/overlay.status.tmp.$$" "$FLEET_HOME/overlay.status"
+pid_only=0
+case "$overlay_status" in VERSION_MISMATCH:*) pid_only=1 ;; esac
+
 healthy_n=0; acted_n=0; total=0
 for key in $(fc bots); do
   total=$((total+1))
@@ -207,6 +237,27 @@ for key in $(fc bots); do
   lr="$STATE/$key.last_restart"
   rl="$STATE/$key.restart_log"
   disabled="$STATE/$key.disabled"
+
+  if [ ! -f "$sdir/.enrolled" ]; then
+    say "$key: NOT ENROLLED, skipping"
+    continue
+  fi
+  if [ -f "$sdir/stopped" ]; then
+    say "$key: STOPPED by owner, skipping"
+    continue
+  fi
+
+  if [ "$pid_only" -eq 1 ]; then
+    version=${overlay_status#VERSION_MISMATCH:}
+    notice="$STATE/$key.overlay-alerted"
+    if [ ! -f "$notice" ] || [ "$(cat "$notice" 2>/dev/null)" != "$version" ]; then
+      say "$key: official Telegram plugin updated to $version; PID-only health"
+      if [ "$DRY_RUN" -eq 0 ]; then
+        alert "The official Telegram plugin updated to $version. Telebots extras are paused until Telebots supports it. Your bot still works." "$(token_of_state "$sdir")" "$(chat_id_of_state "$sdir")"
+        printf '%s\n' "$version" > "$notice"
+      fi
+    fi
+  fi
 
   if [ -f "$disabled" ]; then
     say "$key: DISABLED (manual override), skipping"
@@ -219,7 +270,7 @@ for key in $(fc bots); do
   # Mode (a): both PIDs exist but the heartbeat says polling stopped. No heartbeat
   # file = poller predates the liveness patch: fall back to PID-only (rollout-safe).
   hb_stale=0; hb_reason=""
-  if [ -n "$spid" ] && [ -n "$wpid" ] && [ -f "$sdir/poller.heartbeat" ]; then
+  if [ "$pid_only" -eq 0 ] && [ "$overlay_status" = OK ] && [ -n "$spid" ] && [ -n "$wpid" ] && [ -f "$sdir/poller.heartbeat" ]; then
     hbts=$(head -1 "$sdir/poller.heartbeat" 2>/dev/null | tr -cd '0-9')
     if [ -n "$hbts" ] && [ $(( now - hbts )) -gt "$HEARTBEAT_MAX_AGE" ]; then
       if [ $DRY_RUN -eq 1 ]; then
@@ -235,7 +286,7 @@ for key in $(fc bots); do
   if [ -n "$spid" ] && [ -n "$wpid" ] && [ $hb_stale -eq 0 ]; then
     healthy_n=$((healthy_n+1))
     [ -f "$us" ] && { [ $DRY_RUN -eq 0 ] && rm -f "$us"; log "$key: recovered, healthy again"; }
-    say "$key: healthy (session=$spid poller=$wpid)"
+    say "$key: healthy (session=$spid poller=$wpid${pid_only:+, overlay=$overlay_status})"
     [ $DRY_RUN -eq 0 ] && check_stall "$key" "$sdir"
     continue
   fi
@@ -246,6 +297,12 @@ for key in $(fc bots); do
 
   if [ $DRY_RUN -eq 1 ]; then
     say "$key: UNHEALTHY ($reason) - [DRY-RUN] would restart, no action taken"
+    continue
+  fi
+
+  # A missing or tampered overlay is not a reason to launch an unverified bot.
+  if [ "$overlay_status" != OK ] && [ "$pid_only" -eq 0 ]; then
+    log "$key: overlay=$overlay_status, recovery held"
     continue
   fi
 
