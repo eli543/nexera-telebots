@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ESNext", "DOM", "DOM.Iterable", "DOM.AsyncIterable"],
+    "types": ["bun-types"],
+    "typeRoots": ["./node_modules", "./node_modules/@types"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
+    "paths": {
+      "grammy": ["./node_modules/grammy"],
+      "grammy/types": ["./node_modules/grammy/out/types.d.ts"],
+      "@modelcontextprotocol/sdk/*": ["./node_modules/@modelcontextprotocol/sdk/dist/esm/*"],
+      "zod": ["./node_modules/zod"]
+    }
+  },
+  "include": ["./*.ts", "../tests/poller/*.ts"]
+}

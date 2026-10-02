@@ -1,0 +1,2 @@
+# Blank context lines in a unified diff contain one required space.
+seam-0.0.7.patch whitespace=-blank-at-eol
