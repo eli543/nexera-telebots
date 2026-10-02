@@ -1,0 +1,27 @@
+name: Upstream Telegram plugin watch
+
+on:
+  schedule:
+    - cron: '17 12 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare-server:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compare upstream server.ts with the supported pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected='d902d7195a527b579b889cfdbf251fc24fd224a68e319ac6b7c3b691515c3458'
+          url='https://raw.githubusercontent.com/anthropics/claude-plugins-official/main/external_plugins/telegram/server.ts'
+          curl --fail --location --silent --show-error "$url" --output server.ts
+          actual="$(sha256sum server.ts | awk '{print $1}')"
+          if [ "$actual" != "$expected" ]; then
+            printf 'Upstream Telegram server.ts changed. Pinned: %s Current: %s\n' "$expected" "$actual" >&2
+            exit 1
+          fi
+          printf 'Upstream Telegram server.ts matches the supported pin.\n'

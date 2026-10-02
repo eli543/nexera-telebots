@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${TELEBOTS_TRANSCRIBE_FAIL:-0}" = 1 ]; then exit 1; fi
+printf 'A known voice note from the sandbox.\n'

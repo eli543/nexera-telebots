@@ -1,310 +1,208 @@
 #!/usr/bin/env bash
-#
-# install.sh - bootstrap nexera-telebots from a bare shell.
-#
-# Installs the daemon layer (watchdog + snapshot/restore engines) into FLEET_HOME
-# and, with your consent, the official plugin, this repo's plugin, the launchd
-# watchdog, the optional server.ts patches, and the voice dependencies.
-#
-# Idempotent: safe to run again. Nothing here inlines a token or a chat id.
-#
-# Usage:
-#   ./install.sh [--yes] [--dry-run] [--help]
-#     --yes       non-interactive; take the sane default at every prompt
-#     --dry-run   print every action without executing anything
-#     --help      show this help
-#
-# Env:
-#   FLEET_HOME   install root (default ~/.claude/telegram-fleet)
-#
+# Install Nexera Telebots on macOS. No bot or watchdog is started here.
+# Usage: ./install.sh [--yes] [--dry-run] [--help]
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
-PLIST_LABEL="com.claude-fleet.watchdog"
-PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
-MIN_CLAUDE="2.1.80"
-
 YES=0
 DRY_RUN=0
 
 usage() {
-  sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  printf 'Usage: ./install.sh [--yes] [--dry-run] [--help]\n'
+  printf '  --yes       accept optional voice dependencies when available\n'
+  printf '  --dry-run   print the complete install plan without changing files\n'
 }
-
-while [ $# -gt 0 ]; do
+while [ "$#" -gt 0 ]; do
   case "$1" in
     --yes|-y) YES=1 ;;
     --dry-run|-n) DRY_RUN=1 ;;
     --help|-h) usage; exit 0 ;;
-    *) printf 'unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
 
-# ---- output helpers ---------------------------------------------------------
-
-step() { printf '\n==> %s\n' "$*"; }
+say() { printf '\n==> %s\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
-
-# Print an action, then run it unless --dry-run.
 run() {
-  printf '    + %s\n' "$*"
-  if [ "$DRY_RUN" -eq 0 ]; then
-    "$@"
-  fi
+  printf '    +'; printf ' %q' "$@"; printf '\n'
+  if [ "$DRY_RUN" -eq 0 ]; then "$@"; fi
 }
-
-# Write a single-line value to a file, respecting --dry-run.
-write_value() {
-  local path="$1" value="$2"
-  printf '    + write %s <- %s\n' "$path" "$value"
-  if [ "$DRY_RUN" -eq 0 ]; then
-    printf '%s\n' "$value" > "$path"
-  fi
-}
-
-# Ask a yes/no question. Non-interactive (--yes or --dry-run) takes the default.
-# confirm "Question?" Y|N
 confirm() {
-  local prompt="$1" default="${2:-Y}" reply hint
-  if [ "$default" = "Y" ]; then hint="Y/n"; else hint="y/N"; fi
-  if [ "$YES" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
-    printf '    ? %s [%s] -> %s (non-interactive)\n' "$prompt" "$hint" "$default"
-    [ "$default" = "Y" ]
-    return
-  fi
-  printf '    ? %s [%s] ' "$prompt" "$hint"
-  read -r reply || reply=""
-  reply="${reply:-$default}"
-  case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+  local prompt="$1" answer
+  if [ "$DRY_RUN" -eq 1 ]; then note "$prompt: optional, no action in dry run"; return 1; fi
+  if [ "$YES" -eq 1 ]; then return 0; fi
+  printf '    ? %s [y/N] ' "$prompt"
+  read -r answer || answer=""
+  case "$answer" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
-
-# Compare dotted numeric versions: version_ge A B is true when A >= B.
 version_ge() {
-  local a="$1" b="$2" i x y
-  local av bv
-  IFS=. read -r -a av <<< "$a"
-  IFS=. read -r -a bv <<< "$b"
-  for i in 0 1 2; do
-    x="${av[$i]:-0}"; y="${bv[$i]:-0}"
-    x="${x//[!0-9]/}"; y="${y//[!0-9]/}"
-    x="${x:-0}"; y="${y:-0}"
-    if [ "$x" -gt "$y" ]; then return 0; fi
-    if [ "$x" -lt "$y" ]; then return 1; fi
-  done
-  return 0
+  local old_ifs="$IFS" current="$1" minimum="$2" a b c x y z
+  IFS=. read -r a b c <<< "$current"
+  IFS=. read -r x y z <<< "$minimum"
+  IFS="$old_ifs"
+  a="${a:-0}"; b="${b:-0}"; c="${c:-0}"
+  x="${x:-0}"; y="${y:-0}"; z="${z:-0}"
+  if [ "$a" -ne "$x" ]; then [ "$a" -gt "$x" ]; return; fi
+  if [ "$b" -ne "$y" ]; then [ "$b" -gt "$y" ]; return; fi
+  [ "$c" -ge "$z" ]
 }
 
-# ---- preflight (read-only; always runs) -------------------------------------
-
-step "Preflight checks"
-
-IS_MAC=0
-if [ "$(uname -s)" = "Darwin" ]; then
-  IS_MAC=1
-  note "macOS detected."
-else
-  note "Not macOS. The daemon layer (launchd watchdog, snapshot/restore) is"
-  note "macOS-only and will be skipped. The plugin and hooks may still work."
+# A platform error takes precedence over all checks and every write.
+if [ "$(uname -s)" != Darwin ]; then
+  printf 'Nexera Telebots runs on macOS only.\n' >&2
+  exit 1
 fi
+case "$FLEET_HOME" in /*) ;; *) printf 'FLEET_HOME must be an absolute path.\n' >&2; exit 2 ;; esac
 
-IS_ARM=0
-if [ "$(uname -m)" = "arm64" ]; then
-  IS_ARM=1
-  note "Apple Silicon detected (local voice via mlx-whisper is available)."
-else
-  note "Not Apple Silicon. Voice will use faster-whisper if you enable it."
+say "Preflight"
+note "macOS detected. Install root: $FLEET_HOME"
+mac_version="$(sw_vers -productVersion 2>/dev/null || printf '0.0')"
+note "macOS version: $mac_version (14 or newer required)."
+if ! version_ge "$mac_version" 14.0; then
+  note "Upgrade macOS before using Telebots."
+  if [ "$DRY_RUN" -eq 0 ]; then exit 1; fi
 fi
-
 if command -v claude >/dev/null 2>&1; then
-  CLAUDE_VER="$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
-  CLAUDE_VER="${CLAUDE_VER:-0.0.0}"
-  if version_ge "$CLAUDE_VER" "$MIN_CLAUDE"; then
-    note "Claude Code $CLAUDE_VER (>= $MIN_CLAUDE required for channels). OK."
-  else
-    note "Claude Code $CLAUDE_VER is older than $MIN_CLAUDE. Channels need $MIN_CLAUDE or newer."
-    note "Upgrade Claude Code before using the channel."
+  claude_version="$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)"
+  note "Claude Code: ${claude_version:-version unavailable}"
+  if [ -n "$claude_version" ] && ! version_ge "$claude_version" 2.1.224; then
+    note "Cross-bot handoff needs Claude Code 2.1.224 or newer."
   fi
 else
-  note "Claude Code CLI not found on PATH. Install it and authenticate first:"
-  note "  https://code.claude.com/docs"
-  if [ "$DRY_RUN" -eq 0 ]; then
-    exit 1
-  fi
+  note "Claude Code is missing. Install it and sign in before installing Telebots."
+  if [ "$DRY_RUN" -eq 0 ]; then exit 1; fi
 fi
-
 if command -v bun >/dev/null 2>&1; then
-  note "Bun $(bun --version 2>/dev/null || echo '?') present. OK."
-else
-  note "Bun not found. The official plugin's MCP server requires it."
-  if confirm "Install Bun now (curl -fsSL https://bun.sh/install | bash)?" Y; then
-    run bash -c 'curl -fsSL https://bun.sh/install | bash'
-  else
-    note "Skipping Bun. Install it before starting a bot: https://bun.sh"
+  bun_version="$(bun --version 2>/dev/null || printf '0.0')"
+  note "Bun: $bun_version (1.3 or newer required)."
+  if ! version_ge "$bun_version" 1.3; then
+    if [ "$DRY_RUN" -eq 0 ]; then exit 1; fi
   fi
+else
+  note "Bun is missing. Install it before installing Telebots."
+  if [ "$DRY_RUN" -eq 0 ]; then exit 1; fi
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  note "Python 3 is missing."
+  if [ "$DRY_RUN" -eq 0 ]; then exit 1; fi
+fi
+overlay="$REPO_DIR/poller/install-overlay.sh"
+verify="$REPO_DIR/poller/verify-overlay.sh"
+if [ "$DRY_RUN" -eq 0 ]; then
+  for required in "$REPO_DIR/engine" "$REPO_DIR/daemon/watchdog.sh" \
+    "$REPO_DIR/daemon/watchdog-loop.sh" "$overlay" "$verify" "$REPO_DIR/poller/ux.json"; do
+    if [ ! -e "$required" ]; then
+      printf 'Required install component is missing: %s\n' "$required" >&2
+      exit 1
+    fi
+  done
 fi
 
-# ---- FLEET_HOME layout ------------------------------------------------------
-
-step "Create FLEET_HOME at $FLEET_HOME"
+say "Install directories and scripts"
 run mkdir -p "$FLEET_HOME/bin" "$FLEET_HOME/logs" "$FLEET_HOME/watchdog-state" "$FLEET_HOME/restart-state"
-
-step "Install engine, daemon, and voice scripts into $FLEET_HOME/bin"
-if [ -d "$REPO_DIR/engine" ]; then
-  run cp -R "$REPO_DIR/engine/." "$FLEET_HOME/bin/"
-else
-  note "engine/ not found in the repo; skipping (expected in a partial checkout)."
-fi
-if [ -f "$REPO_DIR/daemon/watchdog.sh" ]; then
-  run cp "$REPO_DIR/daemon/watchdog.sh" "$REPO_DIR/daemon/watchdog-loop.sh" "$FLEET_HOME/bin/"
-else
-  note "daemon/ scripts not found; skipping the watchdog binaries."
-fi
-if [ -f "$REPO_DIR/voice/transcribe-voice-mlx" ]; then
-  run cp "$REPO_DIR/voice/transcribe-voice-mlx" "$REPO_DIR/voice/transcribe-voice-faster" "$FLEET_HOME/bin/"
-fi
-# Optional window-grid extra: installed under the name fleet-launch calls.
+run cp -R "$REPO_DIR/engine/." "$FLEET_HOME/bin/"
+run cp "$REPO_DIR/daemon/watchdog.sh" "$REPO_DIR/daemon/watchdog-loop.sh" "$FLEET_HOME/bin/"
+for voice_script in transcribe-voice transcribe-voice-mlx transcribe-voice-faster transcribe-voice-daemon; do
+  if [ -f "$REPO_DIR/voice/$voice_script" ]; then run cp "$REPO_DIR/voice/$voice_script" "$FLEET_HOME/bin/"; fi
+done
 if [ -f "$REPO_DIR/extras/macos-window-grid/grid.sh" ]; then
   run cp "$REPO_DIR/extras/macos-window-grid/grid.sh" "$FLEET_HOME/bin/fleet-grid"
 fi
-run find "$FLEET_HOME/bin" -type f -exec chmod +x {} +
+note "Set installed script permissions to executable."
+if [ "$DRY_RUN" -eq 0 ]; then find "$FLEET_HOME/bin" -type f -exec chmod +x {} +; fi
 
-# ---- config -----------------------------------------------------------------
-
-step "Fleet config"
+say "Fleet configuration"
 if [ -f "$FLEET_HOME/fleet.json" ]; then
-  note "fleet.json already exists; keeping it."
+  note "Keep existing fleet.json."
 else
-  run cp "$REPO_DIR/config/fleet.example.json" "$FLEET_HOME/fleet.json"
-  note "Wrote a single-bot fleet.json. Edit it, or run /telegram-fleet:setup"
-  note "inside a Claude Code session for the guided version."
+  note "Write fleet.json version 2 with an empty bots list. No bot is created."
+  if [ "$DRY_RUN" -eq 0 ]; then
+    (umask 077; cat > "$FLEET_HOME/fleet.json" <<'JSON'
+{
+  "version": 2,
+  "bots": [],
+  "options": {
+    "watchdog": true,
+    "voice": "auto",
+    "voice_daemon": false,
+    "tldr_judge": false,
+    "grid": false,
+    "notes_dir": "~/Telebots Notes",
+    "rich_stream": true,
+    "guardian_thresholds": "60,70,80,90",
+    "email": false
+  }
+}
+JSON
+    )
+  fi
 fi
-
-# ---- permission stance ------------------------------------------------------
-
-step "Permission stance"
-STANCE="safe"
 if [ -f "$FLEET_HOME/permission-stance" ]; then
-  STANCE="$(cat "$FLEET_HOME/permission-stance" 2>/dev/null || echo safe)"
-  note "Existing stance: $STANCE (leaving as is; edit $FLEET_HOME/permission-stance to change)."
+  note "Keep existing permission stance."
 else
-  note "safe    normal permission prompts (recommended default)"
-  note "scoped  pre-allow a common read/edit set"
-  note "full    --dangerously-skip-permissions (near-shell access; see SECURITY.md)"
-  if [ "$YES" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-    printf '    ? stance [safe/scoped/full] (safe) '
-    read -r reply || reply=""
-    case "$reply" in scoped) STANCE="scoped" ;; full) STANCE="full" ;; *) STANCE="safe" ;; esac
+  note "Write safe permission stance. Change it later for the entire fleet if needed."
+  if [ "$DRY_RUN" -eq 0 ]; then
+    (umask 077; printf 'safe\n' > "$FLEET_HOME/permission-stance")
   fi
-  write_value "$FLEET_HOME/permission-stance" "$STANCE"
-fi
-if [ "$STANCE" = "full" ]; then
-  note "WARNING: 'full' lets any allowlisted user run commands with no prompt."
-  note "Run the bots under a dedicated macOS user or a scoped directory."
 fi
 
-# ---- plugins ----------------------------------------------------------------
-
-step "Install the official plugin and this plugin"
-if command -v claude >/dev/null 2>&1; then
-  if confirm "Add the official marketplace and install telegram@claude-plugins-official?" Y; then
-    run claude plugin marketplace add anthropics/claude-plugins-official || true
-    run claude plugin install telegram@claude-plugins-official || true
-  fi
-  if confirm "Add this repo as a marketplace and install telegram-fleet?" Y; then
-    run claude plugin marketplace add "$REPO_DIR" || true
-    run claude plugin install telegram-fleet@nexera-telebots || true
-  fi
-  note "After installing, run /reload-plugins inside a session if it is open."
+say "Install official Telegram plugin and Telebots plugin"
+stock_slot="$HOME/.claude/plugins/cache/claude-plugins-official/telegram/0.0.7/.claude-plugin/plugin.json"
+if [ -f "$stock_slot" ]; then
+  note "Official Telegram plugin 0.0.7 cache is present. Keep it."
 else
-  note "Skipping plugin install (no claude CLI). Install the plugin from a session:"
-  note "  /plugin marketplace add eli543/nexera-telebots"
-  note "  /plugin install telegram-fleet@nexera-telebots"
+  if ! run claude plugin marketplace add anthropics/claude-plugins-official; then
+    note "Official marketplace may already be registered; continuing to the required plugin install."
+  fi
+  run claude plugin install telegram@claude-plugins-official
+fi
+if ! run claude plugin marketplace add "$REPO_DIR"; then
+  note "Local marketplace may already be registered; continuing to the required plugin install."
+fi
+run claude plugin install telegram-fleet@nexera-telebots
+
+say "Apply the required overlay to your local official plugin"
+note "The overlay accepts only the pinned stock 0.0.7 file or an already installed overlay."
+note "It backs up stock server.ts and refuses version drift or tampering."
+run bash "$overlay"
+if [ "$DRY_RUN" -eq 0 ]; then
+  status="$(bash "$verify" --status)" || {
+    printf 'Overlay verification failed: %s\n' "$status" >&2
+    exit 1
+  }
+  [ "$status" = OK ] || { printf 'Overlay verification failed: %s\n' "$status" >&2; exit 1; }
+else
+  note "Verify overlay status is OK after installation."
 fi
 
-# ---- daemon -----------------------------------------------------------------
+say "Install menu and reaction table"
+run cp "$REPO_DIR/poller/ux.json" "$FLEET_HOME/ux.json"
 
-step "Watchdog daemon (launchd)"
-if [ "$IS_MAC" -eq 1 ] && [ -f "$REPO_DIR/daemon/com.claude-fleet.watchdog.plist.template" ]; then
-  note "This installs a launchd agent that keeps your bots alive."
-  note "Label: $PLIST_LABEL"
-  note "Plist: $PLIST_PATH"
-  note "It will run: launchctl bootout gui/$(id -u)/$PLIST_LABEL (if loaded), then bootstrap."
-  if confirm "Install and load the watchdog now?" Y; then
-    run mkdir -p "$HOME/Library/LaunchAgents"
-    if [ "$DRY_RUN" -eq 0 ]; then
-      sed "s|__FLEET_HOME__|$FLEET_HOME|g" \
-        "$REPO_DIR/daemon/com.claude-fleet.watchdog.plist.template" > "$PLIST_PATH"
+say "Optional voice dependencies"
+if command -v uv >/dev/null 2>&1 && command -v brew >/dev/null 2>&1; then
+  if [ "$(uname -m)" = arm64 ]; then
+    note "uv and Homebrew are available. Apple Silicon voice can use mlx-whisper and ffmpeg."
+    if confirm "Install mlx-whisper and ffmpeg now?"; then
+      run uv tool install mlx-whisper
+      run brew install ffmpeg
     fi
-    printf '    + render %s (substitute __FLEET_HOME__)\n' "$PLIST_PATH"
-    run launchctl bootout "gui/$(id -u)/$PLIST_LABEL" || true
-    run launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
-    note "Loaded. Check $FLEET_HOME/logs/watchdog.log for a heartbeat."
   else
-    note "Skipped. Install later with /telegram-fleet:install-daemon."
+    note "uv and Homebrew are available. On an Intel Mac, use the faster-whisper backend."
+    note "Install ffmpeg and faster-whisper separately before enabling voice transcription."
   fi
 else
-  note "Skipping the daemon (not macOS, or the plist template is not in this checkout)."
+  note "Voice extras skipped: install both uv and Homebrew first, then mlx-whisper and ffmpeg."
+  note "Text chat works without them. The voice-notes fallback remains available."
 fi
 
-# ---- optional patches -------------------------------------------------------
-
-step "Optional server.ts patches (mid-task /fresh + /model, /esc, /opus /fable, /context /usage, command menu)"
-if [ -f "$REPO_DIR/patches/apply-patches.sh" ]; then
-  note "These modify your local copy of the official plugin and are wiped by a"
-  note "plugin update. Idle-path /fresh /resume /model work without them; /esc,"
-  note "/opus, /fable, /context, /usage, and the '/' menu exist only with them."
-  if confirm "Apply the optional patches now?" N; then
-    run bash "$REPO_DIR/patches/apply-patches.sh"
-  else
-    note "Skipped. Apply later with: bash patches/apply-patches.sh"
-  fi
-else
-  note "No patches/apply-patches.sh in this checkout; skipping."
-fi
-
-# ---- voice ------------------------------------------------------------------
-
-step "Voice transcription dependencies"
-if [ "$IS_ARM" -eq 1 ]; then
-  if confirm "Install mlx-whisper and ffmpeg for local voice notes?" Y; then
-    if command -v uv >/dev/null 2>&1; then
-      run uv tool install mlx-whisper || true
-    else
-      note "uv not found; install it first: https://docs.astral.sh/uv/"
-    fi
-    if command -v brew >/dev/null 2>&1; then
-      run brew install ffmpeg || true
-    else
-      note "Homebrew not found; install ffmpeg by hand for audio decoding."
-    fi
-  fi
-else
-  if confirm "Install faster-whisper for voice notes on this hardware?" N; then
-    run bash -c 'pip install faster-whisper' || true
-  fi
-fi
-
-# ---- doctor -----------------------------------------------------------------
-
-step "Health check"
-if [ -x "$FLEET_HOME/bin/fleet-doctor" ]; then
-  run "$FLEET_HOME/bin/fleet-doctor" || true
-else
-  note "fleet-doctor not installed yet; run /telegram-fleet:doctor later."
-fi
-
-# ---- next steps -------------------------------------------------------------
-
-step "Next steps"
-note "1. Create a bot with @BotFather (/newbot) and copy its token."
-note "2. Write the token into each bot's .env, or run /telegram:configure <token>."
-note "3. DM your bot, then run /telegram:access pair <code> in your terminal."
-note "4. Lock down: /telegram:access policy allowlist."
-note "5. Start a bot: $FLEET_HOME/bin/fleet-launch main"
-note ""
-note "Read SECURITY.md before you widen the permission stance."
-if [ "$DRY_RUN" -eq 1 ]; then
-  printf '\n(dry run: nothing above was executed)\n'
-fi
+say "Next steps"
+note "1. Create one bot in @BotFather on your phone. Keep its token out of chats."
+note "2. Run $FLEET_HOME/bin/fleet-add-bot main and paste the token into its hidden prompt."
+note "3. Run $FLEET_HOME/bin/fleet-start main, then $FLEET_HOME/bin/fleet-pair main <code> --lock."
+note "4. At the Mac, run $FLEET_HOME/bin/fleet-checklist --consent, then install the watchdog."
+note "   In Claude Code, /telegram-fleet:install-daemon loads the watchdog after pairing."
+note "5. Run $FLEET_HOME/bin/fleet-checklist main and follow its phone steps."
+note "No bot was started and no watchdog was loaded by this installer."
+if [ "$DRY_RUN" -eq 1 ]; then note "Dry run: no files or services were changed."; fi

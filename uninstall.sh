@@ -19,9 +19,12 @@
 #
 set -euo pipefail
 
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
 PLIST_LABEL="com.claude-fleet.watchdog"
 PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
+VOICE_PLIST_LABEL="com.claude-fleet.voice"
+VOICE_PLIST_PATH="$HOME/Library/LaunchAgents/${VOICE_PLIST_LABEL}.plist"
 
 PURGE=0
 YES=0
@@ -105,11 +108,19 @@ EOF
 # ---- watchdog ---------------------------------------------------------------
 
 step "Stop and remove the watchdog daemon"
-if [ -f "$PLIST_PATH" ] || launchctl print "gui/$(id -u)/$PLIST_LABEL" >/dev/null 2>&1; then
+if [ -f "$PLIST_PATH" ]; then
   run launchctl bootout "gui/$(id -u)/$PLIST_LABEL" || true
   run rm -f "$PLIST_PATH"
 else
-  note "No watchdog plist loaded; nothing to bootout."
+  note "No watchdog plist found."
+fi
+
+step "Stop and remove the optional voice agent"
+if [ -f "$VOICE_PLIST_PATH" ]; then
+  run launchctl bootout "gui/$(id -u)/$VOICE_PLIST_LABEL" || true
+  run rm -f "$VOICE_PLIST_PATH"
+else
+  note "No voice agent plist found."
 fi
 
 # ---- bot sessions -----------------------------------------------------------
@@ -130,6 +141,14 @@ else
 fi
 
 # ---- plugin -----------------------------------------------------------------
+
+step "Restore the official Telegram plugin"
+if [ -f "$REPO_DIR/poller/restore-stock.sh" ]; then
+  run bash "$REPO_DIR/poller/restore-stock.sh"
+else
+  note "poller/restore-stock.sh is missing. Keep the plugin installed until its stock file is restored."
+  if [ "$DRY_RUN" -eq 0 ]; then exit 1; fi
+fi
 
 step "Uninstall the plugin"
 if command -v claude >/dev/null 2>&1; then
