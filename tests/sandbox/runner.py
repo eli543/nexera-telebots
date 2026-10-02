@@ -262,8 +262,22 @@ def snapshot(real_home: Path | None, main: Path | None) -> dict[str, object]:
             found[str(path)] = items
     if main:
         for verb in (["rev-parse", "HEAD"], ["status", "--short"], ["branch", "--show-current"]):
-            r = subprocess.run(["/usr/bin/git", "-C", str(main), *verb], text=True, capture_output=True, check=False)
+            r = subprocess.run(["/usr/bin/git", "-C", str(main), *verb], text=True,
+                               capture_output=True, check=False,
+                               env={"HOME": str(real_home or Path.home()), "PATH": "/usr/bin:/bin"})
             found["git:" + " ".join(verb)] = (r.returncode, r.stdout)
+    try:
+        process_list = subprocess.run(["/bin/ps", "-axo", "pid=,command="], text=True,
+                                      capture_output=True, check=False,
+                                      env={"HOME": str(real_home or Path.home()), "PATH": "/usr/bin:/bin"})
+    except OSError:
+        process_list = None
+    if process_list is None or process_list.returncode:
+        found["live-daemon-pids"] = "unavailable"
+    else:
+        matches = ("channel-watchdog-loop", "Telebots Bar", "transcribe-voice-daemon")
+        found["live-daemon-pids"] = sorted({line.split(None, 1)[0] for line in process_list.stdout.splitlines()
+                                           if any(name in line for name in matches) and line.split()})
     return found
 
 
@@ -335,14 +349,20 @@ def main() -> int:
             print(f"  {number:02d} {status} {title}: {detail}", flush=True)
         (pass_dir / "results.json").write_text(json.dumps(results, indent=2) + "\n")
     after = snapshot(args.real_home, args.main_checkout)
-    untouched = before == after
-    print(f"UNTOUCHED {'PASS' if untouched else 'FAIL'}", flush=True)
-    if not untouched:
+    files_untouched = before == after
+    pid_verified = before.get("live-daemon-pids") != "unavailable"
+    state = "PASS" if files_untouched and pid_verified else "PARTIAL" if files_untouched else "FAIL"
+    print(f"UNTOUCHED {state}", flush=True)
+    if not pid_verified:
+        print("  live daemon PID check unavailable in this execution sandbox", flush=True)
+    if not files_untouched:
         for key in before.keys() | after.keys():
             if before.get(key) != after.get(key):
                 print(f"  changed: {key}", flush=True)
+                if key == "live-daemon-pids":
+                    print(f"  daemon PIDs before={before.get(key)} after={after.get(key)}", flush=True)
     print("TOTAL " + " ".join(f"{k}={v}" for k, v in total.items()), flush=True)
-    return 0 if untouched and not total["FAIL"] and (args.phase1 or not total["STUB"]) else 1
+    return 0 if files_untouched and not total["FAIL"] and (args.phase1 or (not total["STUB"] and pid_verified)) else 1
 
 
 if __name__ == "__main__":
