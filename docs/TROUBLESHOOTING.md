@@ -1,122 +1,37 @@
 # Troubleshooting
 
-Start with `/telegram-fleet:doctor`. It checks the Claude Code version, Bun,
-the official plugin, the config, and per-bot liveness, and prints a green or red
-table. Most problems below show up there first.
+Start with `~/.claude/telegram-fleet/bin/fleet-doctor`. It checks the official plugin version, overlay, bot config, token validity, duplicate tokens, Claude Code version and per-bot health. Then run `~/.claude/telegram-fleet/bin/fleet-checklist <key>` for a per-feature result. Report `PASS`, `FAIL` or an explained `SKIP` for each applicable row; an installed file alone does not prove phone delivery.
 
-## A bot stops replying, or you see 409 Conflict in the logs
+## The bot does not reply or pairing never arrives
 
-Telegram allows exactly one `getUpdates` consumer per bot token. Two pollers on
-the same token fight over it and one gets a 409 Conflict. This is the most common
-failure.
+Check the bot's MCP log and its `<state_dir>/logs/poller-events.log`. A poller error may be in the MCP log, not in the visible Terminal window. Check `fleet-doctor` for `getMe`, the session, poller and heartbeat. If Bun is missing, install it from [Bun's instructions](https://bun.sh/docs/installation) and restart this bot. If the token is invalid, revoke or replace it through BotFather and a hidden local prompt; never paste it into chat.
 
-Causes and fixes:
+Telegram permits one `getUpdates` consumer per token. A 409 Conflict often means the same token is in two bot configs or two channel sessions are polling it. `fleet-doctor` checks duplicate tokens. Identify any extra process by exact PID, state directory and parent before stopping it. Never kill by a name pattern. A 401 response usually means the token was revoked or copied incorrectly.
 
-- Two sessions for one bot. You started the bot twice, or a stale session never
-  died. Find the pollers for that bot and keep one:
-  `ps -axo pid,command | grep server.ts`. Identify the extra one by its working
-  directory, then `kill <pid>` the specific PID. Never pattern-kill.
-- The same token in two `.env` files. Two bots must never share a token. Check
-  each `~/.claude/channels/fleet-<key>/.env`.
-- A leftover poller from a crash. `/fresh` on the affected bot, or let the
-  watchdog restart it, clears it.
+## Overlay is not OK
 
-## The channel never connects
+`poller/verify-overlay.sh --status` returns `OK`, `STOCK`, `MISSING_MODULE`, `TAMPERED`, `VERSION_MISMATCH:<version>` or `NOT_INSTALLED`. The installer and doctor explain the same status. An unsupported upstream version must not be patched by force. When Anthropic changes the official plugin, Telebots extras pause and the watchdog switches to PID-only checks; the stock channel may still reply. Update this project when it supports that version. If the same 0.0.7 slot was replaced by stock, the guarded overlay installer can reapply the seam after checking its hash.
 
-Almost always Bun. The official plugin's MCP server runs on Bun, and without it
-the channel fails quietly.
+The overlay is required for mid-task controls, the 13-command menu, tap callbacks, reactions and poller voice. The old 0.0.6 patch scripts no longer apply. If the plugin was installed while an ordinary Claude Code session was open, run `/reload-plugins` in that session to load this project's slash commands; restart only the bot being checked if its poller needs the new overlay.
 
-- Confirm Bun is installed: `bun --version`. If missing:
-  `curl -fsSL https://bun.sh/install | bash`, then restart the session.
-- Confirm you launched with the channel flag. The session must run
-  `claude --channels plugin:telegram@claude-plugins-official`. The fleet launcher
-  does this for you; a hand-started `claude` does not.
-- Confirm the token is set. Each bot reads `TELEGRAM_BOT_TOKEN` from its `.env`.
-  `/telegram:configure` (with no argument) reports whether a token is present.
+## A command or picker does nothing
 
-## Claude pauses partway through an unattended task
+The phone controls work in a private chat with an allowed user. An unauthorized or stale tap is refused. `/resume` needs transcripts; labels come from the opening of each chat and do not require an API key. A handoff picker needs at least two configured bots. `/inbox` shows a setup hint until email passes `fleet-email test`.
 
-The `safe` permission stance uses normal permission prompts, and a prompt pauses
-the session until you answer. From your phone this looks like the bot going quiet
-mid-task.
+For `/esc` and `/compact`, macOS must grant Terminal.app Automation consent; `/esc` and some compact paths also need Accessibility. Run `fleet-checklist --consent` while at the Mac. In System Settings > Privacy & Security, review Automation and Accessibility if a prompt was missed. The engines refuse an unverified window or an unsent prompt instead of typing into another app. Read `<state_dir>/logs/esc.log` or `compact.log` for the exact reason.
 
-- Where your Claude Code version and the plugin support the permission relay,
-  approval prompts are forwarded to Telegram and you answer them there.
-- Otherwise, either return to the terminal to approve, or reconsider your stance.
-  `scoped` pre-allows a common read and edit set so routine work does not pause.
-  `full` never pauses but removes the guardrails; read [SECURITY.md](../SECURITY.md)
-  before choosing it.
+`/usage` can show token burn while plan limits are unavailable if the Claude Code credential or Anthropic usage endpoint cannot be read. `/compact` may answer "Not enough messages to compact"; that proves the command path but means the session is too short. `fleet-checklist` accepts that specific result for its compact row.
 
-## The watchdog says a bot is unhealthy but it looks fine
+## Watchdog reports unhealthy, or recovery loops
 
-Health is three things, not one: the session PID alive, the poller PID alive, and
-the poller heartbeat fresh (under 180 seconds). A bot can have a live process yet
-a dead poll loop, for example after a clean stop or a persistent 409. That is
-exactly the "alive but silent" case the heartbeat catches.
+The watchdog supervises only bots with `.enrolled` and without `stopped`. It checks exact session and poller PIDs plus the heartbeat when the overlay is `OK`. Run the installed watchdog script with `--dry-run` and read `$FLEET_HOME/logs/watchdog.log`. A grace period, cooldown and breaker stop repeated launches. If an upstream update removed the overlay, PID-only mode avoids a false heartbeat failure. The Mac must be awake and logged in, and a real Telegram round trip is needed to prove recovery.
 
-- Check the heartbeat age: compare `stat -f %m ~/.claude/channels/fleet-<key>/poller.heartbeat`
-  to now. If it is stale, the poll loop is dead even though the process is up; a
-  restart fixes it.
-- If the watchdog is restarting the same bot repeatedly, the crash-loop breaker
-  disables it after too many restarts in an hour and alerts you. Fix the root
-  cause (usually a bad token or a missing working directory), then remove the
-  bot's disable marker under `~/.claude/telegram-fleet/watchdog-state/`.
-- To see what the watchdog would do without it acting, run
-  `~/.claude/telegram-fleet/bin/watchdog.sh --dry-run`.
+Snapshot and restore use exact conversations. If restore refuses a snapshot, keep it for inspection rather than deleting it. An offline sandbox check does not establish sleep, login or reboot behavior on your Mac.
 
-## /fresh, /model, /resume, or another command typed in Telegram did nothing
+## Voice, email or phone page fails
 
-- `/resume` is idle-only. Typed while the bot is mid-task, it folds into the
-  running turn and does nothing. Wait for the bot to finish, then resend (or
-  `/esc` first, with the patches applied).
-- `/fresh` and `/model` work mid-task only if the optional patches are applied.
-  Without them, both still work when the bot is idle. See
-  [../patches/README.md](../patches/README.md).
-- `/esc`, `/opus`, `/fable`, `/context`, and `/usage` are patch-only. Without
-  the patches they reach the model as ordinary chat text and you get a
-  conversational reply instead of the action.
-- `/usage` says "plan limits unavailable": the Claude Code OAuth token was not
-  readable from the Keychain, or Anthropic's (undocumented) usage endpoint did
-  not answer. That section fails soft on purpose - the burn numbers underneath
-  are still live, and the limits usually return on the next try.
-- `/esc` specifically needs macOS Automation and Accessibility consent (it
-  presses a real key). If the interrupt reports it could not land, check
-  System Settings -> Privacy & Security -> Accessibility and Automation, and
-  whether the screen was locked. The engine's log is
-  `~/.claude/telegram-fleet/logs/esc.log`.
-- Check the command spelling. `/model` takes a class (`opus`, `sonnet`, `fable`,
-  `haiku`) and an optional effort (`low`, `medium`, `high`, `xhigh`, `max`). An
-  unknown token is rejected and nothing changes.
+For voice, check `autotranscribe.off`, ffmpeg and the local backend, then read `<state_dir>/logs/voice-transcribe.log`. On Apple Silicon, install uv and mlx-whisper; the first run downloads a model. Intel Macs need the slower fallback. A failed local transcript should leave the voice note available for the model's fallback path.
 
-## After a Claude Code or plugin update, the optional patches are gone
+For email, run `fleet-email test`. It checks the configured IMAP and SMTP account without sending. An app password must be in Keychain under service `telebots-email`, not in `email.json`. OAuth-only providers need a separate backend. An email send that reached an uncertain SMTP state is not retried automatically. See [EMAIL.md](EMAIL.md).
 
-Expected. The poller-side interceptors (mid-task `/fresh` and `/model`, plus
-`/esc`, `/opus`, `/fable`, `/context`, `/usage`, and the "/" command menu) are
-patches on the official plugin's `server.ts`, which lives in a version-pinned
-cache directory. A plugin update writes a new cache directory and your patches
-do not carry over.
-
-- The idle-path commands keep working with no patches, so the core is unaffected.
-- To restore mid-task interception, rerun `patches/apply-patches.sh`. It checks
-  the plugin version, backs up the stock file, and applies the patches in order.
-- `patches/verify-patches.sh` reports which patches are currently present.
-
-This is why the patches are optional and quarantined rather than part of the core
-install.
-
-## Voice notes are not transcribed
-
-- Check the `voice` option in `fleet.json`. `auto` uses mlx on Apple Silicon and
-  faster-whisper elsewhere, and disables voice if neither is installed.
-- On Apple Silicon, confirm `mlx_whisper` is on the path:
-  `uv tool install mlx-whisper`, plus `brew install ffmpeg`.
-- Elsewhere, `pip install faster-whisper`.
-- The first transcription downloads the model and is slow; later ones are fast.
-
-## Something else
-
-- Read the recent watchdog log: `~/.claude/telegram-fleet/logs/watchdog.log`.
-- The `fleet-ops` skill documents the kill switches, safe testing with
-  `STREAM_DRY=1`, and reading state per bot.
-- If a hook is misbehaving, turn it off with its kill switch (see
-  [ARCHITECTURE.md](ARCHITECTURE.md)) and the bot keeps running without it.
+For the optional phone page, confirm Telebots Bar is enabled, both devices are on the intended Tailscale network, the page is bound to the Tailscale interface on port 8477 and its bearer token is valid. The page does not share Telegram's pairing access. See [menubar/README.md](../menubar/README.md).

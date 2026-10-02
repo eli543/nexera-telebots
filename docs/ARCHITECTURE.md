@@ -1,164 +1,77 @@
 # Architecture
 
-Two layers, cleanly separated.
+Nexera Telebots runs on macOS through Anthropic's official `telegram@claude-plugins-official` channel. Each configured bot has one Claude Code session in one Terminal.app window and one Telegram poller. The project adds a version-checked local overlay, a plugin of hooks and skills, and optional launchd supervision.
 
-- Layer A, the plugin: hooks, skills, and slash commands. Installed through the
-  Claude Code plugin system, versioned and removable. It never edits your
-  `settings.json`.
-- Layer B, the daemon: a launchd watchdog and the snapshot/restore engines.
-  Installed by the installer, because a plugin's runtime is session-scoped and
-  cannot own a boot-time daemon or remove one on uninstall.
+## The overlay
 
-## Data flow
+Anthropic's official Telegram plugin 0.0.7 remains installed through Claude Code. `poller/install-overlay.sh` checks its version and stock SHA-256, keeps a local backup, applies `poller/seam-0.0.7.patch` and copies the project's `telebots.ts` module and `ux.json`. The seam contains only the hooks the module cannot attach from outside, including callback order, reply button markup, inbound interception, heartbeat and the poller guard. `poller/README.md` lists the changes to the Apache-2.0 file.
 
-Inbound, a Telegram message becoming a Claude turn:
+The seam loads the module with a guarded import. If the module fails, the stock poller can still handle a normal Telegram conversation. The heartbeat remains in the seam. `poller/verify-overlay.sh --status` prints one of `OK`, `STOCK`, `MISSING_MODULE`, `TAMPERED`, `VERSION_MISMATCH:<version>` or `NOT_INSTALLED`. It exits successfully only for `OK`. Uninstall restores the stock backup.
 
-```
-your phone (Telegram DM to your bot)
-   |
-   v
-Telegram Bot API (cloud), long-poll getUpdates
-   |
-   v
-server.ts  =  the poller / Bun MCP worker  (one per bot)
-   |  1. access gate: read access.json, drop / pair / deliver
-   |  2. write liveness: state_dir/poller.heartbeat and state_dir/last-inbound
-   |  3. intercept /fresh, /model, /opus, /fable, /esc, /context, /usage, and
-   |     permission replies before the model sees them (the command intercepts
-   |     are the optional patches; /esc, the shortcuts, and the reports exist
-   |     only there), and register the "/" command menu on every poller start
-   |  4. download attachments to state_dir/inbox/, describe them in the message meta
-   |  5. emit an MCP notification to the session
-   v
-claude --channels plugin:telegram@claude-plugins-official  (the session)
-   |  wraps the notification as a user turn, then the hooks fire in order:
-   |     telegram-ack.py      instant emoji reaction
-   |     telegram-fresh.sh    idle-path /fresh
-   |     telegram-resume.sh   idle-path /resume, cross-bot picker
-   |     telegram-model.sh    idle-path /model
-   |     tg-stream.py         opens the live "Working" box
-   |     tg-reply-guard.py    arms the delivery guarantee for this turn
-   v
-the model works. PreToolUse and PostToolUse stream progress (tg-stream.py),
-tldr-nudge.py checks the reply, tg-reply-guard.py records that a reply went out.
+A new upstream plugin version does not get an unreviewed patch. Telebots extras pause, the watchdog switches to PID-only checks and reports the version change once per bot. A stock bot can still work while the seam is updated.
+
+## Message and reply path
+
+```text
+Telegram DM -> official plugin poller -> access gate -> Telebots intercept or Claude Code turn
+                                                       -> plugin hooks and rules
+Claude reply -> official plugin reply tool -> Telegram DM
 ```
 
-Outbound, a Claude reply reaching Telegram:
+The poller reads the bot's `access.json` on inbound messages. It intercepts Telegram controls before a busy Claude turn can consume them as ordinary chat. It sends an MCP notification for normal messages, including voice transcripts when a local backend succeeds. The plugin's hooks add the acknowledgement, live work box, reply guard, context guardian and rendered Telebots rules. The Plan in the box comes from real task updates; it is empty if a turn creates no tasks. Rich messages fall back to plain messages when the Telegram server rejects them.
 
-```
-model calls the reply tool  ->  server.ts  ->  Telegram Bot API  ->  your phone
-```
+The poller registers 13 commands from `ux.json` on start. `/key` and the rules use the same table. It reads fleet config at use time for `/resume` and handoff, so adding a bot does not require a fixed-name table.
 
-## Process tree per bot
-
-```
-Terminal.app window (one per bot)
-  claude ... --channels plugin:telegram@claude-plugins-official     the session
-    bun run ... start                                               the MCP wrapper
-      bun server.ts                                                 the poller
-```
-
-A bot is healthy when the session PID and the poller PID are both alive and the
-poller heartbeat is fresh (under 180 seconds old). Telegram allows exactly one
-`getUpdates` consumer per token, so there must be exactly one poller per bot. Two
-pollers on one token produce a 409 Conflict and a fight over the token, which is
-the single most common failure and is covered in
-[TROUBLESHOOTING.md](TROUBLESHOOTING.md).
-
-## Supervision loop
-
-```
-launchd (KeepAlive)  ->  watchdog-loop.sh  ->  watchdog.sh (one pass)  every ~60s
-   each pass, for each bot: check session PID, poller PID, and heartbeat freshness
-     unhealthy past the grace window, not in cooldown, under the hourly breaker
-       ->  fleet-fresh <pid> <workdir> [resume_uuid] quiet
-             ->  kill the stale session (PID, start time and workdir guarded;
-                 skipped when the bot is already back)
-                   ->  open a new Terminal window running fleet-launch
-                         ->  read model-state, exec claude --channels ... resumed
-```
-
-Snapshot and Restore share a fleet transaction lock and a saved generation ID.
-An interrupted snapshot rolls back only switches whose inode still belongs to it.
-Restore archives only its processed generation after current health checks pass.
-The public engines reject duplicate bot keys and shared workdirs or state directories.
-Restart and Restore require fresh heartbeats. An omitted restart argument preserves the selected model;
-recognized idle-hook and mid-task `/fresh` requests still reset it. Explicit
-`fresh-reset` always resets, and launch dry-runs preserve model-state.
-Custom FLEET_HOME and FLEET_CONFIG paths are resolved once and carried into
-Terminal launches and child hooks, including paths containing spaces.
-
-The loop uses a KeepAlive wrapper rather than a launchd `StartInterval` timer on
-purpose: interval timers can stop firing after the machine sleeps, and a keepalive
-loop does not depend on that timer.
-
-## FLEET_HOME
-
-The installer creates `~/.claude/telegram-fleet/` (override with `FLEET_HOME`):
-
-```
-~/.claude/telegram-fleet/
-  fleet.json            the one config file
-  bin/                  all engine and daemon scripts (uninstall = remove this dir)
-    fleet-config        reads fleet.json for every other script
-    fleet-launch        launch a bot in its workdir with token and state dir
-    fleet-fresh         kill and relaunch a bot, guarded by PID and workdir
-    fleet-model         switch model and effort, resume into the same session
-    fleet-esc           press one verified Escape in a bot's window (/esc)
-    fleet-context       report a session's live context usage (/context)
-    fleet-usage         report fleet-wide token burn (/usage)
-    fleet-sessions      enumerate sessions across all bots for the resume picker
-    fleet-snapshot      record running sessions before a reboot
-    fleet-restore       resume the exact conversations after login
-    fleet-doctor        version and liveness checks
-    watchdog.sh         one health pass
-    watchdog-loop.sh    the keepalive loop
-  logs/                 watchdog.log and friends
-  permission-stance     one of: safe, scoped, full
-```
-
-## State directories
-
-One per bot, at `~/.claude/channels/fleet-<key>/`. The `fleet-` prefix keeps
-these clear of the stock plugin's default `telegram` directory, so a fleet
-install coexists with an existing stock setup and never hijacks it. Contents:
-
-```
-.env               TELEGRAM_BOT_TOKEN, chmod 600
-access.json        dmPolicy and allowFrom (the numeric user IDs)
-model-state        MODEL and EFFORT, sticky across restarts
-poller.heartbeat   updated every poll; the watchdog reads its age
-last-inbound       updated on each inbound message
-inbox/             downloaded attachments (grows over time)
-stream/            the live-streamer's state and locks
-```
-
-## Kill switches
-
-Every hook can be turned off with a file, no restart needed. State-dir switches
-sit inside a bot's `~/.claude/channels/fleet-<key>/` directory and affect only
-that bot:
-
-| File | Turns off |
+| Callback prefix | Purpose |
 |---|---|
-| `stream.off` | the live progress box |
-| `ack.off` | the instant reaction ack |
-| `tldr_hook_off` | the whole numbered-TLDR check |
-| `tldr_judge_off` | only the API judge, keeping the free checks |
-| `reply_guard_off` | the reply-delivery guarantee |
+| `qr:` | Quick reply and checklist bubbles |
+| `md:` and `me:` | Model, then effort picker |
+| `eff:` | Effort picker |
+| `ho:` | Handoff target picker |
+| `rs:` | Resume picker |
+| `mail:` | Exact email preview and confirmation |
+| `perm:` | The official plugin's permission replies |
 
-One switch is global, because its hook runs in every session, not just bots:
+Telebots callback handlers register before the official `perm:` handler. Every Telebots press is checked as a private chat against the current allowlist. The label is read from the displayed message, and a used keyboard is cleared. [SECURITY.md](../SECURITY.md) describes the gates.
 
-| File | Turns off |
+## Process and supervision
+
+```text
+Terminal.app window
+  Claude Code --channels plugin:telegram@claude-plugins-official --name telebots-<key>
+    Bun MCP worker
+      official server.ts plus local seam and telebots.ts
+
+launchd -> watchdog loop -> one health pass -> exact bot restart when needed
+```
+
+Each bot has a different token, work directory, state directory and session name. Telegram permits one poller per token. The watchdog manages only bots with an `.enrolled` marker and no `stopped` marker. It checks session PID, poller PID and heartbeat, uses a grace period, cooldown and breaker, and restarts the exact bot through `fleet-fresh`. It never kills by a name pattern. If overlay status is not `OK`, PID-only checks avoid treating the stock plugin's missing Telebots heartbeat as a dead bot. The Mac must be awake and logged in.
+
+Snapshot and restore use a fleet transaction lock and generation ID. Restore validates the snapshot before changing sessions, and archives a generation only after the relevant bots pass health checks. A sandbox test is not proof of a reboot restore on a real Mac.
+
+## Files and logs
+
+`FLEET_HOME` defaults to `~/.claude/telegram-fleet/`. `fleet.json` holds bot names, keys, workdirs, state dirs and non-secret options. The installer copies engines into `bin/`, the menu table into `ux.json`, and writes logs and snapshots under that home. `email.json` holds non-secret account settings; the optional app password stays in Keychain.
+
+A bot state directory normally follows `~/.claude/channels/fleet-<key>/` and contains:
+
+| File | Purpose |
 |---|---|
-| `~/.claude/telegram-fleet/deliver-nudge.off` | the document-delivery nudge |
+| `.env` | Token, mode 0600 |
+| `access.json` | Pairing policy and allowed numeric user IDs |
+| `.enrolled` | The bot finished pairing and may be supervised |
+| `stopped` | A person parked the bot; watchdog skips it |
+| `rich-stream` | Enable rich work box transport |
+| `autotranscribe.off` | Disable poller voice transcription |
+| `guardian-thresholds` | Per-bot context nudge thresholds |
+| `poller.heartbeat`, `last-inbound` | Liveness and inbound timestamps |
+| `inbox/`, `stream/` | Downloads and work box state |
+| `logs/` | Poller, engine and voice evidence |
 
-To create one: `touch ~/.claude/channels/fleet-main/stream.off`. To restore the
-hook: remove the file.
+`logs/poller-events.log` contains time, event name and non-secret fields, never message text or a token. The checklist reads this file and the engine logs to prove observed behavior. Downloaded attachments and notes remain local files and need ordinary retention care.
 
-## Testing without a live bot
+## Kill switches and testing
 
-Never start a second Claude session against a live bot to test it; a duplicate
-poller will kill the real one. Test the streamer offline with `STREAM_DRY=1` and
-`STREAM_NO_SPAWN=1` set, which suppresses real API calls and the animator spawn.
-The hook test harnesses under `tests/` run fully offline.
+Per-bot hook switches include `stream.off`, `ack.off`, `tldr_hook_off`, `tldr_judge_off` and `reply_guard_off`. `autotranscribe.off` disables poller voice. The global document-delivery switch is `$FLEET_HOME/deliver-nudge.off`. A switch changes one feature without stopping the poller; restore it by removing the marker.
+
+Offline tests must use `tests/sandbox/sbenv`, a fake home, fake tokens, a loopback Telegram API and blocking command shims. Never run a second poller on a live bot token. See [CHECKLIST.md](CHECKLIST.md) for the separate, human-assisted phone acceptance.
