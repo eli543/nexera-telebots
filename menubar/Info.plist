@@ -25,6 +25,7 @@
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
 	<key>LSMinimumSystemVersion</key>
+	<!-- The app runs on macOS 14+; compiling glassEffect requires the macOS 26 SDK. -->
 	<string>14.0</string>
 	<key>LSUIElement</key>
 	<true/>

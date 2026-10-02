@@ -456,8 +456,8 @@ dialog p { font-size: 14px; line-height: 1.55; margin: 0 0 20px; }
     if (snapshot.line) return snapshot.line;
     let time = 'time unknown';
     if (typeof snapshot.time === 'number') {
-      time = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', weekday: 'long', hour: 'numeric', minute: '2-digit', hour12: true })
-        .format(new Date(snapshot.time * 1000)).replace(' AM', 'am').replace(' PM', 'pm') + ' ET';
+      time = new Intl.DateTimeFormat('en-US', { weekday: 'long', hour: 'numeric', minute: '2-digit', hour12: true, timeZoneName: 'short' })
+        .format(new Date(snapshot.time * 1000)).replace(' AM', 'am').replace(' PM', 'pm');
     }
     return 'Snapshot saved · ' + snapshot.sessions + ' sessions · ' + time;
   }

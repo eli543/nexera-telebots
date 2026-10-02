@@ -1,0 +1,434 @@
+#!/usr/bin/env python3
+"""transcribe-voice-daemon - keeps Whisper large-v3-turbo loaded for transcribe-voice.
+
+Run by the LaunchAgent com.claude-fleet.voice (KeepAlive). It loads
+mlx-community/whisper-large-v3-turbo once, then answers transcription requests
+on a Unix socket, strictly one at a time.
+
+Socket: $FLEET_HOME/voice/daemon.sock (mode 600)
+Log:    $FLEET_HOME/voice/daemon.log (one line per request, the Mac's local time)
+
+Protocol: one JSON object per line, one request per connection.
+  request:  {"path": "/abs/path/to/audio.oga", "language": "en"}
+  reply:    {"ok": true, "text": "...", "secs": 0.39}
+            {"ok": false, "error": "..."}
+
+"text" is exactly what `mlx_whisper --output-format txt` writes to its .txt file
+(each segment stripped, one per line, every line ending in a newline). The
+client applies the old wrapper's whitespace trim and the name fixes.
+
+Clients keep the connection open until the reply arrives. A queued request
+whose client has already hung up (for example after falling back to the cold
+path) is skipped instead of transcribed.
+
+Nothing from a request is ever executed. The path must be an absolute path to an
+existing regular file outside the macOS privacy-protected folders (the client's
+cold path handles those with the caller's own permissions, so no macOS consent
+dialog is ever raised on behalf of this background process), and the language
+must be one the mlx_whisper CLI accepts.
+
+Model load: the LaunchAgent sets HF_HUB_OFFLINE=1. If the offline load fails
+(for example a cleared Hugging Face cache), the daemon re-executes itself once
+without HF_HUB_OFFLINE so the model can download, and logs which path it took.
+SIGTERM or SIGINT: finish the request in flight (if any), remove the socket, exit.
+"""
+
+import fcntl
+import io
+import json
+import os
+import re
+import signal
+import socket
+import stat
+import sys
+import time
+from datetime import datetime
+
+MODEL = "mlx-community/whisper-large-v3-turbo"
+HOME = os.path.expanduser("~")
+FLEET_HOME = os.path.expanduser(os.environ.get("FLEET_HOME", "~/.claude/telegram-fleet"))
+STATE_DIR = os.path.join(FLEET_HOME, "voice")
+SOCK_PATH = os.path.join(STATE_DIR, "daemon.sock")
+LOG_PATH = os.path.join(STATE_DIR, "daemon.log")
+LOCK_PATH = os.path.join(STATE_DIR, "daemon.lock")
+
+BACKLOG = 16
+READ_TIMEOUT = 5.0       # seconds a client gets to deliver its request line
+WRITE_TIMEOUT = 5.0      # seconds a client gets to take the reply
+MAX_REQUEST = 64 * 1024  # bytes
+FAILED_START_PAUSE = 60  # seconds to wait before exiting after a failed start, so launchd retries slowly
+RETRY_MARKER = "TRANSCRIBE_VOICE_DAEMON_ONLINE_RETRY"
+
+# The exact transcribe() options of the benchmark's reference warm runner, which
+# equal the mlx_whisper 0.4.3 CLI defaults that transcribe-voice has always used.
+# verbose only controls printing: the CLI default (True) prints every segment,
+# None prints nothing and decodes identically. prepend/append_punctuations are
+# left at transcribe()'s defaults, which equal the CLI's and only matter with
+# word_timestamps=True.
+DECODE_KWARGS = dict(
+    verbose=None,
+    temperature=0.0,
+    best_of=5,
+    patience=None,
+    length_penalty=None,
+    suppress_tokens="-1",
+    initial_prompt=None,
+    condition_on_previous_text=True,
+    fp16=True,
+    compression_ratio_threshold=2.4,
+    logprob_threshold=-1.0,
+    no_speech_threshold=0.6,
+    word_timestamps=False,
+    hallucination_silence_threshold=None,
+    clip_timestamps="0",
+    task="transcribe",
+)
+
+# Folders macOS guards with a privacy consent prompt. A launchd agent touching
+# them would raise a dialog (and block this single-threaded loop until answered),
+# so requests for files there are refused and the client's cold path takes them.
+_PROTECTED = tuple(
+    (os.path.join(HOME, sub) + os.sep).lower()
+    for sub in (
+        "Desktop",
+        "Documents",
+        "Downloads",
+        "Library/Mobile Documents",
+        "Library/CloudStorage",
+        "Library/Containers",
+        "Library/Group Containers",
+    )
+) + ("/volumes/",)
+
+_MONTHS = ("January", "February", "March", "April", "May", "June", "July",
+           "August", "September", "October", "November", "December")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+class BadRequest(Exception):
+    pass
+
+
+class State:
+    busy = False       # True while a connection is being handled
+    stop = False       # a stop signal arrived
+    signame = ""
+
+
+def local_now():
+    now = datetime.now().astimezone()
+    hour = now.hour % 12 or 12
+    ampm = "am" if now.hour < 12 else "pm"
+    return (f"{now.strftime('%A')}, {_MONTHS[now.month - 1]} {now.day}, {now.year} "
+            f"{hour}:{now.minute:02d}:{now.second:02d}{ampm} {now.tzname()}")
+
+
+def _write_log(line):
+    line = _CONTROL.sub("?", line) + "\n"
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError:
+        sys.stderr.write(line)
+        sys.stderr.flush()
+
+
+def log_event(message):
+    _write_log(f"{local_now()} | daemon | {message}")
+
+
+def log_request(name, secs, outcome):
+    _write_log(f"{local_now()} | {name} | {secs:.2f}s | {outcome}")
+
+
+def short_error(exc):
+    """One-line summary of an exception, for replies and the log."""
+    text = str(exc).strip()
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) > 1:
+        # e.g. "Failed to load audio: <ffmpeg banner> ... <ffmpeg's actual complaint>"
+        head = lines[0].split(":", 1)[0]
+        text = f"{head}: {lines[-1]}"
+    msg = f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+    return msg[:300]
+
+
+def on_signal(signum, frame):
+    State.stop = True
+    State.signame = signal.Signals(signum).name
+    if not State.busy:
+        raise SystemExit(0)
+
+
+def acquire_lock():
+    """Hold daemon.lock for the life of the process so two copies never race over the socket."""
+    fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def remove_stale_socket():
+    try:
+        st = os.lstat(SOCK_PATH)
+    except FileNotFoundError:
+        return False
+    if stat.S_ISDIR(st.st_mode):
+        raise SystemExit(f"{SOCK_PATH} is a directory, refusing to start")
+    os.unlink(SOCK_PATH)
+    return True
+
+
+class Engine:
+    """mlx_whisper, imported and loaded once."""
+
+    def __init__(self):
+        import mlx.core as mx
+        import numpy as np
+        from mlx_whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE
+        from mlx_whisper.transcribe import ModelHolder, transcribe
+        from mlx_whisper.writers import WriteTXT
+
+        t0 = time.perf_counter()
+        ModelHolder.get_model(MODEL, mx.float16)
+        self.load_secs = time.perf_counter() - t0
+        self._transcribe = transcribe
+        self._writer = WriteTXT(STATE_DIR)  # only write_result() is used; nothing is written to disk
+        # The same --language choices the mlx_whisper CLI accepts.
+        self.languages = frozenset(LANGUAGES) | frozenset(k.title() for k in TO_LANGUAGE_CODE)
+        # One second of silence, so the first real request does not pay one-time GPU setup.
+        t0 = time.perf_counter()
+        self._transcribe(np.zeros(16000, dtype=np.float32), path_or_hf_repo=MODEL,
+                         language="en", **DECODE_KWARGS)
+        self.warmup_secs = time.perf_counter() - t0
+
+    def run(self, path, language):
+        result = self._transcribe(path, path_or_hf_repo=MODEL, language=language, **DECODE_KWARGS)
+        buf = io.StringIO()
+        self._writer.write_result(result, file=buf)  # the CLI's own txt formatter
+        return buf.getvalue()
+
+
+def load_engine():
+    """Load the model; on an offline failure re-exec once without HF_HUB_OFFLINE."""
+    offline = os.environ.get("HF_HUB_OFFLINE", "").upper() in ("1", "ON", "YES", "TRUE")
+    retry = os.environ.get(RETRY_MARKER) == "1"
+    if retry:
+        how = "online retry, HF_HUB_OFFLINE unset"
+    elif offline:
+        how = "offline, HF_HUB_OFFLINE=1"
+    else:
+        how = "online, HF_HUB_OFFLINE not set"
+    log_event(f"starting, pid {os.getpid()}, loading {MODEL} ({how})")
+    try:
+        engine = Engine()
+    except Exception as exc:
+        if offline and not retry:
+            log_event(f"offline model load failed ({short_error(exc)}); "
+                      "unsetting HF_HUB_OFFLINE and retrying once online")
+            env = dict(os.environ)
+            env.pop("HF_HUB_OFFLINE", None)
+            env[RETRY_MARKER] = "1"
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.execve(sys.executable, [sys.executable, os.path.abspath(sys.argv[0])] + sys.argv[1:], env)
+        log_event(f"model load failed ({how}): {short_error(exc)}; "
+                  f"exiting in {FAILED_START_PAUSE}s so launchd can retry")
+        time.sleep(FAILED_START_PAUSE)
+        return None
+    log_event(f"model loaded ({how}) in {engine.load_secs:.2f}s, warm-up {engine.warmup_secs:.2f}s")
+    return engine
+
+
+def is_protected(path):
+    candidates = {os.path.normpath(path).lower() + os.sep}
+    try:
+        candidates.add(os.path.realpath(path).lower() + os.sep)
+    except (OSError, ValueError):
+        pass
+    return any(c.startswith(_PROTECTED) for c in candidates)
+
+
+def parse_request(line, engine):
+    try:
+        req = json.loads(line)
+    except ValueError:
+        raise BadRequest("request is not a JSON object") from None
+    if not isinstance(req, dict):
+        raise BadRequest("request is not a JSON object")
+    path = req.get("path")
+    language = req.get("language", "en")
+    if not isinstance(path, str) or not path:
+        raise BadRequest("path must be a non-empty string")
+    if "\x00" in path or not os.path.isabs(path):
+        raise BadRequest("path must be an absolute file path")
+    if is_protected(path):
+        raise BadRequest("path is in a macOS privacy-protected folder; left to the cold path")
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        raise BadRequest("path is not an existing regular file") from None
+    if not stat.S_ISREG(st.st_mode):
+        raise BadRequest("path is not an existing regular file")
+    if not isinstance(language, str) or language not in engine.languages:
+        raise BadRequest(f"unsupported language: {str(language)[:40]!r}")
+    return path, language
+
+
+def request_name(line):
+    """Basename of the requested path for the log, or "-" when there is none."""
+    try:
+        path = json.loads(line).get("path")
+    except Exception:
+        return "-"
+    if not isinstance(path, str):
+        return "-"
+    return os.path.basename(path) or "-"
+
+
+def read_line(conn):
+    """Read one request line within READ_TIMEOUT seconds in total."""
+    deadline = time.monotonic() + READ_TIMEOUT
+    buf = bytearray()
+    while b"\n" not in buf:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        conn.settimeout(remaining)
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > MAX_REQUEST:
+            raise BadRequest("request too large")
+    return bytes(buf).split(b"\n", 1)[0]
+
+
+def peer_gone(conn):
+    """True if the client already hung up (it gave up waiting and went cold)."""
+    conn.setblocking(False)
+    try:
+        return conn.recv(1, socket.MSG_PEEK) == b""
+    except (BlockingIOError, InterruptedError):
+        return False
+    except OSError:
+        return True
+    finally:
+        conn.setblocking(True)
+
+
+def send(conn, obj):
+    conn.settimeout(WRITE_TIMEOUT)
+    conn.sendall(json.dumps(obj).encode("ascii") + b"\n")
+
+
+def handle(conn, engine):
+    started = time.perf_counter()
+    try:
+        line = read_line(conn)
+    except TimeoutError:
+        log_request("-", time.perf_counter() - started,
+                    f"error: no complete request within {READ_TIMEOUT:g}s, connection dropped")
+        return
+    except BadRequest as exc:
+        line, early_error = None, exc
+    except OSError as exc:
+        log_request("-", time.perf_counter() - started, f"error: reading request failed: {short_error(exc)}")
+        return
+    else:
+        early_error = None
+
+    name = "-"
+    t0 = time.perf_counter()
+    try:
+        if early_error is not None:
+            raise early_error
+        path, language = parse_request(line, engine)
+        name = os.path.basename(path)
+        if peer_gone(conn):
+            log_request(name, 0.0, "skipped: client hung up before its turn")
+            return
+        t0 = time.perf_counter()
+        text = engine.run(path, language)
+        secs = time.perf_counter() - t0
+        reply = {"ok": True, "text": text, "secs": round(secs, 3)}
+        outcome = "ok"
+    except BadRequest as exc:
+        secs = time.perf_counter() - t0
+        if name == "-" and line is not None:
+            name = request_name(line)
+        reply = {"ok": False, "error": f"bad request: {exc}"}
+        outcome = f"error: bad request: {exc}"
+    except Exception as exc:
+        secs = time.perf_counter() - t0
+        msg = short_error(exc)
+        reply = {"ok": False, "error": msg}
+        outcome = f"error: {msg}"
+    try:
+        send(conn, reply)
+    except OSError as exc:
+        outcome += f" (reply not delivered: {type(exc).__name__})"
+    log_request(name, secs, outcome)
+
+
+def serve(engine):
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    old_umask = os.umask(0o177)
+    try:
+        srv.bind(SOCK_PATH)
+    finally:
+        os.umask(old_umask)
+    os.chmod(SOCK_PATH, 0o600)
+    inode = os.lstat(SOCK_PATH).st_ino
+    srv.listen(BACKLOG)
+    log_event(f"listening on {SOCK_PATH}")
+    try:
+        while not State.stop:
+            try:
+                conn, _ = srv.accept()
+            except OSError as exc:
+                log_event(f"accept failed: {short_error(exc)}")
+                time.sleep(0.2)
+                continue
+            State.busy = True
+            try:
+                handle(conn, engine)
+            except Exception as exc:  # never let one request take the daemon down
+                log_request("-", 0.0, f"error: handler crashed: {short_error(exc)}")
+            finally:
+                conn.close()
+                State.busy = False
+    finally:
+        srv.close()
+        try:
+            if os.lstat(SOCK_PATH).st_ino == inode:
+                os.unlink(SOCK_PATH)
+        except OSError:
+            pass
+        log_event(f"stopped ({State.signame or 'exit'}), socket removed")
+
+
+def main():
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    lock_fd = acquire_lock()
+    if lock_fd is None:
+        log_event(f"another copy holds {LOCK_PATH}; pid {os.getpid()} exiting in {FAILED_START_PAUSE}s")
+        time.sleep(FAILED_START_PAUSE)
+        return 1
+    if remove_stale_socket():
+        log_event("removed stale socket file")
+    engine = load_engine()
+    if engine is None:
+        return 1
+    serve(engine)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

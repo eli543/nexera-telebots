@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""Optional IMAP/SMTP backend for Telebots. JSON stdin and JSON stdout."""
+
+import email
+from email.header import decode_header, make_header
+from email.message import EmailMessage
+import hashlib
+import imaplib
+import json
+import os
+from pathlib import Path
+import re
+import smtplib
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+
+FLEET_HOME = Path(os.environ.get("FLEET_HOME", "~/.claude/telegram-fleet")).expanduser()
+CONFIG = FLEET_HOME / "email.json"
+SERVICE = "telebots-email"
+CONSENT_RE = re.compile(r"^[0-9a-f]{24}$")
+
+
+def fail(message):
+    raise ValueError(message)
+
+
+def load_json(path, default=None):
+    try:
+        with open(path, encoding="utf-8") as stream:
+            return json.load(stream)
+    except FileNotFoundError:
+        return default
+
+
+def atomic_json(path, data):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=".email-", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, ensure_ascii=False, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
+def config():
+    value = load_json(CONFIG)
+    if not isinstance(value, dict) or value.get("enabled") is not True:
+        fail("Email is not configured. Run fleet-email setup on your Mac.")
+    if value.get("backend", "builtin") != "builtin":
+        return value
+    required = ("imap_host", "imap_port", "smtp_host", "smtp_port", "smtp_security",
+                "username", "from", "archive_mailbox")
+    if any(not value.get(field) for field in required):
+        fail("Email settings are incomplete. Run fleet-email setup.")
+    if value["smtp_security"] not in ("ssl", "starttls"):
+        fail("smtp_security must be ssl or starttls.")
+    return value
+
+
+def password(username):
+    result = subprocess.run(
+        ["security", "find-generic-password", "-a", username, "-s", SERVICE, "-w"],
+        capture_output=True, text=True, check=False, timeout=15,
+    )
+    if result.returncode or not result.stdout.strip():
+        fail("Email password was not found in Keychain for this account.")
+    return result.stdout.rstrip("\r\n")
+
+
+def local_test_host(host):
+    return os.environ.get("TELEBOTS_TEST") == "1" and host in ("127.0.0.1", "localhost", "::1")
+
+
+def imap_client(c, secret):
+    host, port = c["imap_host"], int(c["imap_port"])
+    if local_test_host(host):
+        client = imaplib.IMAP4(host, port, timeout=20)
+    else:
+        client = imaplib.IMAP4_SSL(host, port, ssl_context=ssl.create_default_context(), timeout=20)
+    client.login(c["username"], secret)
+    return client
+
+
+def smtp_client(c, secret):
+    host, port = c["smtp_host"], int(c["smtp_port"])
+    if c["smtp_security"] == "ssl" and not local_test_host(host):
+        client = smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=20)
+    else:
+        client = smtplib.SMTP(host, port, timeout=20)
+        client.ehlo()
+        if c["smtp_security"] == "starttls" and not local_test_host(host):
+            client.starttls(context=ssl.create_default_context())
+            client.ehlo()
+    client.login(c["username"], secret)
+    return client
+
+
+def header(raw):
+    return str(make_header(decode_header(raw or "")))
+
+
+def message_data(client, uid):
+    uid = str(uid)
+    if not uid.isdigit():
+        fail("Invalid inbox ID.")
+    status, data = client.uid("fetch", uid, "(BODY.PEEK[])")
+    if status != "OK":
+        fail("Inbox read failed.")
+    raw = next((part[1] for part in data if isinstance(part, tuple) and len(part) > 1), None)
+    if not raw:
+        fail("Inbox message is unavailable.")
+    msg = email.message_from_bytes(raw)
+    body = []
+    for part in msg.walk():
+        if part.get_content_type() == "text/plain" and part.get_content_disposition() != "attachment":
+            body.append((part.get_payload(decode=True) or b"").decode(
+                part.get_content_charset() or "utf-8", errors="replace"))
+    text = "".join(body)
+    return {"id": uid, "from": header(msg["From"]), "subject": header(msg["Subject"]),
+            "preview": text[:1600], "reply_to": header(msg["Reply-To"] or msg["From"])}
+
+
+def canonical_email(value):
+    if not isinstance(value, dict):
+        fail("Email must be an object.")
+    result = {key: value.get(key, [] if key in ("to", "cc", "bcc") else "")
+              for key in ("to", "cc", "bcc", "subject", "body")}
+    for key in ("to", "cc", "bcc"):
+        if not isinstance(result[key], list) or any(not isinstance(item, str) for item in result[key]):
+            fail("Email recipients must be lists of addresses.")
+    if not result["to"] or not isinstance(result["subject"], str) or not isinstance(result["body"], str):
+        fail("Email needs a recipient, subject and body.")
+    return result
+
+
+def digest(value):
+    raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def state_for(bot):
+    if not isinstance(bot, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,30}", bot):
+        fail("Invalid bot key.")
+    fleet = load_json(FLEET_HOME / "fleet.json", {})
+    for item in fleet.get("bots", []):
+        if item.get("key") == bot:
+            path = Path(item["state_dir"]).expanduser().resolve()
+            if path.is_dir():
+                return path
+    fail("Bot state directory is unavailable.")
+
+
+def claim_send(req):
+    consent_id, bot = req.get("consent_id"), req.get("bot")
+    if not isinstance(consent_id, str) or not CONSENT_RE.fullmatch(consent_id):
+        fail("Invalid consent ID.")
+    state = state_for(bot)
+    record = load_json(state / "consents.json", {}).get(consent_id)
+    target = canonical_email(req.get("email"))
+    if (not isinstance(record, dict) or record.get("phase") != "consumed"
+            or record.get("expires", 0) < time.time() * 1000
+            or canonical_email(record.get("email")) != target
+            or record.get("digest") != digest(target)):
+        fail("Exact email consent is missing or expired.")
+    attempts = state / "mail-attempts"
+    attempts.mkdir(mode=0o700, exist_ok=True)
+    path = attempts / consent_id
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        fail("This email already has a send attempt. It will not be retried.")
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        json.dump({"at": time.time(), "state": "delivery-uncertain-until-receipt"}, stream)
+    return target, path
+
+
+def builtin(op, req, c):
+    secret = password(c["username"]) if op != "snooze" else ""
+    if op == "send":
+        value, attempt = claim_send(req)
+        message = EmailMessage()
+        message["From"] = c["from"]
+        message["To"] = ", ".join(value["to"])
+        if value["cc"]:
+            message["Cc"] = ", ".join(value["cc"])
+        message["Subject"] = value["subject"]
+        message.set_content(value["body"])
+        recipients = value["to"] + value["cc"] + value["bcc"]
+        with smtp_client(c, secret) as client:
+            refused = client.send_message(message, to_addrs=recipients)
+        status = "smtp-accepted" if not refused else "partially-refused"
+        atomic_json(attempt, {"at": time.time(), "state": status})
+        return {"status": status, "note": "SMTP acceptance does not prove delivery."}
+    if op == "snooze":
+        uid, hours = str(req.get("id", "")), req.get("hours")
+        if not uid.isdigit() or not isinstance(hours, (int, float)) or not 0 < hours <= 720:
+            fail("Snooze needs a message ID and 1 to 720 hours.")
+        path = FLEET_HOME / "inbox-snoozed.json"
+        value = load_json(path, {})
+        value[uid] = time.time() + hours * 3600
+        atomic_json(path, value)
+        return {"status": "snoozed", "id": uid, "hours": hours}
+    with imap_client(c, secret) as client:
+        status, _ = client.select("INBOX", readonly=op != "archive")
+        if status != "OK":
+            fail("Inbox could not be selected.")
+        if op == "test":
+            with smtp_client(c, secret) as smtp:
+                smtp.noop()
+            return {"status": "ok", "imap": "logged-in", "smtp": "logged-in", "sent": False}
+        if op == "inbox":
+            status, data = client.uid("search", None, "ALL")
+            if status != "OK":
+                fail("Inbox search failed.")
+            limit = req.get("limit", 5)
+            if not isinstance(limit, int) or not 1 <= limit <= 20:
+                fail("Inbox limit must be 1 to 20.")
+            snoozed = load_json(FLEET_HOME / "inbox-snoozed.json", {})
+            ids = [uid.decode("ascii") for uid in data[0].split()][::-1]
+            return [message_data(client, uid) for uid in ids
+                    if snoozed.get(uid, 0) <= time.time()][:limit]
+        if op == "read":
+            return message_data(client, req.get("id"))
+        if op == "archive":
+            uid = str(req.get("id", ""))
+            if not uid.isdigit():
+                fail("Invalid inbox ID.")
+            if not any(cap == "MOVE" or cap == b"MOVE" for cap in client.capabilities):
+                fail("The server has no safe UID MOVE. Archive was not performed.")
+            status, _ = client.uid("MOVE", uid, c["archive_mailbox"])
+            if status != "OK":
+                fail("Archive failed.")
+            return {"status": "archived", "id": uid}
+    fail("Unsupported email action.")
+
+
+def setup():
+    if not sys.stdin.isatty():
+        fail("Run fleet-email setup in a Terminal window.")
+    print("Email account setup. Your app password is entered directly into Keychain.")
+    fields = ("imap_host", "imap_port", "smtp_host", "smtp_port", "smtp_security",
+              "username", "from", "archive_mailbox")
+    defaults = {"imap_port": "993", "smtp_port": "465", "smtp_security": "ssl",
+                "archive_mailbox": "Archive"}
+    value = {field: input(f"{field} [{defaults.get(field, '')}]: ").strip() or defaults.get(field, "")
+             for field in fields}
+    if not value["username"] or not value["from"]:
+        fail("Username and From address are required.")
+    value.update({"enabled": True, "backend": "builtin"})
+    # -w at the end makes macOS security prompt without placing the password in
+    # argv, shell history, files, or the Claude conversation.
+    result = subprocess.run(["security", "add-generic-password", "-U", "-a", value["username"],
+                             "-s", SERVICE, "-w"], check=False)
+    if result.returncode:
+        fail("Keychain password setup failed; email settings were not saved.")
+    builtin("test", {}, value)
+    atomic_json(CONFIG, value)
+    return {"status": "configured", "address": value["from"], "sent": False}
+
+
+def main(argv):
+    if len(argv) != 2 or argv[1] not in ("setup", "test", "inbox", "read", "archive", "snooze", "send"):
+        sys.stderr.write("usage: fleet-email setup|test|inbox|read|archive|snooze|send (JSON stdin except setup)\n")
+        return 2
+    op = argv[1]
+    try:
+        if op == "setup":
+            output = setup()
+        else:
+            req = {} if op == "test" and sys.stdin.isatty() else json.loads(sys.stdin.read() or "{}")
+            if not isinstance(req, dict):
+                fail("Request must be a JSON object.")
+            c = config()
+            backend = c.get("backend", "builtin")
+            if backend == "builtin":
+                output = builtin(op, req, c)
+            else:
+                if not os.path.isabs(backend) or not os.access(backend, os.X_OK):
+                    fail("Custom email backend is not an executable absolute path.")
+                attempt = None
+                if op == "send":
+                    _, attempt = claim_send(req)
+                result = subprocess.run([backend, op], input=json.dumps(req), text=True,
+                                        capture_output=True, check=False, timeout=30)
+                if result.returncode:
+                    fail("Custom email backend failed.")
+                output = json.loads(result.stdout)
+                if attempt is not None:
+                    atomic_json(attempt, {"at": time.time(), "state": "backend-accepted"})
+        print(json.dumps(output, ensure_ascii=False))
+        return 0
+    except (ValueError, OSError, imaplib.IMAP4.error, smtplib.SMTPException,
+            subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+        # Send errors remain deliberately generic: after a claimed attempt the
+        # delivery outcome can be uncertain and must never be auto-retried.
+        message = str(exc) if op != "send" else "Email send stopped. Check the private attempt record; do not retry automatically."
+        print(message, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

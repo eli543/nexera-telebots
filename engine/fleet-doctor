@@ -7,7 +7,7 @@
 #   fleet-doctor          check and report (no messages sent)
 #   fleet-doctor --ping   also send one test message to each bot's own chat
 #
-# Checks: claude >= 2.1.80, bun present, official telegram plugin installed,
+# Checks: Claude Code version gates, bun, official plugin 0.0.7 and overlay,
 # fleet.json valid, and per bot: state dir exists, .env is chmod 600, access.json
 # is on an allowlist policy, the session + poller are alive, and the poller
 # heartbeat is fresh. macOS (ps / stat -f / lsof).
@@ -29,9 +29,11 @@ resolve_bin() {
 FC_BIN="$(resolve_bin fleet-config)"
 fc() { "$FC_BIN" "$@"; }
 
-MIN_CLAUDE="2.1.80"
+MIN_CLAUDE="2.1.224"
+TESTED_CLAUDE="2.1.286"
 HEARTBEAT_MAX_AGE=180
 RED_COUNT=0
+TOKEN_ROWS=""
 
 # colors only on a tty
 if [ -t 1 ]; then C_G=$'\033[32m'; C_R=$'\033[31m'; C_Y=$'\033[33m'; C_0=$'\033[0m'
@@ -60,6 +62,24 @@ ver_ge() {
 token_of_state() {
   [ -f "$1/.env" ] || return 0
   grep -E '^TELEGRAM_BOT_TOKEN=' "$1/.env" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]'
+}
+token_hash() { printf '%s' "$1" | shasum -a 256 | awk '{print $1}'; }
+api_base() {
+  if [ "${TELEBOTS_TEST:-}" = 1 ]; then
+    case "${TELEBOTS_API_BASE:-}" in
+      http://127.0.0.1:*|http://localhost:*|http://\[::1\]:*) printf '%s' "${TELEBOTS_API_BASE%/}"; return ;;
+    esac
+  fi
+  printf 'https://api.telegram.org'
+}
+getme_name() {
+  local reply
+  reply=$(curl -sS --max-time 8 "$(api_base)/bot$1/getMe" 2>/dev/null) || return 1
+  printf '%s' "$reply" | python3 -c 'import json,sys
+try:
+ d=json.load(sys.stdin); r=d.get("result") or {}
+ print("@"+str(r["username"])) if d.get("ok") is True and r.get("username") else sys.exit(1)
+except (ValueError,KeyError,TypeError): sys.exit(1)'
 }
 chat_id_of_state() {
   python3 - "$1" <<'PY' 2>/dev/null
@@ -104,7 +124,12 @@ echo "--- environment ---------------------------------------------"
 if command -v claude >/dev/null 2>&1; then
   cver=$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
   if [ -n "$cver" ] && [ "$(ver_ge "$cver" "$MIN_CLAUDE")" = "1" ]; then
-    row ok "claude CLI" "$cver (>= $MIN_CLAUDE)"
+    row ok "claude CLI" "$cver (handoff >= $MIN_CLAUDE)"
+    if [ "$(ver_ge "$cver" "$TESTED_CLAUDE")" = "1" ]; then
+      row ok "tested CLI gate" "$cver (tested at $TESTED_CLAUDE)"
+    else
+      row warn "tested CLI gate" "$cver (tested at $TESTED_CLAUDE; verify features on your version)"
+    fi
   else
     row red "claude CLI" "${cver:-unknown} (need >= $MIN_CLAUDE, channels preview)"
   fi
@@ -126,23 +151,47 @@ fi
 plugcache=$(ls -d "$HOME"/.claude/plugins/cache/claude-plugins-official/telegram/*/server.ts 2>/dev/null | tail -1)
 if [ -n "$plugcache" ]; then
   pver=$(basename "$(dirname "$plugcache")")
-  row ok "telegram plugin" "installed (v$pver)"
+  if [ "$pver" = 0.0.7 ]; then row ok "telegram plugin" "v$pver"
+  else row warn "telegram plugin" "v$pver (Telebots overlay supports 0.0.7 only)"; fi
 else
   row red "telegram plugin" "not installed (claude plugin install telegram@claude-plugins-official)"
 fi
+
+VERIFY="$(resolve_bin verify-overlay.sh)"
+overlay_status=NOT_INSTALLED
+[ -x "$VERIFY" ] && overlay_status=$("$VERIFY" --status 2>/dev/null || true)
+case "$overlay_status" in
+  OK) row ok "overlay status" OK ;;
+  VERSION_MISMATCH:*) row warn "overlay status" "$overlay_status (PID-only recovery)" ;;
+  *) row red "overlay status" "${overlay_status:-UNKNOWN} (repair the pinned overlay)" ;;
+esac
+if [ -f "$FLEET_HOME/overlay.status" ]; then
+  row ok "watchdog overlay" "$(head -1 "$FLEET_HOME/overlay.status")"
+else
+  row warn "watchdog overlay" "no watchdog pass recorded"
+fi
+
+inbound=$(python3 - "$HOME/.claude/settings.json" <<'PY' 2>/dev/null
+import json,sys
+try:
+ d=json.load(open(sys.argv[1])); print(d.get('crossSessionInbound','allow'))
+except (OSError,ValueError): print('allow')
+PY
+)
+case "$inbound" in refuse|hold) row warn "cross-session inbound" "$inbound (handoff can be held)" ;; *) row ok "cross-session inbound" "$inbound" ;; esac
 
 # config validity
 if fc validate 2>/dev/null; then
   row ok "fleet.json" "valid ($(fc bots 2>/dev/null | grep -c . ) bot(s))"
 else
-  row red "fleet.json" "invalid or missing (see: $FLEET_CONFIG validate)"
+  row red "fleet.json" "invalid or missing (run fleet-config validate)"
 fi
 
 # watchdog daemon present?
 if launchctl list 2>/dev/null | grep -q 'com.claude-fleet.watchdog'; then
   row ok "watchdog daemon" "loaded (com.claude-fleet.watchdog)"
 else
-  row warn "watchdog daemon" "not loaded (optional; /fleet-install-daemon)"
+  row warn "watchdog daemon" "not loaded (optional; /telegram-fleet:install-daemon)"
 fi
 
 now=$(date +%s)
@@ -172,6 +221,26 @@ else
       row red "$key .env" "missing (no bot token)"
     fi
 
+    tok=$(token_of_state "$sdir")
+    if [ -n "$tok" ]; then
+      hash=$(token_hash "$tok")
+      owner=$(printf '%s' "$TOKEN_ROWS" | awk -v h="$hash" '$1 == h {print $2; exit}')
+      if [ -n "$owner" ]; then
+        row red "$key duplicate token" "same token as $owner"
+      else
+        TOKEN_ROWS="${TOKEN_ROWS}${hash} ${key}"$'\n'
+        row ok "$key duplicate token" "unique in fleet"
+      fi
+      username=$(getme_name "$tok" || true)
+      if [ -n "$username" ]; then row ok "$key getMe" "$username"
+      else row red "$key getMe" "token rejected or Telegram unreachable (401 means invalid token)"; fi
+    else
+      row red "$key getMe" "no token"
+    fi
+
+    if [ -f "$sdir/.enrolled" ]; then row ok "$key enrollment" "paired and locked"
+    else row warn "$key enrollment" "not paired; watchdog will skip"; fi
+
     # access policy
     pol=$(policy_of_state "$sdir")
     if [ "$pol" = "allowlist" ]; then
@@ -186,7 +255,7 @@ else
     if [ -n "$spid" ] && [ -n "$wpid" ]; then
       row ok "$key session+poller" "session=$spid poller=$wpid"
       # heartbeat freshness
-      if [ -f "$sdir/poller.heartbeat" ]; then
+      if [ "$overlay_status" = OK ] && [ -f "$sdir/poller.heartbeat" ]; then
         hb=$(head -1 "$sdir/poller.heartbeat" 2>/dev/null | tr -cd '0-9')
         if [ -n "$hb" ]; then
           age=$(( now - hb ))
@@ -196,8 +265,10 @@ else
             row red "$key heartbeat" "${age}s ago (> ${HEARTBEAT_MAX_AGE}s: poller may be stuck)"
           fi
         fi
-      else
+      elif [ "$overlay_status" = OK ]; then
         row warn "$key heartbeat" "no heartbeat file (liveness patch not applied?)"
+      else
+        row warn "$key heartbeat" "PID-only proof while overlay=$overlay_status"
       fi
     else
       row red "$key session+poller" "session=${spid:-DOWN} poller=${wpid:-DOWN}"

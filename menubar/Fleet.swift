@@ -218,7 +218,7 @@ enum ConfigLoad {
 }
 
 enum FleetModel {
-    static let defaultTimeZone = TimeZone(identifier: "America/New_York") ?? .current
+    static let defaultTimeZone = TimeZone.current
     private static let keyPattern = try! NSRegularExpression(pattern: "^[a-z0-9][a-z0-9-]{0,30}$")
     private static let menubarKeys: Set<String> = [
         "fresh_engine", "watchdog_state_dir", "watchdog_log", "heartbeat_max_age", "resume_source", "time_zone",
@@ -332,7 +332,7 @@ enum FleetModel {
                     if let s = v as? String, isEngineWord(s) { settings.freshStartArg = s } else { warnings.append("menubar.fresh_start_arg must be letters, digits and dashes, like fresh-reset; default kept") }
                 }
                 if let v = mb["time_zone"] {
-                    if let s = v as? String, let tz = TimeZone(identifier: s) { settings.timeZone = tz } else { warnings.append("menubar.time_zone must be a time zone name like America/New_York; default kept") }
+                    if let s = v as? String, let tz = TimeZone(identifier: s) { settings.timeZone = tz } else { warnings.append("menubar.time_zone must be a time zone name like Europe/London; system default kept") }
                 }
             } else {
                 warnings.append("menubar must be an object; ignored")
@@ -1474,7 +1474,7 @@ extension FleetModel {
     static func engineEnvironment() -> [String: String] {
         var env = Env.vars.filter { !$0.key.hasPrefix("TELEGRAM_") }
         env["PATH"] = FleetPaths.enginePATH
-        env["TZ"] = "America/New_York"
+        env.removeValue(forKey: "TZ")
         return env
     }
 
@@ -2013,7 +2013,7 @@ extension FleetModel {
 // MARK: - Action log
 
 /// Appends one line per action to $FLEET_HOME/menubar.log, stamped in the
-/// configured time zone (America/New_York unless menubar.time_zone says otherwise).
+/// configured time zone (the Mac's zone unless menubar.time_zone says otherwise).
 final class ActionLog {
     static let shared = ActionLog()
 

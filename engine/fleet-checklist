@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""Per-bot setup checks. Phone checks use recorded events, not self-reports."""
+
+import argparse
+from datetime import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+ROOT = Path(os.environ.get("FLEET_HOME", "~/.claude/telegram-fleet")).expanduser()
+COMMANDS = ("esc", "fresh", "update", "key", "inbox", "opus", "fable", "model",
+            "effort", "context", "compact", "usage", "resume")
+ROWS = (
+    ("A1", "Official plugin and overlay", "verify-overlay.sh --status; plugin cache version"),
+    ("A2", "Telebots plugin and engines", "plugin manifest; ux.json; executable engines"),
+    ("A3", "Valid unique token", "getMe; hashes of bot .env tokens"),
+    ("A4", "Session and poller", "fleet-state --json; poller.heartbeat age"),
+    ("A5", "Telegram updates", "getWebhookInfo.allowed_updates"),
+    ("A6", "13-command menu", "getMyCommands(all_private_chats)"),
+    ("A7", "Pairing and allowlist", "access.json; .enrolled marker"),
+    ("A8", "Local voice sample", "say sample; transcribe-voice output; voice option"),
+    ("A9", "Watchdog", "launchctl list; watchdog.sh --dry-run"),
+    ("A10", "Claude Code handoff gates", "claude --version; settings.json; permission-stance"),
+    ("A11", "Optional email and menu bar", "fleet-email test; Telebots Bar process when installed"),
+    ("P1", "First reply and live box", "INBOUND event; streamer state; reply-guard record"),
+    ("P2", "Checklist bubble", "TAP family=qr in poller-events.log"),
+    ("P3", "Save reaction and notes", "REACTION event; notes_dir dated file"),
+    ("P4", "Key legend", "KEY event in poller-events.log"),
+    ("P5", "Picker Close bubbles", "PICKER model and effort; CLOSE events"),
+    ("P6", "Resume descriptions", "sessions render log with count and label count; CLOSE"),
+    ("P7", "Voice note", "VOICE status=ok; voice-transcribe.log status=ok"),
+    ("P8", "Update and Back and ready", "update.log; fresh.log back-online ping sent"),
+    ("P9", "Interrupt while busy", "INTERCEPT cmd=esc; esc.log key landed"),
+    ("P10", "Context and usage", "INTERCEPT events; context.log; usage.log"),
+    ("P11", "Compact", "compact.log exit 0 or 14"),
+    ("P12", "Context nudge and Keep going", "guardian log reason 8; TAP event"),
+    ("P13", "Handoff picker", "HANDOFF-PICKER offered=; CLOSE kind=handoff"),
+    ("P14", "Inbox cards and Snooze", "INTERCEPT cmd=inbox; EMAIL-PREVIEW; snooze record"),
+    ("P15", "Optional self-heal", "watchdog.log restart; fresh.log back-online ping sent"),
+    ("P16", "Optional blank fresh", "INTERCEPT cmd=fresh; fresh.log back-online ping sent"),
+)
+
+
+def read_json(path, default=None):
+    try:
+        with open(path, encoding="utf-8") as stream:
+            return json.load(stream)
+    except (OSError, ValueError):
+        return default
+
+
+def run(command, timeout=15, input_text=None):
+    return subprocess.run(command, input=input_text, text=True, capture_output=True,
+                          check=False, timeout=timeout)
+
+
+def token_from(state):
+    try:
+        for line in (state / ".env").read_text().splitlines():
+            if line.startswith("TELEGRAM_BOT_TOKEN="):
+                return line.split("=", 1)[1].strip().strip('"\'')
+    except OSError:
+        pass
+    return ""
+
+
+def api_base():
+    override = os.environ.get("TELEBOTS_API_BASE", "")
+    if os.environ.get("TELEBOTS_TEST") == "1" and re.fullmatch(
+            r"http://(?:127\.0\.0\.1|localhost|\[::1\]):[0-9]{2,5}/?", override):
+        return override.rstrip("/")
+    return "https://api.telegram.org"
+
+
+def telegram(token, method, data=None):
+    payload = None if data is None else urlencode(data).encode()
+    request = Request(f"{api_base()}/bot{token}/{method}", data=payload)
+    with urlopen(request, timeout=10) as response:
+        value = json.load(response)
+    if value.get("ok") is not True:
+        raise ValueError("Telegram API rejected the request")
+    return value.get("result")
+
+
+def event_lines(state):
+    try:
+        return (state / "logs" / "poller-events.log").read_text().splitlines()
+    except OSError:
+        return []
+
+
+def lines_since(state, started):
+    result = []
+    for line in event_lines(state):
+        try:
+            stamp = datetime.fromisoformat(line.split(" ", 1)[0]).timestamp()
+        except (ValueError, IndexError):
+            continue
+        if stamp >= started:
+            result.append(line)
+    return result
+
+
+def event_seen(lines, name, **fields):
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 2 or parts[1] != name:
+            continue
+        values = dict(part.split("=", 1) for part in parts[2:] if "=" in part)
+        if all(values.get(key) == str(value) for key, value in fields.items()):
+            return True
+    return False
+
+
+def log_has(path, pattern):
+    try:
+        return bool(re.search(pattern, path.read_text(), flags=re.IGNORECASE))
+    except OSError:
+        return False
+
+
+def fresh_log_has(path, pattern, started):
+    try:
+        return path.stat().st_mtime >= started and log_has(path, pattern)
+    except OSError:
+        return False
+
+
+def result(status, detail):
+    return {"status": status, "detail": detail}
+
+
+def auto_row(code, bot, fleet, state, token):
+    engine = ROOT / "bin"
+    logs = state / "logs"
+    if code == "A1":
+        verifier = engine / "verify-overlay.sh"
+        check = run([str(verifier), "--status"]) if verifier.is_file() else None
+        value = check.stdout.strip() if check else "NOT_INSTALLED"
+        cache = Path.home() / ".claude/plugins/cache/claude-plugins-official/telegram/0.0.7/server.ts"
+        return result("Passed" if value == "OK" and cache.is_file() else "Failed", value)
+    if code == "A2":
+        required = (ROOT / "ux.json", engine / "fleet-fresh", engine / "fleet-doctor")
+        installed = read_json(Path.home() / ".claude/plugins/installed_plugins.json", {}).get("plugins", {})
+        enabled = read_json(Path.home() / ".claude/settings.json", {}).get("enabledPlugins", {})
+        plugin_name = "telegram-fleet@nexera-telebots"
+        plugin_ok = plugin_name in installed and enabled.get(plugin_name, True) is True
+        good = all(path.is_file() for path in required) and all(os.access(path, os.X_OK) for path in required[1:])
+        return result("Passed" if good and plugin_ok else "Failed", "plugin, ux.json and engines" if good and plugin_ok else "plugin or engine missing")
+    if code == "A3":
+        if not token:
+            return result("Failed", "token missing")
+        hashes = [hashlib.sha256(token_from(Path(item["state_dir"]).expanduser()).encode()).digest()
+                  for item in fleet.get("bots", [])]
+        if hashes.count(hashlib.sha256(token.encode()).digest()) > 1:
+            return result("Failed", "duplicate token")
+        try:
+            me = telegram(token, "getMe")
+            return result("Passed", "@" + me.get("username", "bot"))
+        except Exception:
+            return result("Failed", "getMe rejected the token or API was unreachable")
+    if code == "A4":
+        try:
+            age = time.time() - float((state / "poller.heartbeat").read_text().strip())
+        except (OSError, ValueError):
+            return result("Failed", "no heartbeat")
+        fleet_state = run([str(engine / "fleet-state"), "--json"]) if (engine / "fleet-state").is_file() else None
+        if fleet_state and fleet_state.returncode == 0 and 0 <= age < 60:
+            return result("Passed", f"heartbeat {int(age)}s old; fleet-state responded")
+        return result("Failed", "session/poller state or heartbeat missing")
+    if code == "A5":
+        try:
+            info = telegram(token, "getWebhookInfo")
+            allowed = info.get("allowed_updates", [])
+            ok = all(name in allowed for name in ("message", "callback_query", "message_reaction"))
+            return result("Passed" if ok else "Failed", ", ".join(allowed))
+        except Exception:
+            return result("Failed", "getWebhookInfo unavailable")
+    if code == "A6":
+        try:
+            commands = telegram(token, "getMyCommands", {"scope": json.dumps({"type": "all_private_chats"})})
+            names = [item.get("command") for item in commands]
+            return result("Passed" if names == list(COMMANDS) else "Failed", ", ".join(names))
+        except Exception:
+            return result("Failed", "getMyCommands unavailable")
+    if code == "A7":
+        access = read_json(state / "access.json", {})
+        ok = access.get("dmPolicy") == "allowlist" and bool(access.get("allowFrom")) and (state / ".enrolled").is_file()
+        return result("Passed" if ok else "Failed", "allowlist and enrolled" if ok else "pair and lock this bot")
+    if code == "A8":
+        voice = fleet.get("options", {}).get("voice", "auto")
+        if voice == "off":
+            return result("Not configured", "voice disabled")
+        if not (engine / "transcribe-voice").is_file():
+            return result("Not configured", "no voice backend installed")
+        with tempfile.TemporaryDirectory(prefix="voice-check-", dir=ROOT) as temp:
+            audio = str(Path(temp) / "sample.aiff")
+            sample = run(["say", "-o", audio, "Check the voice note"], timeout=30)
+            if sample.returncode:
+                return result("Failed", "the Mac could not create a local voice sample")
+            transcript = run([str(engine / "transcribe-voice"), audio], timeout=180)
+            words = transcript.stdout.lower()
+            ok = transcript.returncode == 0 and "voice" in words and "note" in words
+            return result("Passed" if ok else "Failed", "local voice sample matched" if ok else "voice sample did not match")
+    if code == "A9":
+        check = run(["launchctl", "list"])
+        probe = run(["/bin/bash", str(engine / "watchdog.sh"), "--dry-run"]) if (engine / "watchdog.sh").is_file() else None
+        ok = "com.claude-fleet.watchdog" in check.stdout and probe and probe.returncode == 0
+        return result("Passed" if ok else "Needs your action", "loaded and dry run clean" if ok else "install or inspect the watchdog")
+    if code == "A10":
+        check = run(["claude", "--version"])
+        version = re.search(r"\d+\.\d+\.\d+", check.stdout)
+        inbound = read_json(Path.home() / ".claude/settings.json", {}).get("crossSessionInbound", "allow")
+        stance = (ROOT / "permission-stance").read_text().strip() if (ROOT / "permission-stance").is_file() else "safe"
+        good = version and tuple(map(int, version.group().split("."))) >= (2, 1, 224) and inbound not in ("refuse", "hold") and stance in ("safe", "scoped", "full")
+        return result("Passed" if good else "Failed", f"Claude Code {version.group() if version else '?'}; inbound={inbound}; stance={stance}")
+    if code == "A11":
+        email_cfg = read_json(ROOT / "email.json", {})
+        menu = Path.home() / "Applications/Telebots Bar.app"
+        if not email_cfg.get("enabled") and not menu.exists():
+            return result("Not configured", "email and menu bar are optional")
+        details = []
+        if email_cfg.get("enabled"):
+            check = run([str(engine / "fleet-email"), "test"], input_text="{}")
+            details.append("email ok" if check.returncode == 0 else "email test failed")
+        if menu.exists():
+            check = run(["pgrep", "-x", "Telebots Bar"])
+            details.append("menu bar running" if check.returncode == 0 else "menu bar not running")
+        return result("Passed" if all("failed" not in x and "not running" not in x for x in details) else "Failed", "; ".join(details))
+    return result("Failed", "unknown row")
+
+
+def phone_row(code, state, notes, fleet_size, email_enabled, crash_test, started=0):
+    lines = lines_since(state, started) if started else event_lines(state)
+    logs = state / "logs"
+    evidence = lambda name, pattern: fresh_log_has(logs / name, pattern, started)
+    if code == "P1":
+        ok = event_seen(lines, "INBOUND", kind="text") and evidence("tg-stream.log", r"mission|🎯") and evidence("reply-guard.log", r"reply")
+    elif code == "P2": ok = event_seen(lines, "TAP", family="qr")
+    elif code == "P3": ok = event_seen(lines, "REACTION") and notes.is_dir() and any(path.stat().st_mtime >= started for path in notes.glob("20??-??-??.md"))
+    elif code == "P4": ok = event_seen(lines, "KEY")
+    elif code == "P5": ok = all(event_seen(lines, "PICKER", kind=kind) and event_seen(lines, "CLOSE", kind=kind) for kind in ("model", "effort"))
+    elif code == "P6": ok = evidence("sessions.log", r"count=[1-9].*labels=[1-9]") and event_seen(lines, "CLOSE", kind="resume")
+    elif code == "P7": ok = event_seen(lines, "VOICE", status="ok") and evidence("voice-transcribe.log", r"status=ok")
+    elif code == "P8": ok = evidence("update.log", r"update") and evidence("fresh.log", r"back-online ping sent")
+    elif code == "P9": ok = event_seen(lines, "INTERCEPT", cmd="esc") and evidence("esc.log", r"key landed")
+    elif code == "P10": ok = all(event_seen(lines, "INTERCEPT", cmd=cmd) and evidence(f"{cmd}.log", r".") for cmd in ("context", "usage"))
+    elif code == "P11": ok = evidence("compact.log", r"exit (?:0|14)\b")
+    elif code == "P12": ok = evidence("context-guardian.log", r"reason 8") and event_seen(lines, "TAP", family="qr")
+    elif code == "P13":
+        if fleet_size < 2: return result("Not configured", "needs two bots")
+        ok = event_seen(lines, "HANDOFF-PICKER") and event_seen(lines, "CLOSE", kind="handoff")
+    elif code == "P14":
+        if not email_enabled: return result("Not configured", "email is optional")
+        ok = event_seen(lines, "INTERCEPT", cmd="inbox") and event_seen(lines, "EMAIL-PREVIEW") and (ROOT / "inbox-snoozed.json").is_file() and (ROOT / "inbox-snoozed.json").stat().st_mtime >= started
+    elif code == "P15":
+        if not crash_test: return result("Not configured", "run with --crash-test after approval")
+        ok = fresh_log_has(ROOT / "logs/watchdog.log", r"RESTART", started) and evidence("fresh.log", r"back-online ping sent")
+    elif code == "P16": ok = event_seen(lines, "INTERCEPT", cmd="fresh") and evidence("fresh.log", r"back-online ping sent")
+    else: ok = False
+    return result("Passed" if ok else "Needs your action", "recorded evidence found" if ok else "complete this phone step and rerun")
+
+
+PHONE_STEPS = {
+    "P1": 'Send "hi" and wait for the acknowledgement, live box and reply.',
+    "P2": 'Tap the "Checklist OK" bubble below the new checklist message.',
+    "P3": "React with a heart to a bot message; check your notes folder.",
+    "P4": "Send /key and read the legend.",
+    "P5": "Open /model and tap Close, then open /effort and tap Close.",
+    "P6": "Open /resume, check that every row describes a chat, then tap Close.",
+    "P7": "Send a short voice note and wait for its transcript.",
+    "P8": "Send /update and wait for Back and ready with Continue.",
+    "P9": "Ask for a slow count, then send /esc while the bot is busy.",
+    "P10": "Send /context and /usage; wait for both reports.",
+    "P11": "Send /compact and wait for completion or the short-chat response.",
+    "P12": "Send one message to trigger the context nudge, then tap Keep going.",
+    "P13": "With a second bot installed, open Hand off and tap Cancel.",
+    "P14": "Open /inbox, then tap Snooze 1d on a card.",
+    "P15": "Optional self-heal: run the separate exact-PID crash test with the owner present.",
+    "P16": "Optional last step: send /fresh and wait for Back and ready.",
+}
+
+
+def chat_id(state):
+    access = read_json(state / "access.json", {})
+    users = access.get("allowFrom", [])
+    return str(users[0]) if users else ""
+
+
+def notify_phone(token, state, text, bubble=False):
+    recipient = chat_id(state)
+    if not token or not recipient:
+        return False
+    data = {"chat_id": recipient, "text": text}
+    if bubble:
+        data["reply_markup"] = json.dumps({"inline_keyboard": [[
+            {"text": "Checklist OK", "callback_data": "qr:0:0"}]]})
+    try:
+        telegram(token, "sendMessage", data)
+        return True
+    except Exception:
+        return False
+
+
+def save_results(path, key, values):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix=".checklist-", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump({"bot": key, "checked_at": time.time(), "rows": values}, stream, indent=2)
+            stream.write("\n")
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def exact_session_pid(state):
+    listing = run(["ps", "-axo", "pid=,command="])
+    if listing.returncode:
+        return None
+    for line in listing.stdout.splitlines():
+        match = re.match(r"\s*([0-9]+)\s+(.+)", line)
+        if not match or "--channels plugin:telegram@claude-plugins-official" not in match.group(2):
+            continue
+        pid = int(match.group(1))
+        env = run(["ps", "eww", "-p", str(pid)])
+        if env.returncode == 0 and re.search(
+                r"(?:^|\s)TELEGRAM_STATE_DIR=" + re.escape(str(state)) + r"(?=\s|$)", env.stdout):
+            return pid
+    return None
+
+
+def crash_exact_session(state, key, non_interactive):
+    if non_interactive or not sys.stdin.isatty():
+        return False, "a person must confirm this exact-PID test at the Mac"
+    pid = exact_session_pid(state)
+    if pid is None:
+        return False, "no matching session PID was found"
+    answer = input(f"Type CRASH {key} to stop session PID {pid} and test the watchdog: ")
+    if answer != f"CRASH {key}":
+        return False, "crash test was not confirmed"
+    if exact_session_pid(state) != pid:
+        return False, "session identity changed; nothing was signaled"
+    os.kill(pid, signal.SIGTERM)
+    return True, f"signaled exact session PID {pid}"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("key", nargs="?")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--non-interactive", action="store_true")
+    parser.add_argument("--wait", type=int, default=120)
+    parser.add_argument("--crash-test", action="store_true")
+    parser.add_argument("--consent", action="store_true")
+    args = parser.parse_args()
+    if args.dry_run:
+        for code, label, source in ROWS:
+            print(f"{code:3} {label:32} source: {source}")
+        return 0
+    if args.consent:
+        print("macOS may ask for Terminal Automation and Accessibility. Respond at this Mac.")
+        automation = run(["osascript", "-e", 'tell application "Terminal" to get name'])
+        accessibility = run(["osascript", "-e", 'tell application "System Events" to get UI elements enabled'])
+        print(f"Terminal Automation: {'ready' if automation.returncode == 0 else 'needs your action'}")
+        print(f"Accessibility: {'ready' if accessibility.returncode == 0 and accessibility.stdout.strip() == 'true' else 'needs your action'}")
+        return 0 if automation.returncode == 0 and accessibility.returncode == 0 and accessibility.stdout.strip() == "true" else 1
+    fleet = read_json(ROOT / "fleet.json", {})
+    bot = next((item for item in fleet.get("bots", []) if item.get("key") == args.key), None)
+    if bot is None:
+        parser.error("choose a configured bot key")
+    state = Path(bot["state_dir"]).expanduser()
+    token = token_from(state)
+    notes = Path(fleet.get("options", {}).get("notes_dir", "~/Telebots Notes")).expanduser()
+    if args.crash_test:
+        print("Self-heal needs a separate, explicit exact-PID test. No process was signaled by this checklist.")
+    values = {}
+    for code, label, source in ROWS:
+        if code.startswith("A"):
+            try: values[code] = auto_row(code, bot, fleet, state, token)
+            except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                values[code] = result("Failed", str(exc).splitlines()[0][:120])
+        else:
+            if code == "P13" and len(fleet.get("bots", [])) < 2:
+                values[code] = result("Not configured", "needs two bots")
+            elif code == "P14" and not read_json(ROOT / "email.json", {}).get("enabled", False):
+                values[code] = result("Not configured", "email is optional")
+            elif code == "P15" and not args.crash_test:
+                values[code] = result("Not configured", "optional exact-PID test")
+            else:
+                instruction = PHONE_STEPS[code]
+                print(f"{code}: {instruction}")
+                started = time.time()
+                threshold = state / "guardian-thresholds"
+                original = threshold.read_bytes() if code == "P12" and threshold.exists() else None
+                try:
+                    if code == "P12":
+                        threshold.write_text("1\n")
+                    sent = notify_phone(token, state, instruction, bubble=(code == "P2"))
+                    if not sent:
+                        print("Phone instruction could not be delivered; it is printed above.")
+                    if code == "P15":
+                        approved, detail = crash_exact_session(state, args.key, args.non_interactive)
+                        if not approved:
+                            values[code] = result("Needs your action", detail)
+                    if code != "P15" or approved:
+                        deadline = started + max(0, args.wait)
+                        while True:
+                            values[code] = phone_row(code, state, notes, len(fleet.get("bots", [])),
+                                                     read_json(ROOT / "email.json", {}).get("enabled", False),
+                                                     args.crash_test, started)
+                            if values[code]["status"] == "Passed" or time.time() >= deadline:
+                                break
+                            time.sleep(2)
+                finally:
+                    if code == "P12":
+                        if original is None:
+                            threshold.unlink(missing_ok=True)
+                        else:
+                            threshold.write_bytes(original)
+        print(f"{code:3} {values[code]['status']:18} {label}: {values[code]['detail']}")
+    output = ROOT / f"checklist-{args.key}.json"
+    save_results(output, args.key, values)
+    summary = ", ".join(f"{code} {value['status']}" for code, value in values.items())
+    notify_phone(token, state, "Checklist: " + summary)
+    return 0 if all(v["status"] in ("Passed", "Not configured") for v in values.values()) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1519,7 +1519,7 @@ final class FleetStore: ObservableObject {
             store.snapshotAvailable = true
             store.snapshotLine = "Snapshot saved · 6 sessions · 12:41pm ET"
             store.snapshotTip = "Snapshot saved · 6 sessions · 12:41pm ET. " + PanelCopy.restoreHelp
-            store.footerNote = RowNote(text: "Snapshot failed: claude-channels-snapshot.sh could not write /Users/demo/.claude/channels/restart-state/snapshot.tsv.tmp.48213 (No space left on device), so nothing was committed and every switch this run set was removed again. Free some disk space, then press Snapshot again. The engine's table follows: claudini 3f2a91c0 saved, claudito 77b1e2d4 saved, cactus 0c9d4e11 saved, jarvis 5be07aa2 saved, prune e41f09b3 saved, friday 9a3c5d70 not written.",
+            store.footerNote = RowNote(text: "Snapshot failed: the snapshot file could not be written (No space left on device), so nothing was committed and every switch set by this run was removed. Free disk space, then press Snapshot again. Five sessions were saved; the sixth was not written.",
                                        isError: true, at: Date().timeIntervalSince1970, session: nil)
         }
         return store
