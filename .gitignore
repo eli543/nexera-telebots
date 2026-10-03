@@ -34,6 +34,7 @@ __pycache__/
 *.pyc
 *.pyo
 node_modules/
+out/
 
 # macOS
 .DS_Store

@@ -6,13 +6,15 @@ Only file and line numbers are printed. Source text is never echoed.
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 import re
 import sys
 
+from repo_files import git_paths, read_manifest
+
 ROOT = Path(__file__).resolve().parents[2]
-SKIP_DIRS = {".git", "node_modules", "__pycache__", ".next"}
-SKIP_FILES = {"privacy-check.py", "privacy-allowlist.txt"}
+SKIP_FILES = {Path("tests/sandbox/privacy-check.py"), Path("tests/sandbox/privacy-allowlist.txt")}
 TEXT_SUFFIXES = {".md", ".sh", ".py", ".ts", ".tsx", ".js", ".json", ".yml", ".yaml", ".swift", ".plist", ".txt", ".patch"}
 TOKEN = re.compile(r"[0-9]{8,10}:[A-Za-z0-9_-]{35}")
 WORDS = re.compile(r"[A-Za-z0-9_]+")
@@ -74,15 +76,17 @@ def scan(path: Path) -> list[tuple[int, str]]:
 
 def main() -> int:
     findings: list[tuple[str, int, str]] = []
-    for path in ROOT.rglob("*"):
-        if any(part in SKIP_DIRS for part in path.relative_to(ROOT).parts):
-            continue
-        if not path.is_file() or path.name in SKIP_FILES:
+    sandbox_root = os.environ.get("TELEBOTS_SANDBOX_ROOT")
+    manifest = Path(sandbox_root) / "inputs/repo-files.nul" if sandbox_root else None
+    files = read_manifest(manifest) if manifest else git_paths(ROOT)
+    for relative in files:
+        path = ROOT / relative
+        if not path.is_file() or relative in SKIP_FILES:
             continue
         if path.suffix not in TEXT_SUFFIXES and path.name not in {"install.sh", "uninstall.sh"}:
             continue
         for number, kind in scan(path):
-            findings.append((str(path.relative_to(ROOT)), number, kind))
+            findings.append((str(relative), number, kind))
     if findings:
         for name, number, kind in findings[:40]:
             print(f"{name}:{number}: {kind}")

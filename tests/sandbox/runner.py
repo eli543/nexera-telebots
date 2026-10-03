@@ -17,6 +17,8 @@ import subprocess
 import sys
 import tempfile
 
+from repo_files import copy_files, git_paths, read_manifest
+
 REPO = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 STOCK_SHA = "d902d7195a527b579b889cfdbf251fc24fd224a68e319ac6b7c3b691515c3458"
@@ -95,8 +97,9 @@ def sandbox(parent: Path, number: int, phase1: bool, stock: Path | None, bun: Pa
     for name in ("home", "tmp", "cache", "tools", "logs", "mock"):
         (root / name).mkdir()
     shutil.copytree(HERE / "shims", root / "shims", symlinks=True)
-    shutil.copytree(REPO, root / "repo", symlinks=True,
-                    ignore=shutil.ignore_patterns(".git", "node_modules", "__pycache__", "*.pyc"))
+    unit_root = os.environ.get("TELEBOTS_SANDBOX_ROOT")
+    manifest = Path(unit_root) / "inputs/repo-files.nul" if unit_root else None
+    copy_files(REPO, root / "repo", read_manifest(manifest) if manifest else git_paths(REPO))
     slot = root / "home/.claude/plugins/cache/claude-plugins-official/telegram/0.0.7"
     (slot / ".claude-plugin").mkdir(parents=True)
     (slot / ".claude-plugin/plugin.json").write_text('{"version":"0.0.7"}\n')
