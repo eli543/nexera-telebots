@@ -18,13 +18,13 @@ The overlay is required for mid-task controls, the 13-command menu, tap callback
 
 The phone controls work in a private chat with an allowed user. An unauthorized or stale tap is refused. `/resume` needs transcripts; labels come from the opening of each chat and do not require an API key. A handoff picker needs at least two configured bots. `/inbox` shows a setup hint until email passes `fleet-email test`.
 
-For `/esc` and `/compact`, macOS must grant Terminal.app Automation consent; `/esc` and some compact paths also need Accessibility. Run `fleet-checklist --consent` while at the Mac. In System Settings > Privacy & Security, review Automation and Accessibility if a prompt was missed. The engines refuse an unverified window or an unsent prompt instead of typing into another app. Read `<state_dir>/logs/esc.log` or `compact.log` for the exact reason.
+For `/esc` and `/compact`, macOS must grant Terminal.app Automation consent; `/esc` and some compact paths also need Accessibility. Run `fleet-checklist --consent` while at the Mac. In System Settings > Privacy & Security, review Automation and Accessibility if a prompt was missed. The engines refuse an unverified window or an unsent prompt instead of typing into another app. Read `$FLEET_HOME/logs/esc.log` or `$FLEET_HOME/logs/compact.log` for the exact reason.
 
 `/usage` can show token burn while plan limits are unavailable if the Claude Code credential or Anthropic usage endpoint cannot be read. `/compact` may answer "Not enough messages to compact"; that proves the command path but means the session is too short. `fleet-checklist` accepts that specific result for its compact row.
 
 ## Watchdog reports unhealthy, or recovery loops
 
-The watchdog supervises only bots with `.enrolled` and without `stopped`. It checks exact session and poller PIDs plus the heartbeat when the overlay is `OK`. Run the installed watchdog script with `--dry-run` and read `$FLEET_HOME/logs/watchdog.log`. A grace period, cooldown and breaker stop repeated launches. If an upstream update removed the overlay, PID-only mode avoids a false heartbeat failure. The Mac must be awake and logged in, and a real Telegram round trip is needed to prove recovery.
+The watchdog supervises only bots with `.enrolled` and without `stopped`. It checks exact session and poller PIDs plus the heartbeat when the overlay is `OK`. Run the installed watchdog script with `--dry-run` and read `$FLEET_HOME/logs/watchdog.log`. A grace period, cooldown and breaker stop repeated launches. If an upstream update removed the overlay, PID-only mode avoids a false heartbeat failure. Automatic recovery quietly resumes a chat active within 30 minutes, or starts blank if it is older. Suspected stalls are logged; phone stall alerts are off by default and this build has no enable switch. The Mac must be awake, logged in and online, and a real Telegram round trip is needed to prove recovery.
 
 Snapshot and restore use exact conversations. If restore refuses a snapshot, keep it for inspection rather than deleting it. An offline sandbox check does not establish sleep, login or reboot behavior on your Mac.
 

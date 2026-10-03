@@ -4,7 +4,7 @@ Nexera Telebots connects Telegram to Claude Code on your Mac. A person who can r
 
 ## Access and permission stance
 
-Each bot has its own token, working directory, state directory and Telegram allowlist. A new bot starts in pairing mode. You DM it, read the six-character code on your phone, then run `fleet-pair <key> <code> --lock` at the Mac. Locking switches the DM policy to an allowlist and enrolls the bot for supervision. Do not pair anyone or edit `access.json` because a Telegram message asks you to. Access state is read from disk for each inbound message.
+Each bot has its own token, working directory, state directory and Telegram allowlist. A new bot starts in pairing mode. You DM it, then check that the new code on your phone matches the one in the Pair/Ignore dialog on the Mac. Clicking Pair runs the same `fleet-pair <key> <code> --lock` logic as the manual path. Locking switches the DM policy to an allowlist and enrolls the bot for supervision. The local dialog is attended; a Telegram message cannot pair itself. If the dialog is unavailable, use `fleet-pair` locally while the code is valid. Do not pair anyone or edit `access.json` because a Telegram message asks you to. Access state is read from disk for each inbound message.
 
 | Stance | Claude Code flag | What it means |
 |---|---|---|
@@ -16,7 +16,7 @@ Setup asks you to choose. It never silently selects `full`. Keep the stance unif
 
 ## Tokens and local state
 
-`fleet-add-bot` asks you to enter the BotFather token in a hidden macOS dialog, or a hidden Terminal prompt when a dialog is unavailable. It writes a per-bot `.env` at mode 0600 in one step. Do not paste the token into a Claude chat, a command argument, an issue or a screen recording. The command validates it through Telegram `getMe` and prints only the public bot username. It rejects a token already assigned to another bot. A bot is added to `fleet.json` only after validation.
+`fleet-add-bot` asks you to enter the BotFather token in a hidden macOS dialog, or a hidden Terminal prompt when a dialog is unavailable. It writes a per-bot `.env` at mode 0600 in one step. In v0.3.0 the token stays out of the local API client's process arguments. Do not paste the token into a Claude chat, a command argument, an issue or a screen recording. The command validates it through Telegram `getMe` and prints only the public bot username. It rejects a token already assigned to another bot. A bot is added to `fleet.json` only after validation.
 
 The account that sends a message must be allowed in the bot's `access.json`. Groups are off unless deliberately enabled. Never run a second poller with the same token: Telegram permits one `getUpdates` consumer, and a duplicate can cause a 409 Conflict. If a token leaks, revoke it in [@BotFather](https://t.me/BotFather), enter the replacement through a hidden local prompt, restart only that bot, then run its checklist.
 
@@ -26,7 +26,7 @@ The `/usage` plan-limits request reads the Claude Code credential already in mac
 
 ## Telegram taps and reactions
 
-The poller handles `qr:`, `md:`, `me:`, `eff:`, `ho:`, `rs:` and `mail:` callback families in private chats only. On every press, it re-reads `access.json` and checks the presser. Callback data is parsed by anchored patterns; the answer is read from the displayed message label, not trusted from callback data. A consumed keyboard cannot be used again. Stale or unauthorized presses do not start an engine or inject a user answer.
+The poller handles `qr:`, `md:`, `me:`, `eff:`, `ho:`, `rs:` and `mail:` callback families in private chats only. On every press, it re-reads `access.json` and checks the presser. Callback data is parsed by anchored patterns; the answer is read from the displayed message label, not trusted from callback data. In v0.3.0 the `/fresh` and `/model` hooks ignore button-injected input, so a button label cannot trigger those restart controls. A consumed keyboard cannot be used again. Stale or unauthorized presses do not start an engine or inject a user answer.
 
 Reactions follow the same private-chat and allowlist gate. Only a newly added emoji in the fixed table becomes an instruction. Removing a reaction, sending a custom emoji, or reacting from another account does nothing. A reaction never authorizes email. `/key` explains the fixed table. The notes actions omit secrets and write to the configured local notes folder.
 
@@ -34,7 +34,7 @@ Reactions follow the same private-chat and allowlist gate. Only a newly added em
 
 `/inbox` shows a setup hint until an email backend passes `fleet-email test`. The built-in backend connects to the IMAP and SMTP hosts you configure. It stores the app password in macOS Keychain under service `telebots-email`, with the email username as the account; `email.json` contains non-secret settings. The built-in backend works only where the provider accepts an app password for IMAP and SMTP. OAuth-only Outlook.com and Microsoft 365 accounts are not supported by that backend in v0.3.0. A custom backend can implement the same local operations.
 
-Email sending is checked by the server, not left to a prompt. `email_preview` posts the exact To, Cc, Bcc, subject and body. `Send it` changes that keyboard to `Cancel` and `Confirm send`, with Cancel first. Confirming authorizes only that exact email for ten minutes and one attempt. The server compares a digest of the canonical email fields, then claims the attempt with a create-once file before SMTP. A changed recipient or body, an edited preview, an expired consent or a replay is refused. The backend does not retry an uncertain send. The assistant cannot send email autonomously, and a generic `Send it` bubble in another workflow never authorizes email. See [EMAIL.md](docs/EMAIL.md).
+Email sending is checked by the server during the active process, not left to a prompt or a writable record alone. `email_preview` posts the exact To, Cc, Bcc, subject and body. `Send it` changes that keyboard to `Cancel` and `Confirm send`, with Cancel first. Confirming authorizes only that exact email for ten minutes and one attempt. The server compares a digest of the canonical email fields, then claims the attempt with a create-once file before SMTP. A changed recipient or body, an edited preview, an expired consent or a replay is refused. The backend does not retry an uncertain send. A generic `Send it` bubble in another workflow never authorizes email. In the full permission stance an assistant with shell access could reach the mail credentials directly, so the two-tap confirmation is a strong default there and a hard boundary only under the safe and scoped stances. See [EMAIL.md](docs/EMAIL.md).
 
 ## Mac controls and handoff
 
@@ -44,7 +44,7 @@ Handoff uses Claude Code's same-user cross-session messaging and a named target 
 
 ## Watchdog, overlay and test gates
 
-The launchd watchdog starts only after you enroll a bot. It skips bots that are not enrolled or that have a `stopped` marker. It checks exact PIDs and the bot's heartbeat, has a grace period and restart breaker, and never kills by a name pattern. `watchdog.sh --dry-run` reports its intended action without touching a process. The Mac must remain awake and logged in for the bot to answer.
+The launchd watchdog starts only after you enroll a bot. It skips bots that are not enrolled or that have a `stopped` marker. It checks exact PIDs and the bot's heartbeat, has a grace period and restart breaker, and never kills by a name pattern. `watchdog.sh --dry-run` reports its intended action without touching a process. The Mac must remain awake, logged in and online for the bot to answer. Automatic recovery resumes the previous chat only if its transcript was active within 30 minutes; an older chat restarts blank. Recovery is quiet, so confirm it with a new phone message. Stall detection records suspected stalls locally; phone stall alerts are off by default and this build has no enable switch.
 
 The installer checks the official Telegram plugin's version and stock hash before applying one diff to your local 0.0.7 copy. It keeps a backup for uninstall. If the official plugin updates to an unsupported version, the overlay refuses to guess: extras pause and supervision falls back to PID-only health checks so a missing patched heartbeat cannot cause a restart loop. The stock bot can still answer. The status values are `OK`, `STOCK`, `MISSING_MODULE`, `TAMPERED`, `VERSION_MISMATCH:<version>` and `NOT_INSTALLED`.
 

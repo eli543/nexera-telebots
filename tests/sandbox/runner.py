@@ -333,7 +333,7 @@ def changed_items(before: dict[str, object], after: dict[str, object]) -> list[s
 
 
 def snapshot(real_home: Path | None, main: Path | None) -> dict[str, object]:
-    """Record only protected infrastructure and the named live daemon PIDs."""
+    """Record protected files and the launchd-owned daemon PIDs by label."""
     found: dict[str, object] = {}
     if real_home:
         cache = real_home / ".claude/plugins/cache/claude-plugins-official/telegram"
@@ -354,18 +354,24 @@ def snapshot(real_home: Path | None, main: Path | None) -> dict[str, object]:
                                env={"HOME": str(real_home or Path.home()), "PATH": "/usr/bin:/bin",
                                     "GIT_OPTIONAL_LOCKS": "0"})
             found[f"git:{main}:{label}"] = (r.returncode, r.stdout, r.stderr)
+    labels = ("com.nexera.channel-watchdog", "com.claude-fleet.menubar",
+              "com.nexera.transcribe-voice-daemon")
     try:
-        process_list = subprocess.run(["/bin/ps", "-axo", "pid=,command="], text=True,
-                                      capture_output=True, check=False,
-                                      env={"HOME": str(real_home or Path.home()), "PATH": "/usr/bin:/bin"})
+        listed = subprocess.run(["/bin/launchctl", "list"], text=True,
+                                capture_output=True, check=False,
+                                env={"HOME": str(real_home or Path.home()), "PATH": "/usr/bin:/bin"})
     except OSError:
-        process_list = None
-    if process_list is None or process_list.returncode:
-        found["live-daemon-pids"] = "unavailable"
+        listed = None
+    if listed is None or listed.returncode:
+        found["live-daemon-labels"] = "unavailable"
     else:
-        matches = ("channel-watchdog-loop", "Telebots Bar", "transcribe-voice-daemon")
-        found["live-daemon-pids"] = sorted({line.split(None, 1)[0] for line in process_list.stdout.splitlines()
-                                           if any(name in line for name in matches) and line.split()})
+        pids = {}
+        for line in listed.stdout.splitlines():
+            fields = line.split(None, 2)
+            if len(fields) == 3 and fields[2] in labels:
+                pids[fields[2]] = fields[0]
+        for label in labels:
+            found[f"live-daemon:{label}"] = pids.get(label, "not loaded")
     return found
 
 
@@ -452,17 +458,18 @@ def main() -> int:
     after = snapshot(args.real_home, args.main_checkout)
     changes = changed_items(before, after)
     files_untouched = not changes
-    pid_verified = (before.get("live-daemon-pids") != "unavailable"
-                    and after.get("live-daemon-pids") != "unavailable")
+    pid_verified = (before.get("live-daemon-labels") != "unavailable"
+                    and after.get("live-daemon-labels") != "unavailable")
     state = "PASS" if files_untouched and pid_verified else "PARTIAL" if files_untouched else "FAIL"
     print(f"UNTOUCHED {state}", flush=True)
     if not pid_verified:
         print("  live daemon PID check unavailable in this execution sandbox", flush=True)
     for key in changes:
         print(f"  changed: {key}", flush=True)
-        if key == "live-daemon-pids":
+        if key.startswith("live-daemon:"):
             print(f"  daemon PIDs before={before.get(key)} after={after.get(key)}", flush=True)
-    print("TOTAL " + " ".join(f"{k}={v}" for k, v in total.items()), flush=True)
+    print("TOTAL grouped-scenario-results=42 (one shared root for scenarios 1-20 and one Linux root per pass; suites reused within each pass) "
+          + " ".join(f"{k}={v}" for k, v in total.items()), flush=True)
     return 0 if files_untouched and not total["FAIL"] and (args.phase1 or (not total["STUB"] and pid_verified)) else 1
 
 

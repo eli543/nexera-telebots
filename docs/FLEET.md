@@ -1,6 +1,6 @@
 # One bot or a fleet
 
-One bot is a complete installation. More bots give you separate Telegram chats and Claude Code sessions with the same Telebots commands, hooks and rules. You choose each bot's name, emoji and key. There is no built-in six-bot limit; BotFather's account limits and the Mac's capacity set the practical count.
+One bot is a complete installation. More bots give you separate Telegram chats and Claude Code sessions with the same Telebots commands, hooks and rules. Choose your names and count, within Telegram's bot limits and the Mac's capacity.
 
 Each bot has its own BotFather token, Terminal.app window, working directory, state directory, access list and transcript history. Do not point two sessions at one token. You can give bots the same project context by linking their workdirs to a shared `CLAUDE.md` or common notes, but that shared knowledge is your choice and is separate from their tokens and state.
 
@@ -11,10 +11,10 @@ Finish the first bot and its checklist before starting the next. Then:
 1. You do this on your phone: create the next bot in [@BotFather](https://t.me/BotFather) and keep the token private.
 2. Run `~/.claude/telegram-fleet/bin/fleet-add-bot <key> --name <name> --emoji <emoji>` on the Mac. You do this: paste the token into the hidden dialog. The command validates it before adding the entry to `fleet.json`.
 3. Run `~/.claude/telegram-fleet/bin/fleet-start <key>`. You do this at the Mac: accept the new folder trust prompt in that bot's Terminal window.
-4. You do this on your phone: DM that bot, read its code, then run `~/.claude/telegram-fleet/bin/fleet-pair <key> <code> --lock` on the Mac.
+4. You do this on your phone: DM that bot, match its code to the Pair/Ignore dialog on the Mac and click Pair. If the dialog is unavailable, run `~/.claude/telegram-fleet/bin/fleet-pair <key> <code> --lock` locally.
 5. Send `hi` and run `~/.claude/telegram-fleet/bin/fleet-checklist <key>`. Complete the requested phone steps. The existing watchdog starts supervising the new bot only after enrollment.
 
-Do not hand-edit `.env` or create a config entry while waiting for a BotFather token. Telegram may let you create a few bots quickly and then delay another `/newbot` by about a day. Its exact pacing is unpublished. Community references put the account cap at 20 bots, or 40 with Telegram Premium. Add one bot at a time.
+Do not hand-edit `.env` or create a config entry while waiting for a BotFather token. BotFather may delay further `/newbot` requests. Add one bot at a time.
 
 ## Config and paths
 
@@ -30,4 +30,4 @@ With two or more bots, a context nudge can offer Hand off. The picker excludes t
 
 ## Availability
 
-The optional watchdog can restart an enrolled bot whose session or poller dies, subject to its cooldown and breaker. It skips parked bots. A Mac that is asleep, logged out or offline cannot receive or answer Telegram updates. For a planned reboot, snapshot first and restore after login. Prove recovery with a real message round trip, not only a process badge.
+The optional watchdog can restart an enrolled bot whose session or poller dies, subject to its cooldown and breaker. It skips parked bots. It resumes the previous conversation only when that transcript was active within 30 minutes; otherwise the bot starts blank. Recovery is quiet. Suspected stalls are logged locally; phone stall alerts are off by default and this build has no switch to enable them. A Mac that is asleep, logged out or offline cannot receive or answer Telegram updates. For a planned reboot, snapshot first and restore after login. Prove recovery with a real message round trip, not only a process badge.

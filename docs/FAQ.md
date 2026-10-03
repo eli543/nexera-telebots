@@ -16,9 +16,9 @@ The official plugin handles the Telegram channel and pairing. Telebots adds the 
 
 No. It runs Claude Code with Anthropic's official `telegram@claude-plugins-official` plugin through `--channels`. It modifies the user's local copy of plugin 0.0.7 with a version-checked diff and ships its own module. [NOTICE.md](../NOTICE.md) explains the licenses. Claude Code channels remain a research preview and can change.
 
-## Can BotFather make as many bots as I want?
+## Can I choose the bot names and count?
 
-Bot names and the number you configure are your choice, but Telegram controls creation. BotFather may throttle `/newbot` after the first few; waits can reach about a day. Telegram does not publish that pacing rule. Community references put the account limit at 20 bots, or 40 with Telegram Premium. Finish one bot before creating the next.
+Choose your names and count, within Telegram's bot limits. BotFather may delay further `/newbot` requests. Finish one bot before creating the next.
 
 ## Does voice require Apple Silicon?
 
