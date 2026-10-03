@@ -46,7 +46,7 @@ ROWS = (
     ("P10", "Context and usage", "INTERCEPT events; context.log; usage.log"),
     ("P11", "Compact", "fleet-home compact.log delivered or Not enough messages"),
     ("P12", "Context nudge and Keep going", "guardian.log GUARDIAN reason=8 pct= threshold= ok=true; TAP"),
-    ("P13", "Agent-attested handoff delivery", "fresh one-use delivery ID in both poller receipts; needs two bots"),
+    ("P13", "Handoff confirmed in target chat", "matching poller receipts and a recorded user confirmation; needs two bots"),
     ("P14", "Full inbox reply", "linked full read, two-tap confirmation and SMTP receipt"),
     ("P15", "Watchdog recovery", "fleet-home watchdog.log result; quiet restart ledger; 30-minute resume boundary"),
     ("P17", "Model switch keeps history", "model-state and model.log; same session id; restart ledger"),
@@ -125,7 +125,8 @@ def log_lines_since(path, started):
     for line in source:
         try:
             prefix = line.split(" ", 1)[0]
-            stamp = datetime.fromisoformat(prefix if "T" in prefix else line[:19]).timestamp()
+            value = prefix if "T" in prefix else line[:19]
+            stamp = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value).timestamp()
         except (ValueError, IndexError):
             continue
         if stamp >= int(started):
@@ -399,6 +400,48 @@ def auto_row(code, bot, fleet, state, token):
     return result("Failed", "unknown row")
 
 
+def handoff_evidence(state, started):
+    """Return the newest matching agent receipts, without treating them as delivery proof."""
+    source = bot_record(state)
+    if not source:
+        return None
+    fleet = read_json(ROOT / "fleet.json", {})
+    lines = lines_since(state, started) if started else event_lines(state)
+    for sent in reversed(list(matching_events(lines, "HANDOFF-SENT"))):
+        note_id, target, delivery = sent.get("id", ""), sent.get("target", ""), sent.get("delivery", "")
+        if (sent.get("source") != source.get("key") or
+                not re.fullmatch(r"[a-f0-9]{24}", note_id) or not re.fullmatch(r"[a-f0-9]{24}", delivery) or
+                not event_seen(lines, "HANDOFF-ISSUED", id=note_id, source=source["key"], target=target, delivery=delivery)):
+            continue
+        record_path = ROOT / "handoffs" / "deliveries" / (delivery + ".json")
+        try:
+            record = read_json(record_path, {})
+            issued_at = record.get("issued_at", 0)
+            fresh = (record_path.stat().st_mode & 0o777 == 0o600 and
+                     started * 1000 <= issued_at <= time.time() * 1000 and
+                     time.time() * 1000 - issued_at <= 60 * 60 * 1000 and
+                     record.get("phase") == "received" and record.get("delivery_id") == delivery and
+                     record.get("note_id") == note_id and record.get("source") == source["key"] and
+                     record.get("target") == target)
+        except (OSError, TypeError, ValueError):
+            fresh = False
+        if not fresh:
+            continue
+        peer = next((item for item in fleet.get("bots", []) if item.get("key") == target and target != source.get("key")), None)
+        if not peer:
+            continue
+        target_state = Path(peer.get("state_dir", "")).expanduser()
+        received = log_lines_since(target_state / "logs/poller-events.log", started)
+        if event_seen(received, "HANDOFF-RECEIVED", id=note_id, source=source["key"], target=target, delivery=delivery):
+            return {"note_id": note_id, "delivery_id": delivery, "source": source["key"],
+                    "target": target, "target_name": peer.get("name") or target, "issued_at": issued_at}
+    return None
+
+
+def handoff_confirmation_path(source):
+    return ROOT / "checklist-confirmations" / ("P13-" + source + ".json")
+
+
 def phone_row(code, state, notes, fleet_size, email_enabled, crash_test, started=0, baseline=None):
     lines = lines_since(state, started) if started else event_lines(state)
     logs = state / "logs"
@@ -441,34 +484,25 @@ def phone_row(code, state, notes, fleet_size, email_enabled, crash_test, started
     elif code == "P12": ok = guardian_sent(log_lines_since(logs / "guardian.log", started)) and event_seen(lines, "TAP", family="qr")
     elif code == "P13":
         if fleet_size < 2: return result("Not configured", "needs two bots")
-        source = bot_record(state)
-        fleet = read_json(ROOT / "fleet.json", {})
-        for sent in matching_events(lines, "HANDOFF-SENT"):
-            note_id, target, delivery = sent.get("id", ""), sent.get("target", ""), sent.get("delivery", "")
-            if (not source or sent.get("source") != source.get("key") or
-                    not re.fullmatch(r"[a-f0-9]{24}", note_id) or not re.fullmatch(r"[a-f0-9]{24}", delivery) or
-                    not event_seen(lines, "HANDOFF-ISSUED", id=note_id, source=source["key"], target=target, delivery=delivery)):
-                continue
-            record_path = ROOT / "handoffs" / "deliveries" / (delivery + ".json")
-            try:
-                record = read_json(record_path, {})
-                fresh = (record_path.stat().st_mode & 0o777 == 0o600 and
-                         started * 1000 <= record.get("issued_at", 0) <= time.time() * 1000 and
-                         record.get("phase") == "received" and record.get("delivery_id") == delivery and
-                         record.get("note_id") == note_id and record.get("source") == source["key"] and
-                         record.get("target") == target)
-            except (OSError, TypeError, ValueError):
-                fresh = False
-            if not fresh:
-                continue
-            peer = next((item for item in fleet.get("bots", []) if item.get("key") == target and target != source.get("key")), None)
-            if not peer:
-                continue
-            target_state = Path(peer.get("state_dir", "")).expanduser()
-            received = log_lines_since(target_state / "logs/poller-events.log", started)
-            if event_seen(received, "HANDOFF-RECEIVED", id=note_id, source=source["key"], target=target, delivery=delivery):
-                return result("Passed", "agent-attested delivery ID matched in both pollers; check the acknowledgement in the second chat")
-        return result("Needs your action", "complete the handoff; both pollers need matching receipts for a fresh one-use delivery ID")
+        matched = handoff_evidence(state, started)
+        if not matched:
+            return result("Needs your action", "complete the handoff; both pollers need matching receipts for a fresh one-use delivery ID")
+        summary = (f"Receipt: note {matched['note_id']}, {matched['source']} to {matched['target']}, "
+                   f"delivery {matched['delivery_id']} (agent-attested).")
+        confirmation = read_json(handoff_confirmation_path(matched["source"]), {})
+        try:
+            confirmed = (handoff_confirmation_path(matched["source"]).stat().st_mode & 0o777 == 0o600 and
+                         confirmation.get("note_id") == matched["note_id"] and
+                         confirmation.get("delivery_id") == matched["delivery_id"] and
+                         confirmation.get("source") == matched["source"] and
+                         confirmation.get("target") == matched["target"] and
+                         matched["issued_at"] / 1000 <= confirmation.get("confirmed_at", 0) <= time.time() and
+                         confirmation.get("confirmed_at", 0) >= started)
+        except (OSError, TypeError, ValueError):
+            confirmed = False
+        if confirmed:
+            return result("Passed", f"User confirmed the note in {matched['target_name']} chat. {summary}")
+        return result("Needs your action", f"Confirm the note arrived in {matched['target_name']} chat. {summary} Run fleet-checklist confirm P13 {matched['source']} at the Mac.")
     elif code == "P14":
         if not email_enabled: return result("Not configured", "email is optional")
         for reply in matching_events(lines, "EMAIL-REPLY"):
@@ -550,7 +584,7 @@ PHONE_STEPS = {
     "P10": "Send /context and /usage; wait for both reports.",
     "P11": "Send /compact and wait for completion or the short-chat response.",
     "P12": "Send one message to trigger the context nudge, then tap Keep going.",
-    "P13": "With two bots, complete a handoff and confirm the second bot received the note.",
+    "P13": "With two bots, complete a handoff. Check the target bot chat, then run fleet-checklist confirm P13 <source-bot-key> at the Mac.",
     "P14": "Open /inbox, read a complete message, reply with the original recipients and confirm the exact preview twice.",
     "P15": "Optional exact-PID crash test with a person at the Mac. Recovery is quiet; check the bot by sending a new message.",
     "P16": "Last step: send /fresh and verify a new blank chat and Back and ready.",
@@ -627,7 +661,49 @@ def crash_exact_session(state, key, non_interactive):
     return True, f"signaled exact session PID {pid}"
 
 
+def confirm_p13(key):
+    fleet = read_json(ROOT / "fleet.json", {})
+    bot = next((item for item in fleet.get("bots", []) if item.get("key") == key), None)
+    if not bot or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,30}", key):
+        print("Choose a configured source bot key.", file=sys.stderr)
+        return 2
+    if not sys.stdin.isatty():
+        print("P13 needs the person at the Mac to confirm the target chat.", file=sys.stderr)
+        return 1
+    matched = handoff_evidence(Path(bot["state_dir"]).expanduser(), 0)
+    if not matched:
+        print("No fresh matching handoff receipts were found.", file=sys.stderr)
+        return 1
+    print(f"Agent receipts: note {matched['note_id']}, {matched['source']} to {matched['target']}, delivery {matched['delivery_id']}.")
+    expected = "CONFIRM " + matched["target"]
+    answer = input(f"Confirm the note arrived in {matched['target_name']} chat. Type {expected}: ")
+    if answer != expected:
+        print("P13 was not confirmed.")
+        return 1
+    path = handoff_confirmation_path(matched["source"])
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temp = tempfile.mkstemp(prefix=".P13-", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump({"note_id": matched["note_id"], "delivery_id": matched["delivery_id"],
+                       "source": matched["source"], "target": matched["target"],
+                       "confirmed_at": time.time()}, stream)
+            stream.write("\n")
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+    print(f"P13 confirmation recorded for {matched['target_name']} chat.")
+    return 0
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "confirm":
+        if len(sys.argv) != 4 or sys.argv[2] != "P13":
+            print("Usage: fleet-checklist confirm P13 <source-bot-key>", file=sys.stderr)
+            return 2
+        return confirm_p13(sys.argv[3])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("key", nargs="?")
     parser.add_argument("--dry-run", action="store_true")

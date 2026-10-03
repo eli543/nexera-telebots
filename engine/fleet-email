@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 
 FLEET_HOME = Path(os.environ.get("FLEET_HOME", "~/.claude/telegram-fleet")).expanduser()
 CONFIG = FLEET_HOME / "email.json"
@@ -425,8 +426,9 @@ def adapter_payload(op, req):
         if type(limit) is not int or not 1 <= limit <= 20:
             fail("Inbox limit must be 1 to 20.")
         return {"limit": limit}
-    uid = str(req.get("id", ""))
-    if not uid.isdigit():
+    uid = req.get("id")
+    if (not isinstance(uid, str) or not uid.strip() or
+            any(unicodedata.category(char) in ("Cc", "Cs", "Zl", "Zp") for char in uid)):
         fail("Invalid inbox ID.")
     if op in ("read", "archive"):
         return {"id": uid}

@@ -697,6 +697,7 @@ struct BotIndicators: Equatable {
     var contextPercent: Int?    // nil when unknown (no transcript yet)
     var restartsLastHour: Int
     var stallSuspected: Bool
+    var stallPhoneNotified: Bool
     var sessionStarted: TimeInterval?
     var launchMode: String      // "resumed", "fresh", "continued", "not running"
     var lastHeartbeat: TimeInterval?
@@ -810,10 +811,20 @@ extension FleetModel {
     /// The watchdog's stall flag, counted only when the waiting message reached the
     /// session that is running now (a flag left from before a restart is stale).
     static func stallSuspected(_ bot: Bot, _ config: FleetConfig, sessionStarted: TimeInterval?) -> Bool {
-        let flag = config.settings.watchdogStateDir + "/" + bot.key + ".stall_alerted"
+        let flag = config.settings.watchdogStateDir + "/" + bot.key + ".stall_observed"
         guard isRegularFile(flag), let inbound = firstLineDigits(flag) else { return false }
         guard let started = sessionStarted else { return true }
         return TimeInterval(inbound) >= started
+    }
+
+    /// A phone notice counts only for the same observed inbound message.
+    static func stallPhoneNotified(_ bot: Bot, _ config: FleetConfig, sessionStarted: TimeInterval?) -> Bool {
+        guard stallSuspected(bot, config, sessionStarted: sessionStarted) else { return false }
+        let flag = config.settings.watchdogStateDir + "/" + bot.key + ".stall_alerted"
+        let observation = config.settings.watchdogStateDir + "/" + bot.key + ".stall_observed"
+        guard isRegularFile(flag), isRegularFile(observation),
+              let alerted = firstLineDigits(flag), let observed = firstLineDigits(observation) else { return false }
+        return alerted == observed
     }
 
     static func indicators(_ health: BotHealth, _ config: FleetConfig, withContext: Bool) -> BotIndicators {
@@ -849,6 +860,7 @@ extension FleetModel {
             contextPercent: context,
             restartsLastHour: restartsLastHour(health.bot, config, now: health.checkedAt),
             stallSuspected: health.state == .down ? false : stallSuspected(health.bot, config, sessionStarted: health.sessionStarted),
+            stallPhoneNotified: health.state == .down ? false : stallPhoneNotified(health.bot, config, sessionStarted: health.sessionStarted),
             sessionStarted: health.sessionStarted,
             launchMode: health.launchMode.hasPrefix("resumed") ? "resumed" : health.launchMode,
             lastHeartbeat: modificationTime(beatPath))
@@ -1491,9 +1503,17 @@ extension FleetModel {
         var reported: String?
         for line in text.split(separator: "\n").map(String.init) {
             if line.hasPrefix("=== "), line.contains("restart pid=") { ours = line.hasSuffix(marker); reported = nil }
-            if ours, line.contains("back-online ping sent") { reported = line.contains("Continue button attached") ? " with Continue button" : "" }
+            if ours, let markerRange = line.range(of: "back-online ping status=") {
+                let status = line[markerRange.upperBound...].split(separator: " ", maxSplits: 1).first.map(String.init)
+                if ["accepted", "attempted", "failed"].contains(status ?? "") { reported = status }
+            }
             if ours, line == "=== done (exit=0) ===", let reported {
-                return "engine reports \(BotChat.backAndReady) sent\(reported) (engine log; no Bot API receipt retained)"
+                switch reported {
+                case "accepted": return "engine log reports Telegram accepted \(BotChat.backAndReady) (message ID not retained)"
+                case "attempted": return "engine log reports \(BotChat.backAndReady) attempted without Telegram acceptance"
+                case "failed": return "engine log reports \(BotChat.backAndReady) failed to send"
+                default: return nil
+                }
             }
         }
         return nil

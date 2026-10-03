@@ -158,16 +158,52 @@ else
   if [ "$DRY_RUN" -eq 0 ]; then wait_for_watchdog_shutdown || exit 1; fi
 fi
 
-if [ "$RESTORE_PLAN" = RESTORE ]; then
-  step "Restore and verify the stock 0.0.7 plugin slot"
-  run /bin/bash "$REPO_DIR/poller/restore-stock.sh"
-  if [ "$DRY_RUN" -eq 0 ]; then
-    if ! VERIFIED_PLAN="$(/bin/bash "$REPO_DIR/poller/restore-stock.sh" --preflight)" || [ "$VERIFIED_PLAN" != STOCK ]; then
-      note "Stock plugin hash could not be verified. Uninstall stopped."
-      exit 1
-    fi
-    note "Stock plugin hash verified."
+INITIAL_RESTORE_PLAN="$RESTORE_PLAN"
+if [ "$DRY_RUN" -eq 0 ]; then
+  step "Recheck the official Telegram plugin after watchdog shutdown"
+  if ! RESTORE_PLAN="$(/bin/bash "$REPO_DIR/poller/restore-stock.sh" --preflight)"; then
+    note "Plugin restoration preflight failed after watchdog shutdown. Uninstall stopped."
+    exit 1
   fi
+  case "$RESTORE_PLAN" in
+    RESTORE|STOCK|ABSENT|OTHER_VERSION:*) note "Current restoration plan: $RESTORE_PLAN" ;;
+    *) note "Unknown restoration plan after watchdog shutdown. Uninstall stopped."; exit 1 ;;
+  esac
+else
+  note "Would recheck the restoration plan after watchdog shutdown."
+fi
+
+if [ "$RESTORE_PLAN" = RESTORE ]; then
+  step "Restore the stock 0.0.7 plugin slot"
+  if ! run /bin/bash "$REPO_DIR/poller/restore-stock.sh"; then
+    note "Stock plugin restoration failed. Uninstall stopped."
+    exit 1
+  fi
+fi
+
+if [ "$DRY_RUN" -eq 0 ]; then
+  # Preflight hashes server.ts. Run it even when the fresh plan was STOCK, so
+  # the final state is checked before any other teardown action.
+  if ! VERIFIED_PLAN="$(/bin/bash "$REPO_DIR/poller/restore-stock.sh" --preflight)"; then
+    note "Stock plugin hash could not be verified. Uninstall stopped."
+    exit 1
+  fi
+  case "$RESTORE_PLAN" in
+    RESTORE|STOCK)
+      if [ "$VERIFIED_PLAN" != STOCK ]; then
+        note "Stock plugin hash could not be verified. Uninstall stopped."
+        exit 1
+      fi
+      note "Stock plugin hash verified." ;;
+    ABSENT|OTHER_VERSION:*)
+      if [ "$INITIAL_RESTORE_PLAN" = RESTORE ] || [ "$INITIAL_RESTORE_PLAN" = STOCK ] || [ "$VERIFIED_PLAN" != "$RESTORE_PLAN" ]; then
+        note "The official plugin slot changed during teardown. Uninstall stopped."
+        exit 1
+      fi
+      note "No 0.0.7 plugin slot is present to hash; other versions are untouched." ;;
+  esac
+else
+  note "Would verify the stock plugin hash after restoration."
 fi
 
 step "Stop and remove the optional voice agent"

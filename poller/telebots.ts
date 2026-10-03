@@ -67,12 +67,12 @@ const QUICK_RE = /^qr:(\d{1,2}):(\d{1,2})$/
 const HANDOFF_RE = /^ho:(?:bot:)?([a-z0-9][a-z0-9-]{0,30})$/
 const NOTE_ID_RE = /^[a-f0-9]{24}$/
 const DELIVERY_LIFETIME_MS = 60 * 60 * 1000
-type DeliveryRecord = { delivery_id: string; note_id: string; source: string; target: string; issued_at: number; digest: string; phase: 'issued' | 'sent' | 'received' }
+type DeliveryRecord = { delivery_id: string; note_id: string; source: string; target: string; issued_at: number; digest: string; phase: 'issued' | 'sent' | 'received' | 'cancelled' }
 const HANDOFF_RECEIPT_TOOL: Tool = {
   name: 'handoff_receipt',
-  description: 'The sending bot calls issue before preview: it adds a one-use delivery ID to the local note. After SendMessage reports delivery, the sender calls sent with that ID. The receiving bot calls received with the same ID only after it gets the full cross-session note. These are agent attestations, not independent transport proof.',
+  description: 'The sender calls issue before the first preview. If the note changes or the one-hour ID expires before sending, call renew with the old ID, then show a fresh preview; the old ID is cancelled. After SendMessage reports delivery, call sent with the current ID. The receiver calls received only after getting the full note. These are agent attestations, not independent transport proof.',
   inputSchema: { type: 'object', additionalProperties: false, properties: {
-    note_id: { type: 'string' }, phase: { type: 'string', enum: ['issue', 'sent', 'received'] }, delivery_id: { type: 'string' },
+    note_id: { type: 'string' }, phase: { type: 'string', enum: ['issue', 'renew', 'sent', 'received'] }, delivery_id: { type: 'string' },
   }, required: ['note_id', 'phase'] },
 }
 const isEffort = (value: string): value is Effort => (EFFORTS as readonly string[]).includes(value)
@@ -231,7 +231,7 @@ export class TelebotsModule implements Telebots {
     if (name !== 'handoff_receipt') return this.email.callTool(name, args)
     try {
       const id = args.note_id, phase = args.phase
-      if (typeof id !== 'string' || !NOTE_ID_RE.test(id) || !['issue', 'sent', 'received'].includes(String(phase))) throw Error('Invalid handoff receipt.')
+      if (typeof id !== 'string' || !NOTE_ID_RE.test(id) || !['issue', 'renew', 'sent', 'received'].includes(String(phase))) throw Error('Invalid handoff receipt.')
       const self = this.self()?.key
       if (!self) throw Error('This bot is not configured.')
       const path = join(this.fleetHome, 'handoffs', `${id}.md`)
@@ -267,7 +267,32 @@ export class TelebotsModule implements Telebots {
         if (!receiptInfo.isFile() || (receiptInfo.mode & 0o777) !== 0o600 || receiptInfo.size > 4096) throw Error('Invalid delivery record.')
         const record = JSON.parse(readFileSync(receiptPath, 'utf8')) as DeliveryRecord
         if (record.delivery_id !== delivery || record.note_id !== id || record.source !== source || record.target !== target ||
-            !Number.isFinite(record.issued_at) || record.issued_at > this.now() || this.now() - record.issued_at > DELIVERY_LIFETIME_MS ||
+            !Number.isFinite(record.issued_at) || record.issued_at > this.now()) throw Error('Invalid delivery record.')
+        if (phase === 'renew') {
+          const idLines = note.match(/^DELIVERY-ID: [^\r\n]*$/gm) ?? []
+          if (record.phase !== 'issued' || idLines.length !== 1 || idLines[0] !== `DELIVERY-ID: ${delivery}`) throw Error('Invalid delivery record.')
+          const replacement = randomBytes(12).toString('hex')
+          const updated = note.replace(`\nDELIVERY-ID: ${delivery}\n`, `\nDELIVERY-ID: ${replacement}\n`)
+          if (updated === note || Buffer.byteLength(updated) > 64_000) throw Error('Invalid handoff note.')
+          const next: DeliveryRecord = { delivery_id: replacement, note_id: id, source, target,
+            issued_at: this.now(), digest: createHash('sha256').update(updated).digest('hex'), phase: 'issued' }
+          const nextPath = join(directory, `${replacement}.json`)
+          writeFileSync(nextPath, JSON.stringify(next) + '\n', { flag: 'wx', mode: 0o600 })
+          const oldTemp = `${receiptPath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
+          const noteTemp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
+          try {
+            writeFileSync(oldTemp, JSON.stringify({ ...record, phase: 'cancelled' }) + '\n', { flag: 'wx', mode: 0o600 })
+            renameSync(oldTemp, receiptPath)
+            writeFileSync(noteTemp, updated, { flag: 'wx', mode: 0o600 })
+            renameSync(noteTemp, path)
+          } finally {
+            try { unlinkSync(oldTemp) } catch {}
+            try { unlinkSync(noteTemp) } catch {}
+          }
+          this.logEvent('HANDOFF-ISSUED', { id, source, target, delivery: replacement })
+          return { content: [{ type: 'text', text: `Delivery ID: ${replacement}. The old ID is cancelled. Preview the updated note again before sending.` }] }
+        }
+        if (this.now() - record.issued_at > DELIVERY_LIFETIME_MS ||
             record.digest !== createHash('sha256').update(note).digest('hex') ||
             record.phase !== (phase === 'sent' ? 'issued' : 'sent')) throw Error('Invalid delivery record.')
         record.phase = phase as 'sent' | 'received'

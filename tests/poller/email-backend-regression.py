@@ -177,6 +177,58 @@ class EmailBackendRegression(unittest.TestCase):
                 self.assertEqual(run.call_args.args[0], [str(adapter), operation])
                 self.assertEqual(json.loads(run.call_args.kwargs["input"]), expected)
 
+    def test_custom_adapter_opaque_id_supports_read_archive_snooze_and_reply(self):
+        adapter = self.home / "fake-adapter"
+        adapter.write_text("#!/bin/sh\nexit 0\n")
+        adapter.chmod(0o700)
+        email_backend.atomic_json(self.home / "email.json", {"enabled": True, "backend": str(adapter)})
+        item_id = "message-abc"
+        read = {"id": item_id, "reply_to": "sender@example.invalid", "subject": "Subject"}
+        for operation, request, output in (
+            ("read", {"id": item_id}, read),
+            ("archive", {"id": item_id}, {"status": "archived"}),
+            ("snooze", {"id": item_id, "hours": 24}, {"status": "snoozed"}),
+        ):
+            with self.subTest(operation=operation):
+                child = subprocess.CompletedProcess([str(adapter), operation], 0, json.dumps(output), "")
+                with (patch.object(email_backend.subprocess, "run", return_value=child) as run,
+                      patch.object(email_backend.sys, "stdin", io.StringIO(json.dumps(request))),
+                      contextlib.redirect_stdout(io.StringIO()) as captured):
+                    self.assertEqual(email_backend.main(["fleet-email", operation]), 0)
+                self.assertEqual(run.call_args.args[0], [str(adapter), operation])
+                self.assertEqual(json.loads(run.call_args.kwargs["input"]), request)
+                self.assertNotIn("shell", run.call_args.kwargs)
+                if operation == "read":
+                    read = json.loads(captured.getvalue())
+
+        # A reply starts with that opaque-ID read, then uses the normal exact-email
+        # send payload. The adapter receives JSON on stdin, never shell text.
+        reply = {"to": [read["reply_to"]], "cc": [], "bcc": [],
+                 "subject": "Re: " + read["subject"], "body": "Offline reply"}
+        state = self.home / "state"
+        state.mkdir()
+        consent = "a" * 24
+        request = {"bot": "main", "consent_id": consent, "email": reply}
+
+        def accept_reply(*args, **kwargs):
+            self.assertEqual(json.loads(kwargs["input"]), request)
+            self.assertNotIn("shell", kwargs)
+            email_backend.atomic_json(state / "mail-attempts" / consent, {"state": "smtp-accepted"})
+            return subprocess.CompletedProcess(args[0], 0, '{"ok":true,"status":"smtp-accepted"}', "")
+
+        with (patch.object(email_backend, "checked_send", return_value=(reply, state)),
+              patch.object(email_backend.subprocess, "run", side_effect=accept_reply) as run,
+              patch.object(email_backend.sys, "stdin", io.StringIO(json.dumps(request))),
+              contextlib.redirect_stdout(io.StringIO()) as captured):
+            self.assertEqual(email_backend.main(["fleet-email", "send"]), 0)
+        self.assertEqual(run.call_args.args[0], [str(adapter), "send"])
+        self.assertTrue(json.loads(captured.getvalue())["ok"])
+
+    def test_custom_adapter_rejects_empty_or_control_character_ids(self):
+        for item_id in ("", "  ", "message\nabc", "message\x00abc", "message\u2028abc"):
+            with self.subTest(item_id=repr(item_id)), self.assertRaises(ValueError):
+                email_backend.adapter_payload("read", {"id": item_id})
+
     def test_authority_comes_from_private_state_file_and_requires_hmac(self):
         state = self.home / "state"
         state.mkdir()

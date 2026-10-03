@@ -24,7 +24,7 @@ Prepared Friday, October 2, 2026. The release date will be set after integration
 - An upstream plugin hash watch and an offline sandbox runner in CI.
 - Telebots Bar as an optional Mac menu bar layer, with a phone page over Tailscale.
 - One attended Pair/Ignore dialog on the Mac after a new bot receives a pairing code. Pair rechecks the sender, creation time and policy from the pairing request snapshot. `fleet-pair --lock` remains the manual fallback.
-- Setup rows for a history-preserving model switch, reopening a chat, blank `/fresh`, agent-attested handoff, full inbox reply, quiet recovery, reboot restore and phone rescue. A handoff passes only when both pollers record the same fresh one-use delivery ID. Real-device rows still say when phone proof is needed.
+- Setup rows for a history-preserving model switch, reopening a chat, blank `/fresh`, agent-attested handoff, full inbox reply, quiet recovery, reboot restore and phone rescue. Handoff receipts must match, and P13 passes only after the user confirms the note in the target bot chat. Real-device rows still say when phone proof is needed.
 
 ### Changed
 
@@ -45,17 +45,18 @@ Prepared Friday, October 2, 2026. The release date will be set after integration
 - The installer carries the overlay verifier and patch files into the installed fleet. Doctor accepts the empty bot list that installation creates.
 - Rich message HTTP 404 falls back to plain text. Email sends require the active poller's one-time nonce for the exact digest and full SMTP acceptance; disk consent receipts are audit only.
 - Checklist Escape, compact, resume-label and watchdog rows read the producer's actual log path and success wording. The ops tests run real engines inside blocked-command sandboxes instead of manufacturing success strings.
-- The sandbox's untouched check pins known launchd labels, so a short-lived child PID cannot look like a changed daemon. Its summary names the shared roots and suite reuse behind the 42 grouped scenario results.
+- The sandbox's untouched check matches protected process commands, so a short-lived child PID cannot look like a changed daemon. Its summary names the shared roots and suite reuse behind the 42 grouped scenario results.
 - Bot tokens stay out of local API process arguments. Full inbox reads return bounded bodies and reply headers.
 - OAuth credentials for usage checks now enter curl through stdin, not curl arguments. A source scan covers credential headers in engine, daemon and hook curl calls.
 - Tap labels reject newlines and other control characters. `/fresh` and `/model` parse structured hook input and reject synthetic button, reaction and email confirmation origins before reading the command body.
-- Every custom email adapter operation gets its documented payload. A truncated inbox read records `full=false`, and the full-reply checklist row requires a complete read.
+- Every custom email adapter operation gets its documented payload. Custom adapters accept opaque message IDs for reads, archives and snoozes, including the read that begins a reply. The built-in IMAP backend still requires numeric UIDs. A truncated inbox read records `full=false`, and the full-reply checklist row requires a complete read.
 - Email consent checks use a mode-0600 session authority file and an HMAC response. The normal poller workflow enforces two taps; shell permission in any stance can reach mail credentials or the authority file directly.
-- Handoff receipts use sender-issued one-use delivery IDs and are labeled agent-attested. Matching receipts are evidence of the agents' actions; the recipient still checks the destination chat.
-- Fleet notices use one shared sender that distinguishes Telegram acceptance from an attempted or failed send. The update checklist accepts only a confirmed Back and ready response. The watchdog keeps separate records for stall observed and phone notification accepted.
-- Uninstall stops the watchdog and waits for watchdog repair activity to end before restoring the stock plugin, then verifies the stock hash. A failed watchdog stop aborts teardown.
+- Handoff receipts use sender-issued one-use delivery IDs and are labeled agent-attested. Editing a preview or waiting beyond one hour requires ID renewal and a fresh preview; the old ID is cancelled. Matching receipts are evidence of the agents' actions; the user confirms the note in the destination chat before checklist P13 passes.
+- The voice guide now states that `autotranscribe.off` disables poller transcription for one bot; the local transcriber chooses an available local backend. The stored `voice` option does not select or disable the poller backend.
+- Fleet notices use one shared sender that distinguishes Telegram acceptance from an attempted or failed send. The update checklist accepts only a confirmed Back and ready response. Telebots Bar reads the engine's accepted, attempted or failed ping status while judging reconnect health separately. The watchdog keeps separate records for stall observed and phone notification accepted; the Mac and phone dashboards show observed stalls even when phone alerts are off, and show `phone notified` only for a matching accepted alert.
+- Uninstall stops the watchdog, waits for its PID file and watchdog repair lock to clear, then rechecks the plugin slot before deciding whether to restore it. It verifies the final stock hash whenever the pinned 0.0.7 slot is present and aborts if that check fails. A failed watchdog stop aborts teardown.
 - Setup and operations copy uses the Pair/Ignore dialog as the normal path, documents the manual pairing fallback and the fleet log locations. `/watch` ends when its session restarts, and `/update` describes the installed build.
-- These are offline checks. Release date and real-phone acceptance remain pending.
+- The dashboard changes have source and fixture checks; Telebots Bar was not built or launched in this fix round. The other release checks are offline. Release date and real Mac and phone acceptance remain pending.
 
 ### Removed
 

@@ -192,7 +192,7 @@ dialog p { font-size: 14px; line-height: 1.55; margin: 0 0 20px; }
       <dt>Heartbeat</dt><dd>Time since the bot's last liveness ping.</dd>
       <dt>ctx</dt><dd>Context window used by this conversation.</dd>
       <dt>restarts/h</dt><dd>Watchdog restarts in the last hour.</dd>
-      <dt>stall</dt><dd>A message waited 10+ minutes while the bot was idle.</dd>
+      <dt>stall</dt><dd>A message waited 10+ minutes while the bot was idle. Phone alerts can be off; "phone notified" appears only after an alert was accepted.</dd>
       <dt>paused</dt><dd>Auto-recovery paused: the watchdog stopped restarting that bot after too many restarts in an hour. Tap the row for details.</dd>
       <dt>Snapshot</dt><dd id="legend-snapshot">Saves every bot's current conversation so Restore can bring each one back later. Snapshot keeps your auto-recovery settings as they are. Bots already off or paused stay that way.</dd>
     </dl>

@@ -17,6 +17,54 @@ class ChangelogReleaseTests(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertTrue(phrase in text, f"missing release note: {phrase}")
 
+    def test_uninstall_and_untouched_guarantees_match_implementation(self):
+        text = (ROOT / "CHANGELOG.md").read_text().split("## [0.2.0]", 1)[0]
+        self.assertIn("rechecks the plugin slot", text)
+        self.assertIn("final stock hash", text)
+        self.assertIn("process commands", text)
+        self.assertNotIn("pins known launchd labels", text)
+
+    def test_handoff_receipts_do_not_claim_user_confirmation(self):
+        text = (ROOT / "CHANGELOG.md").read_text().split("## [0.2.0]", 1)[0]
+        self.assertIn("user confirms the note", text)
+        self.assertNotIn("A handoff passes only when both pollers", text)
+
+    def test_custom_adapter_ids_are_described_without_changing_imap_uids(self):
+        text = (ROOT / "CHANGELOG.md").read_text().split("## [0.2.0]", 1)[0]
+        self.assertIn("opaque message IDs", text)
+        self.assertIn("numeric UIDs", text)
+
+    def test_edited_handoff_requires_a_new_id_and_preview(self):
+        text = (ROOT / "CHANGELOG.md").read_text().split("## [0.2.0]", 1)[0]
+        self.assertIn("ID renewal and a fresh preview", text)
+        self.assertIn("old ID is cancelled", text)
+
+    def test_observed_stalls_remain_visible_without_phone_alerts(self):
+        text = (ROOT / "CHANGELOG.md").read_text().split("## [0.2.0]", 1)[0]
+        self.assertIn("dashboards show observed stalls", text)
+        self.assertIn("phone alerts are off", text)
+
+    def test_reconnect_log_status_is_distinct_from_reconnect_outcome(self):
+        text = (ROOT / "CHANGELOG.md").read_text().split("## [0.2.0]", 1)[0]
+        self.assertIn("accepted, attempted or failed", text)
+        self.assertIn("reconnect health", text)
+
+    def test_voice_notes_describe_the_marker_and_automatic_backend(self):
+        text = (ROOT / "CHANGELOG.md").read_text().split("## [0.2.0]", 1)[0]
+        self.assertIn("autotranscribe.off", text)
+        self.assertIn("available local backend", text)
+
+    def test_round_d_release_note_limits_device_claims(self):
+        text = (ROOT / "CHANGELOG.md").read_text().split("## [0.2.0]", 1)[0]
+        for phrase in ("rechecks the plugin slot", "user confirms the note",
+                       "opaque message IDs", "ID renewal", "observed stalls",
+                       "accepted, attempted or failed", "autotranscribe.off"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+        self.assertIn("source and fixture checks", text)
+        self.assertIn("Telebots Bar was not built or launched", text)
+        self.assertIn("real Mac and phone acceptance remain pending", text)
+
 
 if __name__ == "__main__":
     unittest.main()

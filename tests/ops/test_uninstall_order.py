@@ -71,13 +71,49 @@ exit 0
         result = self.run_uninstall()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.trace.read_text().splitlines(),
-                         ["preflight", "bootout", "pass-ended", "restore", "verified"])
+                         ["preflight", "bootout", "pass-ended", "preflight", "restore", "verified"])
 
     def test_failed_watchdog_stop_aborts_before_restore_or_removal(self):
         result = self.run_uninstall(fail_stop=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.trace.read_text().splitlines(), ["preflight", "bootout"])
         self.assertTrue(self.plist.exists())
+        self.assertTrue(self.fleet.exists())
+
+    def test_stock_preflight_is_rechecked_after_watchdog_repairs_overlay(self):
+        (self.root / "stock").touch()
+        (self.repo / "poller/restore-stock.sh").write_text('''#!/bin/bash
+if [ "${1:-}" = --preflight ]; then
+  if [ -f "$TEST_ROOT/stock" ]; then echo preflight-stock >> "$TRACE"; echo STOCK
+  else echo preflight-restore >> "$TRACE"; echo RESTORE; fi
+else
+  echo restore >> "$TRACE"
+  touch "$TEST_ROOT/stock"
+fi
+''')
+        (self.root / "bin/launchctl").write_text('''#!/bin/bash
+echo bootout >> "$TRACE"
+(sleep 1; rm -f "$TEST_ROOT/stock"; echo repaired-overlay >> "$TRACE";
+ rm -f "$PID_FILE"; rmdir "$LOCK_DIR"; echo pass-ended >> "$TRACE") >/dev/null 2>&1 &
+''')
+        result = self.run_uninstall()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.trace.read_text().splitlines(),
+                         ["preflight-stock", "bootout", "repaired-overlay", "pass-ended",
+                          "preflight-restore", "restore", "preflight-stock"])
+
+    def test_final_stock_hash_check_runs_even_when_preflight_says_stock(self):
+        (self.repo / "poller/restore-stock.sh").write_text('''#!/bin/bash
+if [ "${1:-}" = --preflight ]; then
+  count=$(cat "$TEST_ROOT/preflight-count" 2>/dev/null || echo 0)
+  count=$((count + 1))
+  echo "$count" > "$TEST_ROOT/preflight-count"
+  if [ "$count" -le 2 ]; then echo STOCK; else echo RESTORE; fi
+fi
+''')
+        result = self.run_uninstall()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Stock plugin hash could not be verified", result.stdout)
         self.assertTrue(self.fleet.exists())
 
 

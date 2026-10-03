@@ -5,8 +5,10 @@ poller runs `transcribe-voice <audio-path>` and forwards the transcript as the
 message. It prints only the transcript to stdout.
 
 The `voice-notes` skill handles a note when the poller cannot transcribe it.
-`fleet-config option voice` selects the backend. An `autotranscribe.off` marker
-in the bot's state directory disables poller transcription for that bot.
+The `voice` option in `fleet.json` is read by the setup checklist and fallback
+skill; it does not select or disable poller transcription. Create an
+`autotranscribe.off` marker in a bot's state directory to disable automatic
+transcription for that bot. Remove the marker to re-enable it.
 
 ## Two backends
 
@@ -16,13 +18,10 @@ in the bot's state directory disables poller transcription for that bot.
 | `transcribe-voice-mlx` | mlx-whisper (`whisper-large-v3-turbo`) | Apple Silicon | Fast after model load |
 | `transcribe-voice-faster` | faster-whisper | Intel Mac | Slower |
 
-The `voice` option in `fleet.json` selects the behavior:
-
-- `auto` (default): use mlx on Apple Silicon, otherwise faster-whisper, and
-  disable voice if neither is installed.
-- `mlx`: force the mlx backend.
-- `faster`: force the faster-whisper backend.
-- `off`: disable voice transcription.
+`transcribe-voice` first tries the optional warm daemon. Without a daemon
+reply, it uses mlx-whisper when installed on Apple Silicon, then tries the
+faster-whisper script as the local fallback. If no backend succeeds, the poller
+passes the original voice note to the fallback skill.
 
 ## Install
 

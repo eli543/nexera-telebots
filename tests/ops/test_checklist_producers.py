@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -180,7 +181,20 @@ class ChecklistProducerTests(unittest.TestCase):
             "note_id": note_id, "source": "main", "target": "second", "phase": "received",
             "issued_at": int(time.time() * 1000), "delivery_id": delivery}))
         record.chmod(0o600)
+        self.assertEqual(row(), "Needs your action")
+        with patch.object(self.checklist.sys.stdin, "isatty", return_value=False):
+            self.assertEqual(self.checklist.confirm_p13("main"), 1)
+        self.assertFalse((self.fleet / "checklist-confirmations/P13-main.json").exists())
+        with patch.object(self.checklist.sys.stdin, "isatty", return_value=True), \
+             patch("builtins.input", return_value="CONFIRM second"):
+            self.assertEqual(self.checklist.confirm_p13("main"), 0)
         self.assertEqual(row(), "Passed")
+        confirmation = self.fleet / "checklist-confirmations/P13-main.json"
+        saved = json.loads(confirmation.read_text())
+        self.assertEqual(confirmation.stat().st_mode & 0o777, 0o600)
+        saved["delivery_id"] = "e" * 24
+        confirmation.write_text(json.dumps(saved))
+        self.assertEqual(row(), "Needs your action")
 
     def test_inbox_reply_requires_a_linked_full_read_and_smtp_receipt(self):
         started = int(time.time()) - 1
