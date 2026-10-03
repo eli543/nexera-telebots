@@ -41,6 +41,8 @@ Run ListAgents and match the exact stable session name `telebots-<target-key>`. 
 
 Call SendMessage with the matched session name, the complete note starting with `HANDOFF from`, including its delivery ID, and the title as summary. After SendMessage confirms delivery, call this bot's `handoff_receipt` tool with the note ID, delivery ID and `phase="sent"`. Mark the pending record delivered, tell the user which bot received which task, and stop performing that task here. Update its task entry to record the handoff; do not claim its underlying work is finished. A sent receipt is an agent attestation, not independent transport proof.
 
+For setup row P13, matching agent receipts still leave the row at `Needs your action`. The person checks that the note arrived in the target bot chat, then runs `fleet-checklist confirm P13 <source-bot-key>` at the Mac and types `CONFIRM <target-key>`. Only that recorded confirmation makes P13 `Passed` for this delivery ID. Do not call the confirmation command for the person.
+
 On a definitely failed send or missing target, keep the note and retry once after 20 seconds. Report a second failure as pending. On an uncertain result or approval hold, do not resend until delivery state can be checked: a duplicate note can duplicate work. Never launch or reset the target as a delivery workaround.
 
 ## Receive a handoff

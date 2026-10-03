@@ -3,6 +3,7 @@ import { Bot, Context, GrammyError, InlineKeyboard } from 'grammy'
 import type { Message, Update, UserFromGetMe } from 'grammy/types'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, join, resolve, sep } from 'node:path'
+import { execFileSync } from 'node:child_process'
 import { DEFAULT_UX, TelebotsModule, addedReactionEmoji, formatVoiceDuration, init, keyText, replyButtons, shq, validatedApiRoot, voiceBody } from '../../poller/telebots.ts'
 import type { AttachmentMeta, ExecOptions, TelebotsDependencies } from '../../poller/contracts.ts'
 import ux from '../../poller/ux.json'
@@ -289,6 +290,12 @@ describe('handoff and resume', () => {
       expect(received).toContain(`HANDOFF-RECEIVED id=${id} source=main target=second delivery=${delivery}`)
       expect(received).not.toContain('Private note body')
       expect(f.events().some(event => event.includes(`HANDOFF-SENT id=${id} source=main target=second delivery=${delivery}`))).toBe(true)
+      const checklist = `import importlib.machinery, importlib.util, json, sys\nfrom pathlib import Path\nloader = importlib.machinery.SourceFileLoader('checklist', sys.argv[1])\nspec = importlib.util.spec_from_loader('checklist', loader)\nmodule = importlib.util.module_from_spec(spec)\nloader.exec_module(module)\nreceived = module.log_lines_since(Path(sys.argv[4]) / 'logs/poller-events.log', 0)\nstatus = module.phone_row('P13', Path(sys.argv[2]), Path(sys.argv[3]), 2, False, False, 0)['status']\nprint(json.dumps({'received_lines': len(received), 'status': status}))`
+      const checklistResult = JSON.parse(execFileSync('/usr/bin/python3',
+        ['-c', checklist, join(process.cwd(), 'engine', 'fleet-checklist'), f.state, f.root, f.fleetBots[1]!.state_dir],
+        { env: { ...process.env, FLEET_HOME: f.fleet }, encoding: 'utf8' }))
+      expect(checklistResult.received_lines).toBe(1)
+      expect(checklistResult.status).toBe('Needs your action')
     } finally { second.dispose() }
   })
   test('handoff dynamically reads the fleet, displays status and excludes self twice', async () => {

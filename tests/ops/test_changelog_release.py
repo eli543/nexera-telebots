@@ -24,6 +24,11 @@ class ChangelogReleaseTests(unittest.TestCase):
         self.assertIn("process commands", text)
         self.assertNotIn("pins known launchd labels", text)
 
+    def test_handoff_receipts_do_not_claim_user_confirmation(self):
+        text = (ROOT / "CHANGELOG.md").read_text().split("## [0.2.0]", 1)[0]
+        self.assertIn("user confirms the note", text)
+        self.assertNotIn("A handoff passes only when both pollers", text)
+
 
 if __name__ == "__main__":
     unittest.main()
