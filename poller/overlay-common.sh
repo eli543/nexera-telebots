@@ -58,6 +58,28 @@ def select_slot():
                 path.stat().st_mtime_ns, path.name)
     return max(slots, key=order)
 
+def pinned_slot():
+    slot = cache / expected_version
+    return slot if slot.is_dir() and not slot.is_symlink() else None
+
+def restore_plan(slot, newest):
+    if slot is None:
+        return 'OTHER_VERSION:' + version(newest) if newest is not None else 'ABSENT'
+    if version(slot) != expected_version:
+        raise Refusal('The pinned plugin slot has invalid version metadata; no files changed.', 13)
+    server = slot / 'server.ts'
+    if not server.exists() and not server.is_symlink():
+        return 'ABSENT'
+    current = digest(server)
+    if current == stock_sha:
+        return 'STOCK'
+    if current != patched_sha:
+        raise Refusal('Unknown server.ts hash; no installed files changed.', 12)
+    checked_backup(slot, required=True)
+    if (slot / '.telebots-overlay.lock').exists():
+        raise Refusal('Another overlay operation is active; no installed files changed.', 24)
+    return 'RESTORE'
+
 def source_payloads():
     if any(not regular(source / name) for name in modules):
         raise Refusal('The overlay package is incomplete; no installed files changed.', 21)
@@ -232,11 +254,20 @@ def mutate(slot):
         lock.rmdir()
 
 try:
-    slot = select_slot()
+    newest = select_slot()
+    slot = pinned_slot() if operation in ('restore', 'restore-plan') else newest
     if operation in ('status', 'verify'):
         value = status(slot)
         print(value if operation == 'status' else 'Overlay status: ' + value)
         sys.exit(status_codes[value.split(':', 1)[0]])
+    if operation in ('restore', 'restore-plan'):
+        plan = restore_plan(slot, newest)
+        if operation == 'restore-plan':
+            print(plan)
+            sys.exit(0)
+        if plan != 'RESTORE':
+            print('No modified 0.0.7 plugin slot to restore (' + plan + ').')
+            sys.exit(0)
     mutate(slot)
 except Refusal as error:
     print('error: ' + error.message, file=sys.stderr)
