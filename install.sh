@@ -244,9 +244,10 @@ fi
 say "Next steps"
 note "1. Create one bot in @BotFather on your phone. Keep its token out of chats."
 note "2. Run $FLEET_HOME/bin/fleet-add-bot main and paste the token into its hidden prompt."
-note "3. Run $FLEET_HOME/bin/fleet-start main, then $FLEET_HOME/bin/fleet-pair main <code> --lock."
+note "3. Run $FLEET_HOME/bin/fleet-start main. DM the bot, match its code on your phone to the Mac dialog, then click Pair."
+note "   If the dialog is unavailable, run $FLEET_HOME/bin/fleet-pair main <code> --lock locally."
 note "4. At the Mac, run $FLEET_HOME/bin/fleet-checklist --consent, then install the watchdog."
 note "   In Claude Code, /telegram-fleet:install-daemon loads the watchdog after pairing."
-note "5. Run $FLEET_HOME/bin/fleet-checklist main and follow its phone steps."
+note "5. Run $FLEET_HOME/bin/fleet-checklist main and follow its phone steps. Review rows marked untested."
 note "No bot was started and no watchdog was loaded by this installer."
 if [ "$DRY_RUN" -eq 1 ]; then note "Dry run: no files or services were changed."; fi

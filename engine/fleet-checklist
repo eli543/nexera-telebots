@@ -41,14 +41,18 @@ ROWS = (
     ("P6", "Resume descriptions", "sessions render log with count and label count; CLOSE"),
     ("P7", "Voice note", "VOICE status=ok; voice-transcribe.log status=ok"),
     ("P8", "Update and Back and ready", "update.log; fresh.log back-online ping sent"),
-    ("P9", "Interrupt while busy", "INTERCEPT cmd=esc; esc.log key landed"),
+    ("P9", "Interrupt while busy", "INTERCEPT cmd=esc; fleet-home esc.log sent Esc"),
     ("P10", "Context and usage", "INTERCEPT events; context.log; usage.log"),
-    ("P11", "Compact", "compact.log exit 0 or 14"),
+    ("P11", "Compact", "fleet-home compact.log delivered or Not enough messages"),
     ("P12", "Context nudge and Keep going", "guardian.log GUARDIAN reason=8 pct= threshold= ok=true; TAP"),
-    ("P13", "Handoff picker", "HANDOFF-PICKER offered=; CLOSE kind=handoff"),
-    ("P14", "Inbox cards and Snooze", "INTERCEPT cmd=inbox; EMAIL-PREVIEW; snooze record"),
-    ("P15", "Optional self-heal", "watchdog.log restart; fresh.log back-online ping sent"),
-    ("P16", "Optional blank fresh", "INTERCEPT cmd=fresh; fresh.log back-online ping sent"),
+    ("P13", "Completed handoff", "second bot receipt required; needs two bots"),
+    ("P14", "Full inbox reply", "linked inbox read and SMTP receipt required; fake IMAP/SMTP suite"),
+    ("P15", "Watchdog recovery", "fleet-home watchdog.log result; quiet restart ledger; 30-minute resume boundary"),
+    ("P17", "Model switch keeps history", "model-state and model.log; same session id; restart ledger"),
+    ("P18", "Resume reopens chat", "PICK kind=resume; changed session id; restart ledger"),
+    ("P16", "Blank /fresh", "fresh-reset restart ledger; new session id; ready ping"),
+    ("P19", "Reboot restore", "real reboot and phone round trip; not proven by sandbox"),
+    ("P20", "Phone rescue", "Telebots Bar and Tailscale phone test; not proven by local status"),
 )
 
 
@@ -119,10 +123,11 @@ def log_lines_since(path, started):
         return result
     for line in source:
         try:
-            stamp = datetime.fromisoformat(line.split(" ", 1)[0]).timestamp()
+            prefix = line.split(" ", 1)[0]
+            stamp = datetime.fromisoformat(prefix if "T" in prefix else line[:19]).timestamp()
         except (ValueError, IndexError):
             continue
-        if stamp >= started:
+        if stamp >= int(started):
             result.append(line)
     return result
 
@@ -173,6 +178,73 @@ def fresh_log_has(path, pattern, started):
         return path.stat().st_mtime >= started and log_has(path, pattern)
     except OSError:
         return False
+
+
+def bot_record(state):
+    fleet = read_json(ROOT / "fleet.json", {})
+    return next((bot for bot in fleet.get("bots", [])
+                 if Path(bot.get("state_dir", "")).expanduser() == state), None)
+
+
+def engine_run(state, name, started):
+    """Last run for this bot after the step began, excluding earlier successes."""
+    bot = bot_record(state)
+    if not bot:
+        return ""
+    path = ROOT / "logs" / (name + ".log")
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return ""
+    selected = []
+    active = False
+    header = re.compile(r"^=== (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) (?:esc|compact|restart) pid=.* cwd=(.*?) (?:dryrun=|focus_len=|===)")
+    for line in lines:
+        match = header.match(line)
+        if match:
+            try:
+                timestamp = datetime.fromisoformat(match.group(1)).timestamp()
+            except ValueError:
+                timestamp = 0
+            active = match.group(2) == bot.get("workdir") and timestamp >= int(started)
+            if active:
+                selected = []
+        if active:
+            selected.append(line)
+    return "\n".join(selected)
+
+
+def restart_receipt(state, started, resume=None, quiet=None):
+    bot = bot_record(state)
+    if not bot:
+        return False
+    lines = log_lines_since(ROOT / "watchdog-state" / (bot["key"] + ".manual_restart_log"), started)
+    for line in lines:
+        fields = dict(part.split("=", 1) for part in line.split() if "=" in part)
+        if fields.get("cwd") != bot.get("workdir") or fields.get("exit") != "0":
+            continue
+        if resume is not None and fields.get("resume") != resume:
+            continue
+        if quiet is not None and fields.get("quiet") != quiet:
+            continue
+        return True
+    return False
+
+
+def session_id(state):
+    try:
+        value = (state / "session.id").read_text().strip()
+    except OSError:
+        return ""
+    return value if re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value) else ""
+
+
+def baseline_for(state):
+    try:
+        model = (state / "model-state").read_text()
+    except OSError:
+        model = ""
+    return {"session_id": session_id(state), "model_state": model}
 
 
 def result(status, detail):
@@ -292,10 +364,13 @@ def auto_row(code, bot, fleet, state, token):
     return result("Failed", "unknown row")
 
 
-def phone_row(code, state, notes, fleet_size, email_enabled, crash_test, started=0):
+def phone_row(code, state, notes, fleet_size, email_enabled, crash_test, started=0, baseline=None):
     lines = lines_since(state, started) if started else event_lines(state)
     logs = state / "logs"
     evidence = lambda name, pattern: fresh_log_has(logs / name, pattern, started)
+    fleet_evidence = lambda name, pattern: bool(re.search(pattern, "\n".join(log_lines_since(ROOT / "logs" / name, started)), re.I))
+    fresh = engine_run(state, "fresh", started)
+    bot = bot_record(state)
     if code == "P1":
         stream_file = state / "stream" / "state.json"
         stream = read_json(stream_file, {})
@@ -312,25 +387,76 @@ def phone_row(code, state, notes, fleet_size, email_enabled, crash_test, started
     elif code == "P3": ok = event_seen(lines, "REACTION") and notes.is_dir() and any(path.stat().st_mtime >= started for path in notes.glob("20??-??-??.md"))
     elif code == "P4": ok = event_seen(lines, "KEY")
     elif code == "P5": ok = all(event_seen(lines, "PICKER", kind=kind) and event_seen(lines, "CLOSE", kind=kind) for kind in ("model", "effort"))
-    elif code == "P6": ok = evidence("sessions.log", r"count=[1-9].*labels=[1-9]") and event_seen(lines, "CLOSE", kind="resume")
+    elif code == "P6": ok = fleet_evidence("sessions.log", r"RENDER count=[1-9].*labels=[1-9]") and event_seen(lines, "CLOSE", kind="resume")
     elif code == "P7": ok = event_seen(lines, "VOICE", status="ok") and evidence("voice-transcribe.log", r"status=ok")
-    elif code == "P8": ok = evidence("update.log", r"update") and evidence("fresh.log", r"back-online ping sent")
-    elif code == "P9": ok = event_seen(lines, "INTERCEPT", cmd="esc") and evidence("esc.log", r"key landed")
-    elif code == "P10": ok = all(event_seen(lines, "INTERCEPT", cmd=cmd) and evidence(f"{cmd}.log", r".") for cmd in ("context", "usage"))
-    elif code == "P11": ok = evidence("compact.log", r"exit (?:0|14)\b")
+    elif code == "P8":
+        update = "\n".join(log_lines_since(logs / "update.log", started))
+        ok = (bool(re.search(r"fleet-fresh exit=0", update))
+              and bool(re.search(r"back-online ping sent", update))
+              and "restart proof accepted" in fresh and restart_receipt(state, started, quiet="quiet"))
+    elif code == "P9":
+        esc = engine_run(state, "esc", started)
+        ok = bool(re.search(r"=== done \(sent Esc to /dev/ttys[0-9]+\) ===", esc))
+    elif code == "P10":
+        ok = all(event_seen(lines, "INTERCEPT", cmd=cmd) and fleet_evidence(f"{cmd}.log", r".")
+                 for cmd in ("context", "usage"))
+    elif code == "P11":
+        compact = engine_run(state, "compact", started)
+        ok = bool(re.search(r"=== done \((?:path [AB].*delivered .* /compact.*|Claude Code answered: Not enough messages to compact)\) ===", compact))
     elif code == "P12": ok = guardian_sent(log_lines_since(logs / "guardian.log", started)) and event_seen(lines, "TAP", family="qr")
     elif code == "P13":
         if fleet_size < 2: return result("Not configured", "needs two bots")
-        ok = event_seen(lines, "HANDOFF-PICKER") and event_seen(lines, "CLOSE", kind="handoff")
+        return result("Needs your action", "Completed handoff untested: confirm the note arrived and the second bot acknowledged it on the phone; no destination receipt is recorded")
     elif code == "P14":
         if not email_enabled: return result("Not configured", "email is optional")
-        ok = event_seen(lines, "INTERCEPT", cmd="inbox") and event_seen(lines, "EMAIL-PREVIEW") and (ROOT / "inbox-snoozed.json").is_file() and (ROOT / "inbox-snoozed.json").stat().st_mtime >= started
+        return result("Needs your action", "Full inbox reply untested: confirm the card, complete message, recipients, two taps and SMTP acceptance; current logs do not link the inbox read to the send")
     elif code == "P15":
-        if not crash_test: return result("Not configured", "run with --crash-test after approval")
-        ok = fresh_log_has(ROOT / "logs/watchdog.log", r"RESTART", started) and evidence("fresh.log", r"back-online ping sent")
-    elif code == "P16": ok = event_seen(lines, "INTERCEPT", cmd="fresh") and evidence("fresh.log", r"back-online ping sent")
+        if not crash_test:
+            return result("Needs your action", "Recovery untested; run the optional exact-PID test with a person at the Mac. A chat active within 30 minutes resumes; an older chat restarts blank. Reboot still untested")
+        key = bot["key"] if bot else ""
+        watchdog = "\n".join(log_lines_since(ROOT / "logs/watchdog.log", started))
+        ok = (bool(re.search(r"\bRESTART " + re.escape(key) + r" via fleet-fresh", watchdog))
+              and bool(re.search(r"result: (?:resumed|fresh) \(engine exit 0\)", watchdog))
+              and restart_receipt(state, started, quiet="quiet")
+              and "restart proof accepted" in fresh and "back-online ping suppressed" in fresh)
+        return result("Passed" if ok else "Needs your action",
+                      "Quiet engine recovery recorded; a chat active within 30 minutes resumes, otherwise it restarts blank. Verify the phone round trip" if ok
+                      else "Quiet watchdog recovery not proven. A chat active within 30 minutes resumes, otherwise it restarts blank; reboot is untested")
+    elif code == "P16":
+        previous = (baseline or {}).get("session_id", "")
+        ok = (bool(previous) and session_id(state) not in ("", previous)
+              and event_seen(lines, "INTERCEPT", cmd="fresh")
+              and restart_receipt(state, started, resume="fresh-reset")
+              and "restart proof accepted" in fresh and "back-online ping sent" in fresh
+              and not (state / "model-state").exists())
+    elif code == "P17":
+        previous = (baseline or {}).get("session_id", "")
+        try:
+            model_now = (state / "model-state").read_text()
+        except OSError:
+            model_now = ""
+        model_log = "\n".join(log_lines_since(ROOT / "logs/model.log", started))
+        ok = (bool(previous) and session_id(state) == previous and model_now
+              and model_now != (baseline or {}).get("model_state", "")
+              and bool(re.search(r"RESTART .* resume=" + re.escape(previous) + r"\b", model_log))
+              and restart_receipt(state, started, resume=previous)
+              and "restart proof accepted" in fresh)
+    elif code == "P18":
+        previous, reopened = (baseline or {}).get("session_id", ""), session_id(state)
+        ok = (bool(previous) and bool(reopened) and reopened != previous
+              and event_seen(lines, "PICK", kind="resume")
+              and restart_receipt(state, started, resume=reopened, quiet="quiet")
+              and "restart proof accepted" in fresh)
+    elif code == "P19":
+        return result("Needs your action", "Reboot restore untested: snapshot, reboot, log in, restore and confirm the same chat answers on the phone")
+    elif code == "P20":
+        if not (Path.home() / "Applications/Telebots Bar.app").exists():
+            return result("Not configured", "phone rescue needs optional Telebots Bar and Tailscale")
+        return result("Needs your action", "Phone rescue untested: with all bots down, reconnect through the Tailscale page and verify a bot reply")
     else: ok = False
-    return result("Passed" if ok else "Needs your action", "recorded evidence found" if ok else "complete this phone step and rerun")
+    detail = ("backend evidence recorded; confirm phone delivery directly" if ok
+              else "complete this phone step and rerun; phone delivery is not proven by an engine log alone")
+    return result("Passed" if ok else "Needs your action", detail)
 
 
 PHONE_STEPS = {
@@ -346,10 +472,14 @@ PHONE_STEPS = {
     "P10": "Send /context and /usage; wait for both reports.",
     "P11": "Send /compact and wait for completion or the short-chat response.",
     "P12": "Send one message to trigger the context nudge, then tap Keep going.",
-    "P13": "With a second bot installed, open Hand off and tap Cancel.",
-    "P14": "Open /inbox, then tap Snooze 1d on a card.",
-    "P15": "Optional self-heal: run the separate exact-PID crash test with the owner present.",
-    "P16": "Optional last step: send /fresh and wait for Back and ready.",
+    "P13": "With two bots, complete a handoff and confirm the second bot received the note.",
+    "P14": "Open /inbox, read a complete message, reply with the original recipients and confirm the exact preview twice.",
+    "P15": "Optional exact-PID crash test with a person at the Mac. Recovery is quiet; check the bot by sending a new message.",
+    "P16": "Last step: send /fresh and verify a new blank chat and Back and ready.",
+    "P17": "Switch to another available model and effort, then confirm this conversation id is preserved.",
+    "P18": "Open /resume and select a different saved chat; confirm that chat opens.",
+    "P19": "Snapshot, reboot, log in and restore; confirm the same chat answers on the phone.",
+    "P20": "If Telebots Bar and Tailscale are set up, reconnect from the phone when every bot is down.",
 }
 
 
@@ -431,6 +561,8 @@ def main():
     parser.add_argument("--recorded-evidence", action="store_true",
                         help="sandbox only: evaluate existing logs without phone requests")
     args = parser.parse_args()
+    if args.recorded_evidence and args.crash_test:
+        parser.error("recorded evidence cannot initiate a crash test")
     if args.dry_run:
         for code, label, source in ROWS:
             print(f"{code:3} {label:32} source: {source}")
@@ -471,13 +603,18 @@ def main():
             elif code == "P14" and not read_json(ROOT / "email.json", {}).get("enabled", False):
                 values[code] = result("Not configured", "email is optional")
             elif code == "P15" and not args.crash_test:
-                values[code] = result("Not configured", "optional exact-PID test")
+                values[code] = result("Needs your action", "Watchdog recovery untested. A chat active within 30 minutes resumes; an older chat restarts blank. Use --crash-test only with a person at the Mac")
             elif code == "P16" and not args.blank_fresh:
-                values[code] = result("Not configured", "optional blank restart; rerun with --blank-fresh")
+                values[code] = result("Needs your action", "Blank /fresh untested; rerun with --blank-fresh after saving current work")
+            elif code in ("P19", "P20"):
+                values[code] = phone_row(code, state, notes, len(fleet.get("bots", [])),
+                                         read_json(ROOT / "email.json", {}).get("enabled", False),
+                                         args.crash_test)
             else:
                 instruction = PHONE_STEPS[code]
                 print(f"{code}: {instruction}")
                 started = 0 if args.recorded_evidence else time.time()
+                baseline = baseline_for(state)
                 threshold = state / "guardian-thresholds"
                 original = threshold.read_bytes() if code == "P12" and threshold.exists() else None
                 try:
@@ -491,11 +628,11 @@ def main():
                         if not approved:
                             values[code] = result("Needs your action", detail)
                     if code != "P15" or approved:
-                        deadline = started + max(0, args.wait)
+                        deadline = started + (0 if code in ("P13", "P14") else max(0, args.wait))
                         while True:
                             values[code] = phone_row(code, state, notes, len(fleet.get("bots", [])),
                                                      read_json(ROOT / "email.json", {}).get("enabled", False),
-                                                     args.crash_test, started)
+                                                     args.crash_test, started, baseline)
                             if values[code]["status"] == "Passed" or time.time() >= deadline:
                                 break
                             time.sleep(2)

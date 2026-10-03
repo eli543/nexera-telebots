@@ -203,6 +203,48 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(json.loads((state / "access.json").read_text()), access)
         self.assertFalse((state / ".enrolled").exists())
 
+    def test_start_offers_one_local_dialog_for_new_code_and_pairs_only_on_pair(self):
+        _work, state = self.bot()
+        shims = self.base / "pair-shims"
+        shims.mkdir()
+        dialog_log = self.base / "pair-dialog.log"
+        dialog = shims / "osascript"
+        dialog.write_text('#!/bin/sh\nprintf "dialog\\n" >> "$PAIR_DIALOG_LOG"\nprintf "%s\\n" "$PAIR_DECISION"\n')
+        dialog.chmod(0o700)
+        extra = {"CC_START_PAIR_ONLY": "1", "CC_START_PAIR_WAIT": "3",
+                 "PAIR_DIALOG_LOG": str(dialog_log), "PAIR_DECISION": "Pair",
+                 "PATH": str(shims) + ":" + self.env["PATH"]}
+
+        def pending(code):
+            time.sleep(0.3)
+            access = json.loads((state / "access.json").read_text())
+            access["pending"][code] = {"senderId": "77", "chatId": "77",
+                                        "createdAt": int(time.time() * 1000),
+                                        "expiresAt": int(time.time() * 1000) + 60_000}
+            (state / "access.json").write_text(json.dumps(access))
+
+        writer = threading.Thread(target=pending, args=("a1b2c3",))
+        writer.start()
+        result = self.run_engine("fleet-start", "alpha", extra=extra)
+        writer.join()
+        self.assertIn("Paired bot alpha and locked", result.stdout)
+        self.assertEqual(dialog_log.read_text().splitlines(), ["dialog"])
+        self.assertTrue((state / ".enrolled").exists())
+        self.assertEqual(json.loads((state / "access.json").read_text())["allowFrom"], ["42", "77"])
+
+        (state / ".enrolled").unlink()
+        access = json.loads((state / "access.json").read_text())
+        access["dmPolicy"] = "pairing"
+        (state / "access.json").write_text(json.dumps(access))
+        writer = threading.Thread(target=pending, args=("d4e5f6",))
+        writer.start()
+        ignored = self.run_engine("fleet-start", "alpha", extra={**extra, "PAIR_DECISION": "Ignore"})
+        writer.join()
+        self.assertIn("pairing ignored", ignored.stdout)
+        self.assertEqual(dialog_log.read_text().splitlines(), ["dialog", "dialog"])
+        self.assertFalse((state / ".enrolled").exists())
+        self.assertIn("d4e5f6", json.loads((state / "access.json").read_text())["pending"])
+
     def test_start_launch_fresh_update_and_ready_bubbles(self):
         work, state = self.bot()
         start = self.run_engine("fleet-start", "alpha", extra={"CC_START_DRYRUN": "1"})

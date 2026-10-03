@@ -56,6 +56,22 @@ class UntouchedSnapshotTests(unittest.TestCase):
         after = self.snapshot()
         self.assertEqual(runner.changed_items(before, after), [str(self.server)])
 
+    def test_launchd_labels_ignore_transient_processes_and_detect_daemon_change(self) -> None:
+        first = "PID Status Label\n1649 0 com.nexera.channel-watchdog\n1648 0 com.claude-fleet.menubar\n1655 0 com.nexera.transcribe-voice-daemon\n"
+        second = first.replace("1649 0 com.nexera.channel-watchdog", "1700 0 com.nexera.channel-watchdog")
+
+        def listing(output):
+            def read(command, **_kwargs):
+                self.assertEqual(command, ["/bin/launchctl", "list"])
+                return subprocess.CompletedProcess(command, 0, stdout=output)
+            with patch.object(runner.subprocess, "run", side_effect=read):
+                return runner.snapshot(self.home, None)
+
+        before = listing(first)
+        self.assertEqual(before, listing(first))
+        self.assertEqual(runner.changed_items(before, listing(second)),
+                         ["live-daemon:com.nexera.channel-watchdog"])
+
 
 if __name__ == "__main__":
     unittest.main()

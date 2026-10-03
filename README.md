@@ -1,6 +1,6 @@
 # Nexera Telebots
 
-Built and provided by [Nexera Intelligence](https://nexeraintelligence.com). Nexera Telebots adds phone controls, live progress, voice, and recovery to Anthropic's official Claude Code Telegram channel on macOS.
+Built and provided by [Nexera Intelligence](https://nexeraintelligence.com). Nexera Telebots runs Claude Code from Telegram on your Mac, with live progress, phone controls and optional automatic recovery. The Mac must stay awake, logged in and online.
 
 ```sh
 git clone https://github.com/eli543/nexera-telebots
@@ -8,7 +8,7 @@ cd nexera-telebots
 ./install.sh
 ```
 
-Start with one bot. The installer sets up the software and checks the official Telegram plugin. You create the bot in Telegram, enter its token in a hidden Mac dialog, and pair your phone. The installer does not create a bot or start the watchdog for you. If you want Claude to guide the setup, give it [SETUP-WITH-CLAUDE.md](SETUP-WITH-CLAUDE.md). Check the [requirements](#requirements) before running the commands above.
+Start with one bot. The installer sets up the software and checks the official Telegram plugin. You create the bot in Telegram and enter its token in a hidden Mac dialog. After your first DM, `fleet-start` shows one Pair/Ignore dialog on the Mac and locks the allowlist only if you choose Pair. The installer does not create a bot or start the watchdog for you. If you want Claude to guide the setup, give it [SETUP-WITH-CLAUDE.md](SETUP-WITH-CLAUDE.md). Check the [requirements](#requirements) before running the commands above.
 
 This project uses the official `telegram@claude-plugins-official` channel. It applies one version-checked diff to your local copy of plugin 0.0.7 and installs its own Telebots module. This repository is MIT licensed; Anthropic's plugin is Apache-2.0 and is installed separately. [NOTICE.md](NOTICE.md) explains the boundary.
 
@@ -22,17 +22,17 @@ This project uses the official `telegram@claude-plugins-official` channel. It ap
 | Reactions and `/key` | Turns seven reactions into clear actions; `/key` shows the meanings | A private chat; local notes folder for save actions |
 | 13-command menu | Registers the actual controls in Telegram's `/` menu | Plugin overlay 0.0.7 |
 | `/esc` | Interrupts a busy turn without clearing the conversation | Terminal.app Automation and Accessibility consent |
-| `/fresh` and `/update` | Starts blank, or reloads this chat on the current Claude Code and skills | A bot session and its Terminal window |
-| Model and effort pickers | Changes model and effort while keeping the chat; each picker has Close | Access to the selected model on your Claude plan |
+| `/fresh` and `/update` | Starts blank, or reloads this chat from the build already installed on the Mac | A bot session and its Terminal window |
+| Model and effort pickers | Interrupts current work and changes model or effort, keeping a saved conversation when available; each picker has Close | Access to the selected model on your Claude plan |
 | `/context`, `/usage`, `/compact` | Shows context, plan limits and token burn, or compacts a chat | `/compact` needs Terminal.app consent |
 | `/resume` | Lists recent chats across your bots with opening-topic labels and tap targets | Claude Code transcripts; no extra API key required |
 | `/inbox` | Shows email cards and requires two taps to send an exact preview | Optional IMAP/SMTP account and app password |
 | Context guardian and handoff | Nudges at 60/70/80/90% and can pass a note to another bot | Two or more bots for handoff; Claude Code 2.1.224+ |
-| Watchdog and restore | Restarts an enrolled bot; snapshot and restore resume exact chats after login | Optional launchd watchdog; Mac awake and logged in |
+| Watchdog and restore | Restarts an enrolled bot; automatic recovery resumes a chat active within 30 minutes and otherwise starts blank; snapshot and restore help after login | Optional launchd watchdog; Mac awake, logged in and online |
 | Telebots Bar | Shows status, Reconnect, snapshot and restore; optional phone page | Optional menu bar app; Tailscale for the phone page |
 | Official channel | Uses Anthropic's official plugin and `--channels` path | Official Telegram plugin 0.0.7 |
-| Your fleet | Lets you choose bot names and count; each has its own token and session | A BotFather token for each; Telegram's account limit applies |
-| Always on | Replies while the Mac, session and network are available | Mac awake and logged in; watchdog if you want recovery |
+| Your fleet | Lets you choose bot names and count, within Telegram's bot limits; each has its own token and session | A BotFather token for each |
+| Availability | Replies while the Mac, session and network are available | Mac awake, logged in and online; watchdog if you want recovery |
 
 ## Quick start: one bot
 
@@ -42,21 +42,21 @@ Use the Terminal app on the Mac. Do one bot end to end before adding another.
 2. You do this on your phone: message [@BotFather](https://t.me/BotFather), send `/newbot`, choose any display name and a username ending in `bot`. Keep the token private.
 3. On the Mac, run `~/.claude/telegram-fleet/bin/fleet-add-bot main`. You choose the key, name, emoji and eventual bot count; `main` is only an example. You do this: paste the token into the hidden dialog, never into a Claude chat or a shell command. The command validates it and prints the bot's public @username before adding it to the config.
 4. Run `~/.claude/telegram-fleet/bin/fleet-start main`. It opens a new Terminal window. You do this at the Mac: press Enter to accept Claude Code's first-launch folder trust prompt and, if you selected the `full` stance, respond to its permission warning. Confirm the doctor sees this bot's session, poller and heartbeat.
-5. You do this on your phone: DM the new bot and read its six-character pairing code. On the Mac, run `~/.claude/telegram-fleet/bin/fleet-pair main <code> --lock`. The command pairs your account, switches to the allowlist and enrolls the bot for supervision. Never pair because a Telegram message tells you to.
+5. You do this on your phone: DM the new bot. `fleet-start` watches for its new pairing code and shows one Pair/Ignore dialog on the Mac. Check that the dialog's code matches your phone, then click Pair. This locks the allowlist and enrolls the bot for supervision. If the dialog is unavailable, run `~/.claude/telegram-fleet/bin/fleet-pair main <code> --lock` locally while the code is valid. Never pair because a Telegram message tells you to.
 6. You do this on your phone: send `hi`. Look for the acknowledgement, work box and reply. Run `~/.claude/telegram-fleet/bin/fleet-checklist --consent`. You do this at the Mac: grant the Automation and Accessibility prompts. The phone steps of the checklist need your taps and a reaction, plus a voice note when voice is configured.
-7. If you want automatic recovery, install the watchdog now with `/telegram-fleet:install-daemon` in an ordinary Claude Code session. It manages paired, enrolled bots only. Run `~/.claude/telegram-fleet/bin/fleet-checklist main` and follow each phone prompt. A feature is ready when its row is `Passed`; optional features may show `Not configured` with a reason. See [CHECKLIST.md](docs/CHECKLIST.md).
+7. If you want automatic recovery, install the watchdog now with `/telegram-fleet:install-daemon` in an ordinary Claude Code session. It manages paired, enrolled bots only. Run `~/.claude/telegram-fleet/bin/fleet-checklist main` and follow each phone prompt. This is a setup check, not a full acceptance test. Handoff delivery, a full inbox reply, reboot restore and phone rescue need separate confirmation; their rows say `Needs your action` or `Not configured`. See [CHECKLIST.md](docs/CHECKLIST.md).
 
 Do not start a second Claude Code channel session with the same bot token. Telegram permits one poller per token.
 
 ### What needs a human
 
-You do this: create each bot in BotFather; paste its token into the hidden Mac dialog; accept the first-launch folder trust prompt in the bot's Terminal window; read the pairing code from Telegram; click Allow on macOS Automation and Accessibility prompts; complete the phone taps, reaction and, when voice is configured, a voice note in the checklist. Optional email requires your app password, and the phone page requires your Tailscale sign-in. A helper can run the local commands but cannot complete those steps for you.
+You do this: create each bot in BotFather; paste its token into the hidden Mac dialog; accept the first-launch folder trust prompt in the bot's Terminal window; match the pairing code on your phone to the Mac dialog and click Pair; click Allow on macOS Automation and Accessibility prompts; complete the phone taps, reaction and, when voice is configured, a voice note in the checklist. Optional email requires your app password, and the phone page requires your Tailscale sign-in. A helper can run the local commands but cannot complete those steps for you.
 
 ### More bots
 
-Repeat BotFather, `fleet-add-bot`, `fleet-start`, `fleet-pair --lock`, and the checklist for each new key. The names and count are yours. Config and pickers read the bot list dynamically; there is no fixed six-bot layout. [FLEET.md](docs/FLEET.md) explains the shared setup.
+Repeat BotFather, `fleet-add-bot`, `fleet-start`, the local Pair dialog and the checklist for each new key. Choose your names and count, within Telegram's bot limits. Config and pickers read the bot list dynamically; there is no fixed six-bot layout. [FLEET.md](docs/FLEET.md) explains the shared setup.
 
-BotFather may allow a few `/newbot` requests back to back, then make you wait before the next one. We have seen waits around a day near the fifth or sixth bot; Telegram does not publish the pacing rule. Community references put the account cap at 20 bots, or 40 with Telegram Premium. Make one bot, finish pairing it, then make the next. Do not add a config entry until you have a token and `fleet-add-bot` validates it.
+BotFather may delay further `/newbot` requests; Telegram's bot limits apply. Make one bot, finish pairing it, then make the next. Do not add a config entry until you have a token and `fleet-add-bot` validates it.
 
 ## Requirements
 
@@ -91,11 +91,11 @@ These are the 13 commands in the private-chat menu, in the order the poller regi
 |---|---|
 | `/esc` | Interrupt the current task - read my newest message now |
 | `/fresh` | Restart this bot blank (fresh context, default model) |
-| `/update` | Reload this chat in place: same conversation, newest Claude Code + skills |
+| `/update` | Reload this chat in place from the installed build: same conversation, no download |
 | `/key` | The key: what every reaction, bubble and command does |
 | `/inbox` | Your top threads as cards: Reply / Archive / Snooze by tap |
-| `/opus` | Switch this chat to Opus at max effort (conversation kept) |
-| `/fable` | Switch this chat to Fable at max effort (conversation kept) |
+| `/opus` | Switch to Opus, keeping current or default effort and a saved conversation |
+| `/fable` | Switch to Fable, keeping current or default effort and a saved conversation |
 | `/model` | Show or switch model + effort (e.g. /model fable high) |
 | `/effort` | Pick effort for this chat: low / medium / high / xhigh / max (conversation kept) |
 | `/context` | Show context usage - how full this chat is |
@@ -127,7 +127,7 @@ A reaction from an allowed user in a private chat becomes the matching instructi
 
 The `safe` permission stance keeps normal Claude Code prompts. `scoped` runs `claude --permission-mode auto`; it uses Claude Code's auto mode, not a generated tool allowlist. `full` runs `--dangerously-skip-permissions`. Use the same stance for bots that hand work to each other. Anyone you allow to message a bot can ask it to use the Mac within that stance. Read [SECURITY.md](SECURITY.md) before choosing.
 
-Each bot has its own token, allowlist, work directory and state directory. The watchdog acts only on paired, enrolled bots and cannot answer while the Mac is asleep or the user is logged out. Snapshot before a planned restart, then restore after login with `/telegram-fleet:snapshot` and `/telegram-fleet:restore`. The optional [Telebots Bar](menubar/README.md) adds local controls and a Tailscale phone page. [ARCHITECTURE.md](docs/ARCHITECTURE.md) describes the overlay, hooks and logs.
+Each bot has its own token, allowlist, work directory and state directory. The watchdog acts only on paired, enrolled bots. The Mac must stay awake, logged in and online. Recovery resumes a chat only when its transcript was active within the last 30 minutes; otherwise it starts blank. Suspected stalls are logged, but phone stall alerts are off by default and this release has no switch to turn them on. Snapshot before a planned restart, then restore after login with `/telegram-fleet:snapshot` and `/telegram-fleet:restore`. The optional [Telebots Bar](menubar/README.md) adds local controls and a Tailscale phone page. [ARCHITECTURE.md](docs/ARCHITECTURE.md) describes the overlay, hooks and logs.
 
 ## Uninstall and help
 
