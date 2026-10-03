@@ -62,7 +62,7 @@ fi
 CURL="${CC_MODEL_CURL:-/usr/bin/curl}"
 tg_send() {
   { [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; } && { log "tg_send skipped (no token/chat)"; return 0; }
-  "$CURL" -s -m 8 -o /dev/null -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$BOT_TOKEN" | "$CURL" --config - -s -m 8 -o /dev/null -X POST \
     --data-urlencode "chat_id=$CHAT_ID" \
     --data-urlencode "text=$1" >> "$LOG" 2>&1 || log "WARN telegram send failed"
 }

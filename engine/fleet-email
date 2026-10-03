@@ -4,12 +4,14 @@
 import email
 from email.header import decode_header, make_header
 from email.message import EmailMessage
+from html.parser import HTMLParser
 import hashlib
 import imaplib
 import json
 import os
 from pathlib import Path
 import re
+import socket
 import smtplib
 import ssl
 import stat
@@ -22,6 +24,8 @@ FLEET_HOME = Path(os.environ.get("FLEET_HOME", "~/.claude/telegram-fleet")).expa
 CONFIG = FLEET_HOME / "email.json"
 SERVICE = "telebots-email"
 CONSENT_RE = re.compile(r"^[0-9a-f]{24}$")
+MAX_MESSAGE_BYTES = 262144
+MAX_BODY_CHARS = 100000
 
 
 def fail(message):
@@ -109,25 +113,76 @@ def header(raw):
     return str(make_header(decode_header(raw or "")))
 
 
-def message_data(client, uid):
+class TextFromHTML(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.text = []
+        self.hidden = 0
+
+    def handle_starttag(self, tag, _attrs):
+        if tag in ("script", "style"):
+            self.hidden += 1
+        elif tag in ("p", "div", "br", "li", "tr"):
+            self.text.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self.hidden = max(0, self.hidden - 1)
+        elif tag in ("p", "div", "li", "tr"):
+            self.text.append("\n")
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.text.append(data)
+
+    def value(self):
+        return "\n".join(line.strip() for line in
+                         re.sub(r"[ \t]+", " ", "".join(self.text)).splitlines()
+                         if line.strip())
+
+
+def message_data(client, uid, full=False):
     uid = str(uid)
     if not uid.isdigit():
         fail("Invalid inbox ID.")
-    status, data = client.uid("fetch", uid, "(BODY.PEEK[])")
+    # Ask the server for a prefix only. Attachments and oversized messages must
+    # never make a five-card view download the whole mailbox.
+    status, data = client.uid("fetch", uid, f"(BODY.PEEK[]<0.{MAX_MESSAGE_BYTES}>)")
     if status != "OK":
         fail("Inbox read failed.")
     raw = next((part[1] for part in data if isinstance(part, tuple) and len(part) > 1), None)
     if not raw:
         fail("Inbox message is unavailable.")
+    if len(raw) > MAX_MESSAGE_BYTES:
+        fail("Inbox message exceeded the read limit.")
     msg = email.message_from_bytes(raw)
-    body = []
+    plain, html = [], []
     for part in msg.walk():
-        if part.get_content_type() == "text/plain" and part.get_content_disposition() != "attachment":
-            body.append((part.get_payload(decode=True) or b"").decode(
-                part.get_content_charset() or "utf-8", errors="replace"))
-    text = "".join(body)
-    return {"id": uid, "from": header(msg["From"]), "subject": header(msg["Subject"]),
-            "preview": text[:1600], "reply_to": header(msg["Reply-To"] or msg["From"])}
+        if part.get_content_disposition() == "attachment" or part.get_filename():
+            continue
+        kind = part.get_content_type()
+        if kind not in ("text/plain", "text/html"):
+            continue
+        decoded = (part.get_payload(decode=True) or b"").decode(
+            part.get_content_charset() or "utf-8", errors="replace")
+        (plain if kind == "text/plain" else html).append(decoded)
+    if plain:
+        text = "\n".join(plain)
+    else:
+        parser = TextFromHTML()
+        parser.feed("\n".join(html))
+        text = parser.value()
+    card = {"id": uid, "from": header(msg["From"]), "subject": header(msg["Subject"]),
+            "preview": text[:1600], "reply_to": header(msg["Reply-To"] or msg["From"]),
+            "date": header(msg["Date"])}
+    if not full:
+        return card
+    return {**card, "body": text[:MAX_BODY_CHARS],
+            "truncated": len(text) > MAX_BODY_CHARS or len(raw) >= MAX_MESSAGE_BYTES,
+            "to": header(msg["To"]), "cc": header(msg["Cc"]),
+            "message_id": header(msg["Message-Id"]),
+            "in_reply_to": header(msg["In-Reply-To"]),
+            "references": header(msg["References"])}
 
 
 def canonical_email(value):
@@ -189,34 +244,32 @@ def checked_send(req):
     if not isinstance(consent_id, str) or not CONSENT_RE.fullmatch(consent_id):
         fail("Invalid consent ID.")
     state = state_for(bot)
-    path = state / "consents.json"
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(fd, "r", encoding="utf-8") as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 8 * 1024 * 1024:
-            fail("Consent storage is unavailable.")
-        records = json.load(stream)
-    if not isinstance(records, dict):
-        fail("Consent storage is unavailable.")
-    record = records.get(consent_id)
     target = canonical_email(req.get("email"))
-    if (not isinstance(record, dict) or record.get("id") != consent_id
-            or record.get("phase") != "consumed"
-            or not isinstance(record.get("chat"), str)
-            or not re.fullmatch(r"[1-9][0-9]*", record["chat"])
-            or type(record.get("message")) is not int or record["message"] <= 0
-            or type(record.get("expires")) is not int
-            or record["expires"] <= time.time() * 1000
-            or record["expires"] > 2**53 - 1
-            or canonical_email(record.get("email")) != target
-            or record.get("digest") != digest(target)):
-        fail("Exact email consent is missing or expired.")
+    chat, message, proof_digest, nonce = (req.get(key) for key in ("chat", "message", "digest", "nonce"))
+    if (not isinstance(chat, str) or not re.fullmatch(r"[1-9][0-9]*", chat)
+            or type(message) is not int or message <= 0
+            or proof_digest != digest(target)
+            or not isinstance(nonce, str) or not re.fullmatch(r"[a-f0-9]{64}", nonce)):
+        fail("A one-time poller authorization is required.")
     access = load_json(state / "access.json")
     if (not isinstance(access, dict) or access.get("dmPolicy") == "disabled"
             or not isinstance(access.get("allowFrom"), list)
-            or not all(isinstance(chat, str) for chat in access["allowFrom"])
-            or record["chat"] not in access["allowFrom"]):
+            or not all(isinstance(item, str) for item in access["allowFrom"])
+            or chat not in access["allowFrom"]):
         fail("The original chat is not on the current allowlist.")
+    port = os.environ.get("TELEBOTS_EMAIL_AUTHORITY_PORT", "")
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        fail("The poller email authority is unavailable.")
+    proof = {"consent_id": consent_id, "chat": chat, "message": message,
+             "digest": proof_digest, "nonce": nonce}
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=3) as channel:
+            channel.sendall((json.dumps(proof, separators=(",", ":")) + "\n").encode("utf-8"))
+            response = channel.recv(256)
+        if json.loads(response).get("ok") is not True:
+            fail("The poller did not authorize this send.")
+    except (OSError, ValueError, json.JSONDecodeError):
+        fail("The poller did not authorize this send.")
     return target, state
 
 
@@ -281,10 +334,10 @@ def builtin(op, req, c):
                 fail("Inbox limit must be 1 to 20.")
             snoozed = load_json(FLEET_HOME / "inbox-snoozed.json", {})
             ids = [uid.decode("ascii") for uid in data[0].split()][::-1]
-            return [message_data(client, uid) for uid in ids
-                    if snoozed.get(uid, 0) <= time.time()][:limit]
+            eligible = [uid for uid in ids if snoozed.get(uid, 0) <= time.time()][:limit]
+            return [message_data(client, uid) for uid in eligible]
         if op == "read":
-            return message_data(client, req.get("id"))
+            return message_data(client, req.get("id"), full=True)
         if op == "archive":
             uid = str(req.get("id", ""))
             if not uid.isdigit():
@@ -355,7 +408,8 @@ def main(argv):
                              ("HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "FLEET_HOME",
                               "TELEGRAM_STATE_DIR", "TELEBOTS_TEST", "TELEBOTS_SANDBOX_ROOT")
                              if key in os.environ}
-                result = subprocess.run([backend, op], input=json.dumps(req), text=True,
+                child_req = {key: req[key] for key in ("bot", "consent_id", "email")}
+                result = subprocess.run([backend, op], input=json.dumps(child_req), text=True,
                                         capture_output=True, check=False, timeout=30,
                                         env=child_env)
                 if result.returncode:

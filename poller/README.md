@@ -85,12 +85,15 @@ same-filesystem atomic renames. Dependencies and the marker arrive before
 filesystem transaction can guarantee rollback after power loss. The verifier
 will detect an interrupted or incomplete bundle on the next check.
 
-Restore requires the pinned version, a recognized server hash, and a verified
-stock backup. It replaces the server atomically, removes unchanged support
-files named by the installed marker, and leaves locally modified support files
-inert. It retains the stock backup. Unknown server modifications are refused
-so they can be reviewed without being overwritten. These scripts never start,
-stop, or signal a bot. A running process loads changes on its next restart.
+Restore preflight reports RESTORE, STOCK, ABSENT, or OTHER_VERSION:<version>.
+Only an exact patched 0.0.7 server hash with a verified stock backup is restored.
+The restore command can find that slot beneath a newer official plugin version;
+it leaves the newer slot untouched. Stock and absent slots need no restoration.
+Unknown server modifications are refused before uninstall removes anything.
+Restore replaces the server atomically, removes unchanged support files named
+by the installed marker, leaves locally modified support files inert, and
+retains the stock backup. These scripts never start, stop, or signal a bot.
+A running process loads changes on its next restart.
 
 ## Status and exit codes
 
@@ -172,22 +175,33 @@ identical email, chat, and consent ID. Editing the preview or restarting the
 poller cancels unfinished consent and requires a fresh preview and both taps.
 Nonchannel diagnostic loads expose stock tools and do not initialize consent.
 
-`consents.json` is a mode 600 object keyed by the 24-character hex ID. Records
-contain `id`, `chat`, `message`, `digest`, `expires`, `phase`, and the canonical
-`email`. Expiry is Unix milliseconds, ten minutes after preview. Digest input
+The poller alone holds active consent in process memory. It records a Confirm
+send tap only after receiving the matching Telegram callback for the exact
+private chat, preview message and email digest. `email_send` checks that memory,
+then spends the consent before one backend attempt. A poller restart loses all
+active consent. `consents.json` is a mode 600 audit record keyed by the
+24-character hex ID. Its `phase` is never accepted as send authorization.
+Records contain `id`, `chat`, `message`, `digest`, `expires`, `phase`, and the
+canonical `email`. Expiry is Unix milliseconds, ten minutes after preview. Digest input
 is compact UTF-8 JSON with keys in this order: `bcc`, `body`, `cc`, `subject`,
 `to`. Missing Cc and Bcc become empty arrays; recipient order, case, and body
 whitespace are preserved. Lone surrogates and hidden header characters are
 refused. Phases are `preview`, `confirm`, `authorized`, `consumed`, `cancelled`.
 
-The poller persists `consumed` before calling the configured executable with
-argv `send` and JSON stdin `{consent_id, bot, email}`. The adapter must recheck
-the record, exact digest, expiry, and allowlist, then claim
-`<state>/mail-attempts/<id>` using exclusive creation before contacting SMTP.
-The adapter alone owns that claim. Return `{"ok":true}` only for confirmed
-success. Failed or uncertain attempts remain spent and are never retried
-automatically. The poller's 30-second backend deadline does not send a signal;
-the adapter must set its own bounded network deadlines.
+The poller calls `fleet-email send` with only `send` in argv. JSON stdin carries
+the exact email, chat, message ID, digest and a random one-time nonce. The
+backend checks the current allowlist and spends that nonce through a local
+127.0.0.1 authority held by the poller. It never trusts an `authorized` or
+`consumed` phase read from disk. This check also wraps custom adapters. Only
+then does the adapter claim `<state>/mail-attempts/<id>` with exclusive creation
+before contacting SMTP. Return `{"ok":true}` only for confirmed success.
+Failed or uncertain attempts remain spent and are never retried automatically.
+The poller's 30-second backend deadline does not send a signal; the adapter
+must set its own bounded network deadlines.
+
+In the `full` permission stance, an assistant with shell access could still
+reach the mail credentials directly, so the two-tap is a strong default there
+and a hard boundary only under `safe` and `scoped`.
 
 ## Verification boundaries
 

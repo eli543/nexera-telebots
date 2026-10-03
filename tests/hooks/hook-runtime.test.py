@@ -105,6 +105,24 @@ if __name__ == '__main__':
             result = self.run_hook(file, {"tool_name": "Write", "tool_input": {"file_path": "/tmp/report.pdf"}}, args, state=False)
             self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""), file)
 
+    def test_synthetic_slash_labels_never_run_fresh_or_model(self):
+        config = self.fleet / "bin/fleet-config"
+        config.write_text("#!/usr/bin/env python3\nimport sys\n"
+                          "print('main' if sys.argv[1] == 'bot-by-state' else '" + str(self.workdir) + "')\n")
+        config.chmod(0o700)
+        for name in ("fleet-fresh", "fleet-model"):
+            engine = self.fleet / "bin" / name
+            engine.write_text("#!/bin/sh\nprintf 'called\\n' >> '" + str(self.root / "engine-calls") + "'\n")
+            engine.chmod(0o700)
+        for via, command, hook in (("button", "/fresh", "telegram-fresh.sh"),
+                                   ("reaction", "/model", "telegram-model.sh"),
+                                   ("email_confirm", "/fresh", "telegram-fresh.sh"),
+                                   ("button", "/model opus", "telegram-model.sh")):
+            prompt = f'<channel source="plugin:telegram:telegram" chat_id="4242" via="{via}" message_id="9">{command}</channel>'
+            result = self.run_hook(hook, self.event(prompt=prompt))
+            self.assertEqual(result.returncode, 0, (via, command, result.stderr))
+        self.assertFalse((self.root / "engine-calls").exists())
+
     def test_judge_is_opt_in_and_uses_unpinned_service(self):
         tn = module("tldr-nudge")
         with patch.dict(os.environ, self.env, clear=True), patch.object(tn.subprocess, "run") as key:

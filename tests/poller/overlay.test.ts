@@ -103,7 +103,8 @@ describe('hash-pinned overlay lifecycle', () => {
     const before = tree(f.cache)
     status(f, `VERSION_MISMATCH:${version}`, 13)
     expect(f.run('install-overlay.sh').code).toBe(13)
-    expect(f.run('restore-stock.sh').code).toBe(13)
+    expect(f.run('restore-stock.sh', ['--preflight'])).toEqual({ code: 0, out: `OTHER_VERSION:${version}\n`, err: '' })
+    expect(f.run('restore-stock.sh').code).toBe(0)
     expect(tree(f.cache)).toEqual(before)
   })
 
@@ -117,6 +118,20 @@ describe('hash-pinned overlay lifecycle', () => {
     status(f, 'VERSION_MISMATCH:0.0.8', 13)
     expect(f.run('install-overlay.sh').code).toBe(13)
     expect(sha(readFileSync(join(f.slot, 'server.ts')))).toBe(stockSha)
+  })
+
+  test('restore selects a verified modified 0.0.7 slot beneath a newer stock slot', () => {
+    const f = fixture()
+    install(f)
+    const newer = join(f.cache, '0.0.8')
+    mkdirSync(join(newer, '.claude-plugin'), { recursive: true })
+    writeFileSync(join(newer, '.claude-plugin/plugin.json'), '{"version":"0.0.8"}')
+    writeFileSync(join(newer, 'server.ts'), 'new upstream fixture\n')
+    const newerBefore = tree(newer)
+    expect(f.run('restore-stock.sh', ['--preflight'])).toEqual({ code: 0, out: 'RESTORE\n', err: '' })
+    expect(f.run('restore-stock.sh').code).toBe(0)
+    expect(sha(readFileSync(join(f.slot, 'server.ts')))).toBe(stockSha)
+    expect(tree(newer)).toEqual(newerBefore)
   })
 
   test('invalid plugin metadata prints one safe unknown-version token', () => {

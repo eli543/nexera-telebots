@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from
 import { Bot, Context } from 'grammy'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join, resolve, sep } from 'node:path'
+import { connect } from 'node:net'
 import { canonicalEmailJson, ConsentStore, EmailService, emailDigest, emailText, emailTools, type Email, type EmailBackendPayload, type EmailServiceOptions } from '../../poller/email.ts'
 
 // Keep failure cleanup in our code; Bun timeout cleanup sends process signals.
@@ -73,13 +74,14 @@ function harness(overrides: Partial<EmailServiceOptions> = {}) {
     allowedCallback: () => true, logEvent: (event, fields) => { events.push({ event, fields }) },
     injectConfirm: async (ctx, id) => { injections.push({ ctx, id }) },
     runBackend: async (executable, op, payload) => {
-      expect(store.get(payload.consent_id)?.phase).toBe('consumed')
+      expect(JSON.parse(readFileSync(join(state, 'consents.json'), 'utf8'))[payload.consent_id]?.phase).toBe('consumed')
       expect(existsSync(join(state, 'mail-attempts', payload.consent_id))).toBeFalse()
       sends.push({ executable, op, payload })
       return { ok: true }
     }, ...overrides,
   }
   const service = new EmailService(options)
+  store = service.consents
   function context(data: string, message: any, sender = 1): Context {
     return new Context({ update_id: 1, callback_query: { id: 'DEMO-CALLBACK', from: { id: sender, is_bot: false, first_name: 'DEMO' }, chat_instance: 'DEMO-CHAT', data, message: structuredClone(message) } }, bot.api, botInfo)
   }
@@ -170,11 +172,12 @@ describe('durable one-use consent', () => {
     expect(() => store.consume(record.id, '1', fixture)).toThrow()
   })
 
-  test('cancellation and preview edits persist across restarts', () => {
+  test('cancellation is audited but a restart never imports consent', () => {
     const record = authorized()
     store.invalidatePreview('1', 42)
     const restarted = new ConsentStore(state, () => now)
-    expect(restarted.get(record.id)?.phase).toBe('cancelled')
+    expect(restarted.get(record.id)).toBeUndefined()
+    expect(JSON.parse(readFileSync(store.path, 'utf8'))[record.id].phase).toBe('cancelled')
     expect(() => restarted.consume(record.id, '1', fixture)).toThrow()
   })
 
@@ -184,7 +187,8 @@ describe('durable one-use consent', () => {
     store.consume(record.id, '1', fixture)
     expect(() => second.consume(record.id, '1', fixture)).toThrow()
     store.invalidatePreview('1', 42)
-    expect(second.get(record.id)?.phase).toBe('consumed')
+    expect(second.get(record.id)).toBeUndefined()
+    expect(JSON.parse(readFileSync(store.path, 'utf8'))[record.id].phase).toBe('consumed')
   })
 
   test('malformed storage, permissive modes and an existing transaction lock fail closed', () => {
@@ -201,6 +205,41 @@ describe('durable one-use consent', () => {
 })
 
 describe('email service confirmation', () => {
+  test('poller spends one nonce for only the confirmed preview digest', async () => {
+    let h!: ReturnType<typeof harness>
+    h = harness({ runBackend: async (_file, _op, payload) => {
+      const address = (h.service as any).authority.address()
+      const query = (value: object): Promise<{ ok: boolean }> => new Promise((resolve, reject) => {
+        const socket = connect(address.port, '127.0.0.1')
+        let reply = ''
+        socket.on('connect', () => socket.write(JSON.stringify(value) + '\n'))
+        socket.on('data', chunk => {
+          reply += chunk.toString('utf8')
+          if (reply.includes('\n')) { socket.end(); resolve(JSON.parse(reply)) }
+        })
+        socket.on('error', reject)
+      })
+      const proof = { nonce: payload.nonce, consent_id: payload.consent_id,
+        chat: payload.chat, message: payload.message, digest: payload.digest }
+      expect(await query({ ...proof, digest: '0'.repeat(64) })).toEqual({ ok: false })
+      expect(await query(proof)).toEqual({ ok: true })
+      expect(await query(proof)).toEqual({ ok: false })
+      return { ok: true }
+    } })
+    const { id } = await h.confirm()
+    expect((await h.service.callTool('email_send', { chat_id: '1', consent_id: id, email: fixture }))?.isError).not.toBeTrue()
+  })
+
+  test('editing the audit receipt cannot manufacture a Confirm send tap', async () => {
+    const h = harness(), { id } = await h.preview()
+    const audit = JSON.parse(readFileSync(store.path, 'utf8'))
+    audit[id].phase = 'authorized'
+    writeFileSync(store.path, JSON.stringify(audit))
+    const result = await h.service.callTool('email_send', { chat_id: '1', consent_id: id, email: fixture })
+    expect(result?.isError).toBeTrue()
+    expect(h.sends).toHaveLength(0)
+  })
+
   test('controller startup cancels every unfinished phase and preserves completed history', () => {
     const preview = store.preview('1', 40, fixture)
     const confirm = store.preview('1', 41, fixture)
@@ -211,9 +250,13 @@ describe('email service confirmation', () => {
     const cancelled = store.preview('1', 43, fixture)
     const cancelledBefore = store.tap(cancelled.id, 'cancel', '1', 43, emailText(fixture))
     harness()
-    for (const record of [preview, confirm, approved]) expect(store.get(record.id)?.phase).toBe('cancelled')
-    expect(store.get(consumed.id)).toEqual(consumedBefore)
-    expect(store.get(cancelled.id)).toEqual(cancelledBefore)
+    const audit = JSON.parse(readFileSync(store.path, 'utf8'))
+    for (const record of [preview, confirm, approved]) {
+      expect(store.get(record.id)).toBeUndefined()
+      expect(audit[record.id].phase).toBe('cancelled')
+    }
+    expect(audit[consumed.id]).toEqual(consumedBefore)
+    expect(audit[cancelled.id]).toEqual(cancelledBefore)
     expect(statSync(store.path).mode & 0o777).toBe(0o600)
   })
 
@@ -222,7 +265,8 @@ describe('email service confirmation', () => {
     expect(store.get(id)!.expires).toBeGreaterThan(now)
     const restarted = new EmailService(h.options)
     expect((await restarted.callTool('email_send', { chat_id: '1', consent_id: id, email: fixture }))?.isError).toBeTrue()
-    expect(store.get(id)?.phase).toBe('cancelled')
+    expect(restarted.consents.get(id)).toBeUndefined()
+    expect(JSON.parse(readFileSync(store.path, 'utf8'))[id].phase).toBe('cancelled')
     expect(h.sends).toHaveLength(0)
     expect((await restarted.callTool('email_preview', { chat_id: '1', email: fixture }))?.isError).not.toBeTrue()
     const message = h.messages.get(h.messages.size)!
@@ -239,7 +283,7 @@ describe('email service confirmation', () => {
     const oldKeyboard = structuredClone(message)
     const restarted = new EmailService(h.options)
     await restarted.handleCallback(h.context(`mail:${id}:confirm`, oldKeyboard))
-    expect(store.get(id)?.phase).toBe('cancelled')
+    expect(restarted.consents.get(id)).toBeUndefined()
     expect(h.injections).toHaveLength(0)
   })
 
@@ -487,6 +531,9 @@ describe('email security gates', () => {
   test('the configured custom executable receives send argv and JSON stdin without a shell', async () => {
     const report = join(root, 'backend-report.json'), backend = join(root, 'custom backend')
     writeFileSync(backend, `#!${process.execPath}\nconst fs = require('node:fs');\nconst path = require('node:path');\n(async () => {\nconst payload = JSON.parse(await Bun.stdin.text());\nconst record = JSON.parse(fs.readFileSync(path.join(process.env.TELEGRAM_STATE_DIR, 'consents.json'), 'utf8'))[payload.consent_id];\nconst dir = path.join(process.env.TELEGRAM_STATE_DIR, 'mail-attempts');\nfs.mkdirSync(dir, {recursive:true, mode:448});\nconst fd = fs.openSync(path.join(dir, payload.consent_id), 'wx', 384); fs.closeSync(fd);\nfs.writeFileSync(${JSON.stringify(report)}, JSON.stringify({argv:process.argv.slice(2),payload,phase:record.phase,tokenPresent:Boolean(process.env.TELEGRAM_BOT_TOKEN)}), {mode:384});\nprocess.stdout.write(JSON.stringify({ok:true}));\n})();\n`, { mode: 0o700 })
+    mkdirSync(join(fleet, 'bin'))
+    writeFileSync(join(fleet, 'bin', 'fleet-email'), readFileSync(join(import.meta.dir, '../../engine/fleet-email')), { mode: 0o700 })
+    writeFileSync(join(fleet, 'fleet.json'), JSON.stringify({ version: 2, bots: [{ key: 'main', state_dir: state }] }))
     writeFileSync(join(fleet, 'email.json'), JSON.stringify({ enabled: true, backend }))
     const h = harness({ runBackend: undefined }), { id } = await h.confirm()
     expect((await h.service.callTool('email_send', { chat_id: '1', consent_id: id, email: fixture }))?.isError).not.toBeTrue()

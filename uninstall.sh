@@ -105,6 +105,27 @@ $candidates
 EOF
 }
 
+# Restore first. An unknown or damaged modified slot must stop uninstall before
+# a daemon, session, state file or installation is removed.
+step "Preflight official Telegram plugin restoration"
+if [ ! -f "$REPO_DIR/poller/restore-stock.sh" ]; then
+  note "poller/restore-stock.sh is missing. Nothing was removed."
+  exit 1
+fi
+if ! RESTORE_PLAN="$(/bin/bash "$REPO_DIR/poller/restore-stock.sh" --preflight)"; then
+  note "Plugin restoration cannot be verified. Nothing was removed."
+  exit 1
+fi
+case "$RESTORE_PLAN" in
+  RESTORE)
+    step "Restore the verified 0.0.7 plugin slot before teardown"
+    run /bin/bash "$REPO_DIR/poller/restore-stock.sh" ;;
+  STOCK) note "The 0.0.7 plugin slot is already stock." ;;
+  ABSENT) note "No 0.0.7 plugin slot is installed." ;;
+  OTHER_VERSION:*) note "Only a different official plugin version is present; leaving it untouched." ;;
+  *) note "Unknown restoration plan. Nothing was removed."; exit 1 ;;
+esac
+
 # ---- watchdog ---------------------------------------------------------------
 
 step "Stop and remove the watchdog daemon"
@@ -141,14 +162,6 @@ else
 fi
 
 # ---- plugin -----------------------------------------------------------------
-
-step "Restore the official Telegram plugin"
-if [ -f "$REPO_DIR/poller/restore-stock.sh" ]; then
-  run bash "$REPO_DIR/poller/restore-stock.sh"
-else
-  note "poller/restore-stock.sh is missing. Keep the plugin installed until its stock file is restored."
-  if [ "$DRY_RUN" -eq 0 ]; then exit 1; fi
-fi
 
 step "Uninstall the plugin"
 if command -v claude >/dev/null 2>&1; then

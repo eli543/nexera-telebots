@@ -105,7 +105,7 @@ PY
       token="$(grep -E '^TELEGRAM_BOT_TOKEN=' "$STATE_DIR/.env" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]')"
     fi
     if [ -n "$token" ] && [ -n "$CHAT_ID" ]; then
-      curl -s -m 8 -o /dev/null -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+      printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$token" | curl --config - -s -m 8 -o /dev/null -X POST \
         --data-urlencode "chat_id=${CHAT_ID}" \
         --data-urlencode "text=${msg}" || true
     fi

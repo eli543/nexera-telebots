@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { spawn } from 'node:child_process'
+import { createServer, type Server } from 'node:net'
 import type { Bot, Context } from 'grammy'
 import type { InlineKeyboardMarkup } from 'grammy/types'
 import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js'
@@ -69,6 +70,7 @@ export function emailText(value: unknown): string {
 export class ConsentStore {
   readonly path: string
   private readonly lockPath: string
+  private active: Record<string, ConsentRecord> = Object.create(null) as Record<string, ConsentRecord>
 
   constructor(readonly stateDir: string, private readonly now: () => number = Date.now) {
     this.path = join(stateDir, 'consents.json')
@@ -94,20 +96,28 @@ export class ConsentStore {
     } finally { closeSync(fd) }
   }
 
-  private transaction<T>(change: (records: Record<string, ConsentRecord>) => T): T {
+  private transaction<T>(change: (records: Record<string, ConsentRecord>) => T, cancelOldPending = false): T {
     mkdirSync(this.stateDir, { recursive: true, mode: 0o700 })
     // One synchronous transaction also prevents separate pollers from authorizing
     // or consuming the same record concurrently. An orphan lock fails closed.
     const lock = openSync(this.lockPath, 'wx', 0o600)
     let temporary: string | undefined
     try {
-      const records = this.read()
+      const records = structuredClone(this.active)
       const result = change(records)
+      const audit = this.read()
+      if (cancelOldPending) {
+        for (const record of Object.values(audit)) {
+          if (record.phase === 'preview' || record.phase === 'confirm' || record.phase === 'authorized') record.phase = 'cancelled'
+        }
+      }
+      Object.assign(audit, records)
       temporary = `${this.path}.${randomBytes(8).toString('hex')}.tmp`
       const fd = openSync(temporary, 'wx', 0o600)
-      try { writeFileSync(fd, JSON.stringify(records)); fsyncSync(fd) } finally { closeSync(fd) }
+      try { writeFileSync(fd, JSON.stringify(audit)); fsyncSync(fd) } finally { closeSync(fd) }
       renameSync(temporary, this.path)
       temporary = undefined
+      this.active = records
       return structuredClone(result)
     } finally {
       if (temporary) { try { unlinkSync(temporary) } catch { /* No content is logged. */ } }
@@ -118,7 +128,7 @@ export class ConsentStore {
 
   get(id: string): ConsentRecord | undefined {
     if (!ID.test(id)) return undefined
-    const record = this.read()[id]
+    const record = this.active[id]
     return record ? structuredClone(record) : undefined
   }
 
@@ -180,15 +190,11 @@ export class ConsentStore {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
       throw error
     }
-    this.transaction(records => {
-      for (const record of Object.values(records)) {
-        if (record.phase === 'preview' || record.phase === 'confirm' || record.phase === 'authorized') record.phase = 'cancelled'
-      }
-    })
+    this.transaction(() => {}, true)
   }
 }
 
-export type EmailBackendPayload = { consent_id: string; bot: string; email: CanonicalEmail }
+export type EmailBackendPayload = { consent_id: string; bot: string; email: CanonicalEmail; nonce: string; chat: string; message: number; digest: string }
 export type EmailServiceOptions = {
   bot: Pick<Bot, 'api'>
   stateDir: string
@@ -251,16 +257,54 @@ export class EmailService {
   readonly tools = emailTools
   readonly consents: ConsentStore
   private readonly busy = new Set<string>()
+  private readonly pending = new Map<string, { id: string; chat: string; message: number; digest: string; expires: number }>()
+  private readonly authority: Server
+  private readonly authorityReady: Promise<number>
 
   constructor(private readonly options: EmailServiceOptions) {
     this.consents = new ConsentStore(options.stateDir, options.now)
-    // Stock fallback can edit messages while the feature module is unavailable.
-    // A new controller cannot know which preview was edited in that interval.
-    // Cancel unfinished consent durably before exposing tools or callbacks;
-    // any storage failure throws so initialization fails closed for email.
-    // Consumed/cancelled history remains intact for adapter replay checks.
+    // Disk receipts are audit records only. A controller restart begins with no
+    // in-memory consent, even if a receipt says authorized or consumed.
     this.consents.invalidatePending()
+    // The adapter must ask this process to spend a fresh nonce for this exact
+    // digest before contacting SMTP. A local shell in full stance can still
+    // reach mail credentials directly; see the documented stance boundary.
+    this.authority = createServer(socket => {
+      let input = '', answered = false
+      socket.setTimeout(3000, () => socket.destroy())
+      socket.on('data', (chunk: Buffer) => {
+        if (answered) return
+        input += chunk.toString('utf8')
+        if (Buffer.byteLength(input) > 2048) { socket.destroy(); return }
+        if (!input.includes('\n')) return
+        answered = true
+        let ok = false
+        try {
+          const value: unknown = JSON.parse(input.slice(0, input.indexOf('\n')))
+          if (plainObject(value) && typeof value.nonce === 'string') {
+            const pending = this.pending.get(value.nonce)
+            const record = pending && this.consents.get(pending.id)
+            ok = !!pending && !!record && pending.expires > (this.options.now ?? Date.now)() &&
+              value.consent_id === pending.id && value.chat === pending.chat && value.message === pending.message &&
+              value.digest === pending.digest && record.phase === 'consumed' && record.chat === pending.chat &&
+              record.message === pending.message && record.digest === pending.digest
+            if (ok) this.pending.delete(value.nonce)
+          }
+        } catch { /* Invalid proof never authorizes a send. */ }
+        socket.end(JSON.stringify({ ok }) + '\n')
+      })
+    })
+    this.authorityReady = new Promise(resolve => {
+      this.authority.once('error', () => resolve(0))
+      this.authority.listen(0, '127.0.0.1', () => {
+        this.authority.unref()
+        const address = this.authority.address()
+        resolve(address && typeof address !== 'string' ? address.port : 0)
+      })
+    })
   }
+
+  dispose(): void { this.pending.clear(); this.authority.close() }
 
   private event(event: string, fields: Record<string, string | number>): void {
     try { this.options.logEvent(event, fields) } catch { /* Evidence failure cannot turn a send into a retry. */ }
@@ -270,8 +314,12 @@ export class EmailService {
     try {
       const config: unknown = JSON.parse(readFileSync(join(this.options.fleetHome, 'email.json'), 'utf8'))
       if (!plainObject(config) || config.enabled !== true) return undefined
-      if (config.backend === 'builtin') return join(this.options.fleetHome, 'bin', 'fleet-email')
-      if (typeof config.backend === 'string' && isAbsolute(config.backend) && !/[\u0000\r\n]/.test(config.backend)) return config.backend
+      if (config.backend === 'builtin' ||
+          (typeof config.backend === 'string' && isAbsolute(config.backend) && !/[\u0000\r\n]/.test(config.backend))) {
+        // Custom adapters are still called through fleet-email so they cannot
+        // bypass the one-time poller authorization check.
+        return join(this.options.fleetHome, 'bin', 'fleet-email')
+      }
     } catch { /* Missing or malformed configuration disables email. */ }
     return undefined
   }
@@ -390,22 +438,28 @@ export class EmailService {
       const bot = this.options.botKey()
       if (!bot || !/^[a-z0-9][a-z0-9-]{0,30}$/.test(bot)) throw Error('This bot is not configured for email.')
       if (typeof args.consent_id !== 'string') throw Error(STALE)
+      const port = await this.authorityReady
+      if (!port) throw Error('The email authority is unavailable.')
       // No await between the disk-fresh access check and durable consumption.
       if (!this.diskAllowed(chat)) throw Error('This private chat is not authorized.')
       const record = this.consents.consume(args.consent_id, chat, email)
+      const nonce = randomBytes(32).toString('hex')
+      this.pending.set(nonce, { id: record.id, chat, message: record.message, digest: record.digest,
+        expires: Math.min(record.expires, (this.options.now ?? Date.now)() + 30_000) })
       this.event('EMAIL-SEND', { id: record.id, status: 'attempt' })
       try {
-        // The adapter ALONE creates mail-attempts/<id> with O_EXCL and mode 600
-        // before SMTP. It resolves state from the validated bot, re-reads this
-        // consumed record, checks chat/message/expiry/digest, and never retries.
-        // consents.json is a JSON object keyed by id, without an envelope.
-        const result = await (this.options.runBackend ?? this.runBackend.bind(this))(executable, 'send', { consent_id: record.id, bot, email: record.email })
+        // The backend spends the nonce through the loopback authority, then
+        // creates mail-attempts/<id> with O_EXCL before one SMTP attempt.
+        const result = await (this.options.runBackend ?? this.runBackend.bind(this))(executable, 'send',
+          { consent_id: record.id, bot, email: record.email, nonce, chat, message: record.message, digest: record.digest })
         if (!plainObject(result) || result.ok !== true) throw Error(BACKEND_UNCERTAIN)
         this.event('EMAIL-SEND', { id: record.id, status: 'sent' })
         return { content: [{ type: 'text', text: 'The email backend confirmed the send. Consent has been used.' }] }
       } catch {
         this.event('EMAIL-SEND', { id: record.id, status: 'uncertain' })
         throw Error(BACKEND_UNCERTAIN)
+      } finally {
+        this.pending.delete(nonce)
       }
     } catch (error) {
       // Never forward adapter stderr/stdout, message text, paths or secrets.
@@ -418,8 +472,10 @@ export class EmailService {
 
   private async runBackend(executable: string, op: 'send', payload: EmailBackendPayload): Promise<unknown> {
     return await new Promise((resolve, reject) => {
-      const env: NodeJS.ProcessEnv = { FLEET_HOME: this.options.fleetHome, TELEGRAM_STATE_DIR: this.options.stateDir }
-      for (const key of ['HOME', 'PATH', 'TMPDIR', 'LANG', 'LC_ALL']) if (process.env[key]) env[key] = process.env[key]
+      const address = this.authority.address()
+      const env: NodeJS.ProcessEnv = { FLEET_HOME: this.options.fleetHome, TELEGRAM_STATE_DIR: this.options.stateDir,
+        TELEBOTS_EMAIL_AUTHORITY_PORT: address && typeof address !== 'string' ? String(address.port) : '' }
+      for (const key of ['HOME', 'PATH', 'TMPDIR', 'LANG', 'LC_ALL', 'TELEBOTS_TEST', 'TELEBOTS_SANDBOX_ROOT']) if (process.env[key]) env[key] = process.env[key]
       // A soft deadline makes the result uncertain without signalling a child.
       // The adapter must set its own socket deadlines. Never retry after this.
       const child = spawn(executable, [op], { env, stdio: ['pipe', 'pipe', 'ignore'] })

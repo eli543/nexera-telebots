@@ -269,7 +269,7 @@ tg_notice() {   # tg_notice <text>
     echo "$(date '+%F %T') notice skipped: no token/chat for $KEY"
     return 1
   fi
-  curl -s -o /dev/null --max-time 10 -X POST "https://api.telegram.org/bot${tok}/sendMessage" \
+  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$tok" | curl --config - -s -o /dev/null --max-time 10 -X POST \
     --data-urlencode "chat_id=${chat}" \
     --data-urlencode "text=$1" \
     && echo "$(date '+%F %T') notice sent: $1" \
@@ -292,7 +292,7 @@ send_ready_ping() {
   if [[ "$RESUME_ID" =~ $UUID_RE ]]; then
     args+=(--data-urlencode 'reply_markup={"inline_keyboard":[[{"text":"Continue","callback_data":"qr:0:0"}]]}')
   fi
-  if curl -s -o /dev/null --max-time 10 -X POST "$base/bot$tok/sendMessage" \
+  if printf 'url = "%s/bot%s/sendMessage"\n' "$base" "$tok" | curl --config - -s -o /dev/null --max-time 10 -X POST \
     --data-urlencode "chat_id=$chat" --data-urlencode "text=⚡ Back and ready" "${args[@]}" 2>/dev/null; then
     echo "$(date '+%F %T') back-online ping sent"
   else

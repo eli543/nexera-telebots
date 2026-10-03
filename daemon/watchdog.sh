@@ -100,7 +100,7 @@ alert() {
   [ -z "$tok" ] && tok="$(token_of_state "$ALERT_STATE")"
   [ -z "$cid" ] && cid="$(chat_id_of_state "$ALERT_STATE")"
   { [ -z "$tok" ] || [ -z "$cid" ]; } && { log "alert skipped (no alert token/chat)"; return 0; }
-  curl -s --max-time 10 "https://api.telegram.org/bot${tok}/sendMessage" \
+  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$tok" | curl --config - -s --max-time 10 \
     --data-urlencode "chat_id=${cid}" --data-urlencode "text=$1" >/dev/null 2>&1
 }
 
@@ -110,7 +110,7 @@ alert() {
 telegram_reachable() {
   local tok resp
   tok=$(token_of_state "$1"); [ -z "$tok" ] && return 0
-  resp=$(curl -s --max-time 10 "https://api.telegram.org/bot${tok}/getWebhookInfo" 2>/dev/null)
+  resp=$(printf 'url = "https://api.telegram.org/bot%s/getWebhookInfo"\n' "$tok" | curl --config - -s --max-time 10 2>/dev/null)
   printf '%s' "$resp" | python3 -c 'import json,sys
 try: sys.exit(0 if json.load(sys.stdin).get("ok") is True else 1)
 except (ValueError,TypeError): sys.exit(1)'

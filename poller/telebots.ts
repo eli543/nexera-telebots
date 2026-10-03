@@ -472,7 +472,7 @@ export class TelebotsModule implements Telebots {
     const self = this.self(), pid = needsPid ? this.ownerPid() : null
     if (!self || (needsPid && !pid)) { await this.send(chatId, `Could not run /${kind} automatically - use the terminal.`); return }
     const args = kind === 'model' ? [self.workdir, chatId, argument]
-      : kind === 'fresh' ? [String(pid), self.workdir]
+      : kind === 'fresh' ? [String(pid), self.workdir, 'fresh-reset']
       : kind === 'compact' ? [String(pid), self.workdir, ...(argument ? [argument] : [])]
       : needsPid ? [String(pid), self.workdir, chatId]
       : [self.workdir, chatId]
@@ -710,7 +710,7 @@ export class TelebotsModule implements Telebots {
       ...(voice?.meta ?? {}),
     } } })
   }
-  dispose(): void { this.disposed = true; for (const timer of this.timers) clearTimeout(timer); this.timers.clear() }
+  dispose(): void { this.disposed = true; this.email.dispose(); for (const timer of this.timers) clearTimeout(timer); this.timers.clear() }
   async drain(): Promise<void> {
     while (this.chains.size || this.tasks.size) await Promise.all([...this.chains.values(), ...this.tasks])
   }
