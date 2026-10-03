@@ -142,6 +142,19 @@ class ChecklistProducerTests(unittest.TestCase):
         (peer / "logs/poller-events.log").write_text(f"{stamp} HANDOFF-RECEIVED id={'b' * 24} source=main target=second\n")
         self.assertEqual(row(), "Needs your action")
         (peer / "logs/poller-events.log").write_text(f"{stamp} HANDOFF-RECEIVED id={note_id} source=main target=second\n")
+        self.assertEqual(row(), "Needs your action")
+        delivery = "d" * 24
+        source.write_text(f"{stamp} HANDOFF-ISSUED id={note_id} source=main target=second delivery={delivery}\n"
+                          f"{stamp} HANDOFF-SENT id={note_id} source=main target=second delivery={delivery}\n")
+        (peer / "logs/poller-events.log").write_text(
+            f"{stamp} HANDOFF-RECEIVED id={note_id} source=main target=second delivery={delivery}\n")
+        deliveries = self.fleet / "handoffs/deliveries"
+        deliveries.mkdir(parents=True)
+        record = deliveries / (delivery + ".json")
+        record.write_text(json.dumps({
+            "note_id": note_id, "source": "main", "target": "second", "phase": "received",
+            "issued_at": int(time.time() * 1000), "delivery_id": delivery}))
+        record.chmod(0o600)
         self.assertEqual(row(), "Passed")
 
     def test_inbox_reply_requires_a_linked_full_read_and_smtp_receipt(self):

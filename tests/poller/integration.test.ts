@@ -290,9 +290,14 @@ describe('stock seam and mock Telegram with a fake MCP owner', () => {
     mkdirSync(join(f.fleetHome, 'handoffs'))
     writeFileSync(join(f.fleetHome, 'handoffs', `${noteId}.md`),
       `HANDOFF from Main to Research Lab - Friday, October 2, 2026\nTITLE: Offline handoff\nRECOMMENDED EFFORT: low\nNOTE-ID: ${noteId}\nSOURCE-KEY: main\nTARGET-KEY: research-lab\n`, { mode: 0o600 })
-    expect((await f.client.callTool('handoff_receipt', { note_id: noteId, phase: 'received' })).isError).toBe(true)
-    expect((await f.client.callTool('handoff_receipt', { note_id: noteId, phase: 'sent' })).isError).not.toBe(true)
-    expect(f.events()).toContain(`HANDOFF-SENT id=${noteId} source=main target=research-lab`)
+    expect((await f.client.callTool('handoff_receipt', { note_id: noteId, phase: 'received', delivery_id: 'f'.repeat(24) })).isError).toBe(true)
+    const issued = await f.client.callTool('handoff_receipt', { note_id: noteId, phase: 'issue' })
+    expect(issued.isError).not.toBe(true)
+    if (issued.content[0]?.type !== 'text') throw Error('Issue receipt missing text')
+    const delivery = /Delivery ID: ([a-f0-9]{24})/.exec(issued.content[0].text)?.[1]
+    expect(delivery).toMatch(/^[a-f0-9]{24}$/)
+    expect((await f.client.callTool('handoff_receipt', { note_id: noteId, phase: 'sent', delivery_id: delivery })).isError).not.toBe(true)
+    expect(f.events()).toContain(`HANDOFF-SENT id=${noteId} source=main target=research-lab delivery=${delivery}`)
   })
 
   test('F2.13 spawns every intercept with exact argv and supports resume refresh/close/open', async () => {
