@@ -49,6 +49,11 @@ class ChangelogReleaseTests(unittest.TestCase):
         self.assertIn("accepted, attempted or failed", text)
         self.assertIn("reconnect health", text)
 
+    def test_voice_notes_describe_the_marker_and_automatic_backend(self):
+        text = (ROOT / "CHANGELOG.md").read_text().split("## [0.2.0]", 1)[0]
+        self.assertIn("autotranscribe.off", text)
+        self.assertIn("available local backend", text)
+
 
 if __name__ == "__main__":
     unittest.main()
