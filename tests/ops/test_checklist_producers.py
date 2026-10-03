@@ -223,19 +223,24 @@ class ChecklistProducerTests(unittest.TestCase):
                                         '  -axo) printf "111 claude --channels plugin:telegram@claude-plugins-official\\n222 bun server.ts\\n" ;;\n'
                                         '  eww) printf "TELEGRAM_STATE_DIR=%s\\n" "$TEST_STATE" ;;\n'
                                         'esac\n')
-        (self.shims / "curl").write_text('#!/bin/sh\necho called >> "$CURL_LOG"\nprintf "{\\"ok\\":true}\\n"\n')
+        (self.shims / "curl").write_text('#!/bin/sh\necho called >> "$CURL_LOG"\n'
+                                          'printf "{\\"ok\\":%s}\\n" "${CURL_OK:-true}"\n')
         config = self.fleet / "fleet.json"
         fleet = json.loads(config.read_text())
         started = {"TEST_STATE": str(self.state), "CURL_LOG": str(self.root / "curl.log")}
         watchdog = REPO / "daemon/watchdog.sh"
         self.assertEqual(self.call(watchdog, extra=started).returncode, 0)
         self.assertFalse((self.root / "curl.log").exists())
+        self.assertTrue((self.fleet / "watchdog-state/main.stall_observed").exists())
+        self.assertFalse((self.fleet / "watchdog-state/main.stall_alerted").exists())
         fleet["options"] = {"stall_phone_alerts": True}
         config.write_text(json.dumps(fleet))
-        (self.fleet / "watchdog-state/main.stall_alerted").unlink()
+        self.assertEqual(self.call(watchdog, extra={**started, "CURL_OK": "false"}).returncode, 0)
+        self.assertFalse((self.fleet / "watchdog-state/main.stall_alerted").exists())
         for _ in range(2):
             self.assertEqual(self.call(watchdog, extra=started).returncode, 0)
-        self.assertEqual((self.root / "curl.log").read_text().splitlines(), ["called"])
+        self.assertEqual((self.root / "curl.log").read_text().splitlines(), ["called", "called"])
+        self.assertTrue((self.fleet / "watchdog-state/main.stall_alerted").exists())
         self.assertFalse((self.fleet / "watchdog-state/main.restart_log").exists())
 
 

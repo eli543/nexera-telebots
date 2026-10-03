@@ -168,7 +168,7 @@ restart_channel() {
 # ALERT-ONLY, never restarts (also matches a session legitimately inside one long
 # tool call). The ping itself is OFF by default; detection still logs.
 check_stall() {
-  local key="$1" sdir="$2" li li_ts proj latest tm flag
+  local key="$1" sdir="$2" li li_ts proj latest tm flag observed
   li="$sdir/last-inbound"
   [ -f "$li" ] || return 0
   li_ts=$(head -1 "$li" 2>/dev/null | tr -cd '0-9'); [ -z "$li_ts" ] && return 0
@@ -177,16 +177,21 @@ check_stall() {
   latest=$(ls -t "$proj"/*.jsonl 2>/dev/null | head -1)
   [ -n "$latest" ] && tm=$(stat -f %m "$latest" 2>/dev/null || echo 0)
   flag="$STATE/$key.stall_alerted"
+  observed="$STATE/$key.stall_observed"
   if [ "$li_ts" -gt "$tm" ] && [ $(( now - li_ts )) -ge "$STALL_MIN" ]; then
-    if [ ! -f "$flag" ] || [ "$(cat "$flag" 2>/dev/null)" != "$li_ts" ]; then
+    if [ ! -f "$observed" ] || [ "$(cat "$observed" 2>/dev/null)" != "$li_ts" ]; then
       log "$key: STALL suspected - inbound $(( now - li_ts ))s ago, no transcript activity since. ALERT-ONLY, no restart. (phone alerts=$STALL_PHONE_ALERTS)"
-      if [ "$STALL_PHONE_ALERTS" = true ]; then
-        alert "I received a message but have shown no transcript activity for 10 minutes. I may be stalled. Please check this bot on the Mac." "$(token_of_state "$sdir")" "$(chat_id_of_state "$sdir")"
+      [ $DRY_RUN -eq 0 ] && printf '%s\n' "$li_ts" > "$observed"
+    fi
+    if [ "$STALL_PHONE_ALERTS" = true ]; then
+      if [ ! -f "$flag" ] || [ "$(cat "$flag" 2>/dev/null)" != "$li_ts" ]; then
+        if alert "I received a message but have shown no transcript activity for 10 minutes. I may be stalled. Please check this bot on the Mac." "$(token_of_state "$sdir")" "$(chat_id_of_state "$sdir")"; then
+          [ $DRY_RUN -eq 0 ] && printf '%s\n' "$li_ts" > "$flag"
+        fi
       fi
-      [ $DRY_RUN -eq 0 ] && printf '%s\n' "$li_ts" > "$flag"
     fi
   else
-    [ $DRY_RUN -eq 0 ] && rm -f "$flag" 2>/dev/null
+    [ $DRY_RUN -eq 0 ] && rm -f "$flag" "$observed" 2>/dev/null
   fi
   return 0
 }
