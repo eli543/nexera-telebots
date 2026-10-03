@@ -207,7 +207,7 @@ describe('commands and pickers', () => {
     const inputs = ['/fresh', '/Model opus low', '/opus', '/FABLE', '/effort HIGH', '/esc', '/update', '/context', '/usage', '/COMPACT keep\n  the\u0000 notes']
     for (const input of inputs) { expect(await f.tb.intercept(f.textContext(), input, '101')).toBe(true); await f.tb.drain() }
     expect(f.spawns.map(s => [basename(s.file), s.args])).toEqual([
-      ['fleet-fresh', ['12345', f.workdir]],
+      ['fleet-fresh', ['12345', f.workdir, 'fresh-reset']],
       ['fleet-model', [f.workdir, '101', 'opus low']], ['fleet-model', [f.workdir, '101', 'opus']], ['fleet-model', [f.workdir, '101', 'fable']], ['fleet-model', [f.workdir, '101', 'high']],
       ['fleet-esc', ['12345', f.workdir, '101']],
       ['fleet-update', ['12345', f.workdir, '101']], ['fleet-context', [f.workdir, '101']], ['fleet-usage', [f.workdir, '101']], ['fleet-compact', ['12345', f.workdir, 'keep the notes']],

@@ -295,7 +295,7 @@ describe('stock seam and mock Telegram with a fake MCP owner', () => {
     const calls = f.calls()
     const pid = calls.find(call => call.engine === 'fleet-fresh')!.args[0]!
     expect(Number(pid)).toBeGreaterThan(1)
-    expect(calls.find(call => call.engine === 'fleet-fresh')!.args).toEqual([pid, f.workdir])
+    expect(calls.find(call => call.engine === 'fleet-fresh')!.args).toEqual([pid, f.workdir, 'fresh-reset'])
     expect(calls.find(call => call.engine === 'fleet-update')!.args).toEqual([pid, f.workdir, String(owner)])
     expect(calls.find(call => call.engine === 'fleet-esc')!.args).toEqual([pid, f.workdir, String(owner)])
     expect(calls.find(call => call.engine === 'fleet-compact')!.args).toEqual([pid, f.workdir, 'focus second line'])

@@ -472,7 +472,7 @@ export class TelebotsModule implements Telebots {
     const self = this.self(), pid = needsPid ? this.ownerPid() : null
     if (!self || (needsPid && !pid)) { await this.send(chatId, `Could not run /${kind} automatically - use the terminal.`); return }
     const args = kind === 'model' ? [self.workdir, chatId, argument]
-      : kind === 'fresh' ? [String(pid), self.workdir]
+      : kind === 'fresh' ? [String(pid), self.workdir, 'fresh-reset']
       : kind === 'compact' ? [String(pid), self.workdir, ...(argument ? [argument] : [])]
       : needsPid ? [String(pid), self.workdir, chatId]
       : [self.workdir, chatId]
