@@ -1,6 +1,6 @@
 #!/bin/bash
 # fleet-start <key> [uuid|continue|fresh-keep|fresh-reset]
-# Open one bot in a new Terminal window through fleet-fresh's restart lock.
+# Open one bot in a new Terminal window and offer attended local pairing.
 # Exit codes: 0 started or dry run, 1 missing bot or token, 2 invalid arguments,
 # 7 bot already running or restart in flight, 8 process state could not be checked.
 # CC_START_DRYRUN=1 validates and prints the action without opening Terminal.
@@ -39,6 +39,83 @@ if [[ "$RESUME" == continue ]]; then
   fi
 fi
 
+# Stock Telegram writes a fresh six-character code into this bot's access.json.
+# Read only codes created after this start, so an old pending request cannot
+# acquire a new dialog. The code is shown only in the local Mac dialog.
+pairing_candidate() {
+  /usr/bin/python3 - "$STATE/access.json" "$1" <<'PY'
+import json, re, sys, time
+try:
+    access = json.load(open(sys.argv[1], encoding="utf-8"))
+    if access.get("dmPolicy") != "pairing":
+        raise ValueError("pairing is closed")
+    now = int(time.time() * 1000)
+    choices = []
+    for code, item in access.get("pending", {}).items():
+        if (re.fullmatch(r"[a-f0-9]{6}", code) and isinstance(item, dict)
+                and int(item.get("createdAt", 0)) >= int(sys.argv[2])
+                and int(item.get("expiresAt", 0)) > now):
+            choices.append((int(item["createdAt"]), code))
+    if choices:
+        print(min(choices)[1])
+except (OSError, ValueError, TypeError, KeyError):
+    pass
+PY
+}
+
+watch_for_pairing() {
+  local started_ms="$1" code choice waited=0 limit=180
+  [[ -f "$STATE/.enrolled" ]] && return 0
+  if [[ "${TELEBOTS_TEST:-0}" == 1 && "${CC_START_PAIR_WAIT:-}" =~ ^[0-9]{1,3}$ ]]; then
+    limit="$CC_START_PAIR_WAIT"
+  fi
+  echo "fleet-start: waiting up to ${limit}s for a new pairing code for $KEY. Send the bot a DM from your phone."
+  while (( waited <= limit )); do
+    code="$(pairing_candidate "$started_ms")"
+    if [[ -n "$code" ]]; then
+      if ! choice="$(osascript -e 'on run argv' \
+        -e 'set messageText to "A Telegram user sent pairing code " & (item 1 of argv) & " to " & (item 2 of argv) & ". Pair and lock the allowlist to them?"' \
+        -e 'return button returned of (display dialog messageText buttons {"Ignore", "Pair"} default button "Pair" with icon caution)' \
+        -e 'end run' -- "$code" "$KEY" 2>/dev/null)"; then
+        echo "fleet-start: local pairing dialog was unavailable. Use fleet-pair locally while the code is valid." >&2
+        return 1
+      fi
+      if [[ "$choice" == Pair ]]; then
+        "$PAIR" "$KEY" "$code" --lock || {
+          echo "fleet-start: pairing failed. Use fleet-pair locally while the code is valid." >&2
+          return 1
+        }
+      elif [[ "$choice" == Ignore ]]; then
+        echo "fleet-start: pairing ignored. The pending request was not approved."
+      else
+        echo "fleet-start: local pairing dialog returned no decision. Use fleet-pair locally while the code is valid." >&2
+        return 1
+      fi
+      return 0
+    fi
+    (( waited == limit )) && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  echo "fleet-start: no new pairing code appeared. Use fleet-pair locally if needed."
+}
+
+PAIR="$FLEET_HOME/bin/fleet-pair"
+[[ -x "$PAIR" ]] || PAIR="$SELF_DIR/fleet-pair"
+started_ms="$(/usr/bin/python3 -c 'import time; print(int(time.time() * 1000))')"
+
+# This branch exercises the real watcher and pairer without starting a bot.
+# It is available only with a fake home inside the marked test sandbox.
+if [[ "${CC_START_PAIR_ONLY:-0}" == 1 ]]; then
+  sandbox="${TELEBOTS_SANDBOX_ROOT:-}"
+  if [[ "${TELEBOTS_TEST:-0}" != 1 || -z "$sandbox" || "$FLEET_HOME" != "$sandbox"/* || "$STATE" != "$sandbox"/* ]]; then
+    echo 'fleet-start: pairing test requires an isolated sandbox' >&2
+    exit 2
+  fi
+  watch_for_pairing "$started_ms"
+  exit $?
+fi
+
 # A live named Claude session for this exact workdir is a double launch. The
 # fresh engine repeats discovery while holding the per-bot restart lock.
 processes="$(ps -axo pid=,command= 2>/dev/null)" || { echo 'fleet-start: process list unavailable' >&2; exit 8; }
@@ -58,4 +135,5 @@ if [[ "${CC_START_DRYRUN:-0}" == 1 ]]; then
   exit $?
 fi
 
-"$FRESH" 999999 "$WORKDIR" "$RESUME"
+"$FRESH" 999999 "$WORKDIR" "$RESUME" || exit $?
+watch_for_pairing "$started_ms"
