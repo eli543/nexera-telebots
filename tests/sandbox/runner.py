@@ -281,46 +281,79 @@ def scenario_stub(root: Path, number: int, title: str, required: tuple[str, ...]
     return "missing " + ", ".join(missing) if missing else "integration assertions pending"
 
 
+def runtime_path(path: Path) -> bool:
+    """Skip state written by active channels and plugin/runtime workers."""
+    name = path.name
+    return (any(part in {"channels", "sessions", "projects", "logs", "__pycache__"}
+                for part in path.parts)
+            or name == "menubar-windows.json"
+            or name.endswith((".log", ".pyc", ".in_use", ".synced"))
+            or name.startswith((".in_use", ".synced")))
+
+
+def file_sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "absent"
+
+
+def record_tree(found: dict[str, object], root: Path, *, hashes: bool,
+                ignore_runtime: bool) -> None:
+    """Hash hook contents or list file names, sizes and mtimes without directory mtimes."""
+    found[str(root)] = "directory" if root.is_dir() else "absent"
+    if not root.is_dir():
+        return
+    for dirname, dirs, files in os.walk(root):
+        current = Path(dirname)
+        keep_dirs = []
+        for name in dirs:
+            path = current / name
+            if ignore_runtime and runtime_path(path.relative_to(root)):
+                continue
+            if path.is_symlink():
+                found[str(path)] = ("link", os.readlink(path))
+            else:
+                found[str(path)] = "directory"
+                keep_dirs.append(name)
+        dirs[:] = keep_dirs
+        for name in files:
+            path = current / name
+            if ignore_runtime and runtime_path(path.relative_to(root)):
+                continue
+            if hashes:
+                digest = file_sha(path)
+                found[str(path)] = ("link", os.readlink(path), digest) if path.is_symlink() else digest
+            else:
+                metadata = path.lstat()
+                kind = "link" if path.is_symlink() else "file"
+                found[str(path)] = (kind, metadata.st_size, metadata.st_mtime_ns)
+
+
+def changed_items(before: dict[str, object], after: dict[str, object]) -> list[str]:
+    """Return the exact protected paths or checks whose snapshots differ."""
+    return sorted(key for key in before.keys() | after.keys() if before.get(key) != after.get(key))
+
+
 def snapshot(real_home: Path | None, main: Path | None) -> dict[str, object]:
-    """Record static infrastructure and root listings, excluding live logs."""
+    """Record only protected infrastructure and the named live daemon PIDs."""
     found: dict[str, object] = {}
     if real_home:
-        roots = [
-            (real_home / ".claude", 1),
-            (real_home / ".claude/hooks", 2),
-            (real_home / ".claude/plugins/cache/claude-plugins-official", 5),
-            (real_home / "Library/LaunchAgents", 2),
-            (real_home / ".local/bin", 2),
-        ]
-        for path, depth in roots:
-            if not path.exists():
-                found[str(path)] = "absent"
-                continue
-            items: dict[str, str] = {}
-            for dirname, dirs, files in os.walk(path):
-                current = Path(dirname)
-                level = len(current.relative_to(path).parts)
-                for name in dirs:
-                    sub = current / name
-                    if len(sub.relative_to(path).parts) <= depth:
-                        items[str(sub.relative_to(path)) + "/"] = "directory"
-                if level >= depth:
-                    dirs[:] = []
-                for name in files:
-                    sub = current / name
-                    if len(sub.relative_to(path).parts) > depth:
-                        continue
-                    if sub.is_symlink():
-                        items[str(sub.relative_to(path))] = "link:" + os.readlink(sub)
-                    elif sub.is_file():
-                        items[str(sub.relative_to(path))] = hashlib.sha256(sub.read_bytes()).hexdigest()
-            found[str(path)] = items
+        cache = real_home / ".claude/plugins/cache/claude-plugins-official/telegram"
+        for server in cache.glob("*/server.ts"):
+            found[str(server)] = file_sha(server)
+        marketplace = real_home / ".claude/plugins/marketplaces/claude-plugins-official/external_plugins/telegram/server.ts"
+        found[str(marketplace)] = file_sha(marketplace)
+        record_tree(found, real_home / "Library/LaunchAgents", hashes=False, ignore_runtime=False)
+        record_tree(found, real_home / ".claude/telegram-fleet", hashes=False, ignore_runtime=True)
+        record_tree(found, real_home / ".claude/hooks", hashes=True, ignore_runtime=True)
+        settings = real_home / ".claude/settings.json"
+        found[str(settings)] = file_sha(settings)
     if main:
-        for verb in (["rev-parse", "HEAD"], ["status", "--short"], ["branch", "--show-current"]):
+        for label, verb in (("HEAD", ["rev-parse", "HEAD"]),
+                            ("status --porcelain", ["status", "--porcelain"])):
             r = subprocess.run(["/usr/bin/git", "-C", str(main), *verb], text=True,
                                capture_output=True, check=False,
-                               env={"HOME": str(real_home or Path.home()), "PATH": "/usr/bin:/bin"})
-            found["git:" + " ".join(verb)] = (r.returncode, r.stdout)
+                               env={"HOME": str(real_home or Path.home()), "PATH": "/usr/bin:/bin",
+                                    "GIT_OPTIONAL_LOCKS": "0"})
+            found[f"git:{main}:{label}"] = (r.returncode, r.stdout, r.stderr)
     try:
         process_list = subprocess.run(["/bin/ps", "-axo", "pid=,command="], text=True,
                                       capture_output=True, check=False,
@@ -417,18 +450,18 @@ def main() -> int:
             print(f"  {number:02d} {status} {title}: {detail}", flush=True)
         (pass_dir / "results.json").write_text(json.dumps(results, indent=2) + "\n")
     after = snapshot(args.real_home, args.main_checkout)
-    files_untouched = before == after
-    pid_verified = before.get("live-daemon-pids") != "unavailable"
+    changes = changed_items(before, after)
+    files_untouched = not changes
+    pid_verified = (before.get("live-daemon-pids") != "unavailable"
+                    and after.get("live-daemon-pids") != "unavailable")
     state = "PASS" if files_untouched and pid_verified else "PARTIAL" if files_untouched else "FAIL"
     print(f"UNTOUCHED {state}", flush=True)
     if not pid_verified:
         print("  live daemon PID check unavailable in this execution sandbox", flush=True)
-    if not files_untouched:
-        for key in before.keys() | after.keys():
-            if before.get(key) != after.get(key):
-                print(f"  changed: {key}", flush=True)
-                if key == "live-daemon-pids":
-                    print(f"  daemon PIDs before={before.get(key)} after={after.get(key)}", flush=True)
+    for key in changes:
+        print(f"  changed: {key}", flush=True)
+        if key == "live-daemon-pids":
+            print(f"  daemon PIDs before={before.get(key)} after={after.get(key)}", flush=True)
     print("TOTAL " + " ".join(f"{k}={v}" for k, v in total.items()), flush=True)
     return 0 if files_untouched and not total["FAIL"] and (args.phase1 or (not total["STUB"] and pid_verified)) else 1
 
