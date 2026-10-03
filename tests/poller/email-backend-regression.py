@@ -3,8 +3,12 @@
 
 import importlib.machinery
 import importlib.util
+import contextlib
+import io
+import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -51,6 +55,7 @@ class EmailBackendRegression(unittest.TestCase):
         self.home = Path(self.temp.name)
         self.addCleanup(patch.stopall)
         patch.object(email_backend, "FLEET_HOME", self.home).start()
+        patch.object(email_backend, "CONFIG", self.home / "email.json").start()
         patch.object(email_backend, "password", return_value="fixture-only").start()
         self.config = {"username": "me@example.test", "archive_mailbox": "Archive"}
 
@@ -115,6 +120,28 @@ class EmailBackendRegression(unittest.TestCase):
         with patch.dict(os.environ, {"TELEGRAM_STATE_DIR": str(state)}):
             with self.assertRaises(ValueError):
                 email_backend.checked_send(request)
+
+    def test_custom_adapter_receives_each_non_send_operation_payload(self):
+        adapter = self.home / "fake-adapter"
+        adapter.write_text("#!/bin/sh\nexit 0\n")
+        adapter.chmod(0o700)
+        email_backend.atomic_json(self.home / "email.json", {"enabled": True, "backend": str(adapter)})
+        operations = (
+            ("test", {}, {}),
+            ("inbox", {"limit": 4}, {"limit": 4}),
+            ("read", {"id": "17"}, {"id": "17"}),
+            ("archive", {"id": "18"}, {"id": "18"}),
+            ("snooze", {"id": "19", "hours": 24}, {"id": "19", "hours": 24}),
+        )
+        for operation, request, expected in operations:
+            with self.subTest(operation=operation):
+                child = subprocess.CompletedProcess([str(adapter), operation], 0, '{"status":"ok"}', "")
+                with (patch.object(email_backend.subprocess, "run", return_value=child) as run,
+                      patch.object(email_backend.sys, "stdin", io.StringIO(json.dumps(request))),
+                      contextlib.redirect_stdout(io.StringIO())):
+                    self.assertEqual(email_backend.main(["fleet-email", operation]), 0)
+                self.assertEqual(run.call_args.args[0], [str(adapter), operation])
+                self.assertEqual(json.loads(run.call_args.kwargs["input"]), expected)
 
 
 if __name__ == "__main__":

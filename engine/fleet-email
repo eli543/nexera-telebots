@@ -400,6 +400,29 @@ def setup():
     return {"status": "configured", "address": value["from"], "sent": False}
 
 
+def adapter_payload(op, req):
+    if op == "send":
+        return {key: req[key] for key in ("bot", "consent_id", "email")}
+    if op == "test":
+        return {}
+    if op == "inbox":
+        limit = req.get("limit", 5)
+        if type(limit) is not int or not 1 <= limit <= 20:
+            fail("Inbox limit must be 1 to 20.")
+        return {"limit": limit}
+    uid = str(req.get("id", ""))
+    if not uid.isdigit():
+        fail("Invalid inbox ID.")
+    if op in ("read", "archive"):
+        return {"id": uid}
+    if op == "snooze":
+        hours = req.get("hours")
+        if type(hours) not in (int, float) or not 0 < hours <= 720:
+            fail("Snooze needs a message ID and 1 to 720 hours.")
+        return {"id": uid, "hours": hours}
+    fail("Unsupported email action.")
+
+
 def main(argv):
     if len(argv) == 2 and argv[1] in ("--help", "-h"):
         print("fleet-email setup|test|inbox|read|archive|snooze|send")
@@ -433,7 +456,7 @@ def main(argv):
                              ("HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "FLEET_HOME",
                               "TELEGRAM_STATE_DIR", "TELEBOTS_TEST", "TELEBOTS_SANDBOX_ROOT")
                              if key in os.environ}
-                child_req = {key: req[key] for key in ("bot", "consent_id", "email")}
+                child_req = adapter_payload(op, req)
                 result = subprocess.run([backend, op], input=json.dumps(child_req), text=True,
                                         capture_output=True, check=False, timeout=30,
                                         env=child_env)
