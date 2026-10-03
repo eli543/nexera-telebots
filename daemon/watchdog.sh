@@ -45,6 +45,8 @@ COOLDOWN=180
 MAX_RESTARTS_PER_HOUR=4
 HEARTBEAT_MAX_AGE=180
 STALL_MIN=600
+STALL_PHONE_ALERTS="$(fc option stall_phone_alerts 2>/dev/null || true)"
+[ "$STALL_PHONE_ALERTS" = true ] || STALL_PHONE_ALERTS=false
 
 STATE="$FLEET_HOME/watchdog-state"
 LOG_DIR="$FLEET_HOME/logs"
@@ -173,7 +175,10 @@ check_stall() {
   flag="$STATE/$key.stall_alerted"
   if [ "$li_ts" -gt "$tm" ] && [ $(( now - li_ts )) -ge "$STALL_MIN" ]; then
     if [ ! -f "$flag" ] || [ "$(cat "$flag" 2>/dev/null)" != "$li_ts" ]; then
-      log "$key: STALL suspected - inbound $(( now - li_ts ))s ago, no transcript activity since. ALERT-ONLY, no restart. (ping off by default)"
+      log "$key: STALL suspected - inbound $(( now - li_ts ))s ago, no transcript activity since. ALERT-ONLY, no restart. (phone alerts=$STALL_PHONE_ALERTS)"
+      if [ "$STALL_PHONE_ALERTS" = true ]; then
+        alert "I received a message but have shown no transcript activity for 10 minutes. I may be stalled. Please check this bot on the Mac." "$(token_of_state "$sdir")" "$(chat_id_of_state "$sdir")"
+      fi
       [ $DRY_RUN -eq 0 ] && printf '%s\n' "$li_ts" > "$flag"
     fi
   else

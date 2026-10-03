@@ -263,6 +263,24 @@ describe('commands and pickers', () => {
 })
 
 describe('handoff and resume', () => {
+  test('source and receiving pollers record one linked handoff note without logging its body', async () => {
+    const f = fixture()
+    const id = 'a'.repeat(24)
+    mkdirSync(join(f.fleet, 'handoffs'))
+    writeFileSync(join(f.fleet, 'handoffs', `${id}.md`),
+      `HANDOFF from Main to Second - Friday, October 2, 2026\nTITLE: Offline fixture\nRECOMMENDED EFFORT: low\nNOTE-ID: ${id}\nSOURCE-KEY: main\nTARGET-KEY: second\nPrivate note body stays out of events.\n`, { mode: 0o600 })
+    expect((await f.tb.callTool('handoff_receipt', { note_id: id, phase: 'received' }))?.isError).toBe(true)
+    expect((await f.tb.callTool('handoff_receipt', { note_id: id, phase: 'sent' }))?.isError).not.toBe(true)
+    const second = init({ bot: f.bot, stateDir: f.fleetBots[1]!.state_dir, token: 'offline-test-token', fleetHome: f.fleet,
+      mcp: { notification: async () => {} }, loadAccess: () => ({}), assertAllowedChat: () => {} }) as TelebotsModule
+    try {
+      expect((await second.callTool('handoff_receipt', { note_id: id, phase: 'received' }))?.isError).not.toBe(true)
+      const received = readFileSync(join(f.fleetBots[1]!.state_dir, 'logs', 'poller-events.log'), 'utf8')
+      expect(received).toContain(`HANDOFF-RECEIVED id=${id} source=main target=second`)
+      expect(received).not.toContain('Private note body')
+      expect(f.events().some(event => event.includes(`HANDOFF-SENT id=${id} source=main target=second`))).toBe(true)
+    } finally { second.dispose() }
+  })
   test('handoff dynamically reads the fleet, displays status and excludes self twice', async () => {
     const f = fixture()
     writeFileSync(join(f.fleet, 'fleet.json'), JSON.stringify({ bots: [...f.fleetBots, { key: 'clone', name: 'Clone', state_dir: join(f.root, 'clone'), workdir: f.workdir }, { key: 'new', name: 'New bot', state_dir: join(f.root, 'new'), workdir: join(f.root, 'new-work') }] }))
@@ -322,7 +340,7 @@ describe('email module routing', () => {
   test('mail confirmation injects consent through the ordered channel, once', async () => {
     const f = fixture()
     writeFileSync(join(f.fleet, 'email.json'), JSON.stringify({ enabled: true, backend: 'builtin' }))
-    expect(f.tb.tools.map(tool => tool.name)).toEqual(['email_preview', 'email_send'])
+    expect(f.tb.tools.map(tool => tool.name)).toEqual(['email_preview', 'email_send', 'handoff_receipt'])
     for (const tool of f.tb.tools) expect(tool.description!.length).toBeLessThanOrEqual(2000)
     expect(await f.tb.callTool('unrelated_tool', {})).toBeNull()
     const result = await f.tb.callTool('email_preview', { chat_id: '101', email })

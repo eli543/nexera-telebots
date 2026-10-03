@@ -24,7 +24,7 @@ Prepared Friday, October 2, 2026. The release date will be set after integration
 - An upstream plugin hash watch and an offline sandbox runner in CI.
 - Telebots Bar as an optional Mac menu bar layer, with a phone page over Tailscale.
 - One attended Pair/Ignore dialog on the Mac after a new bot receives a pairing code. `fleet-pair --lock` remains the manual fallback.
-- Setup rows for a history-preserving model switch, reopening a chat, blank `/fresh`, completed handoff, full inbox reply, quiet recovery, reboot restore and phone rescue. Rows without a linked receipt or real-device check say so.
+- Setup rows for a history-preserving model switch, reopening a chat, blank `/fresh`, completed handoff, full inbox reply, quiet recovery, reboot restore and phone rescue. Handoff and inbox rows now consume linked receipts; real-device rows still say when phone proof is needed.
 
 ### Changed
 
@@ -33,7 +33,7 @@ Prepared Friday, October 2, 2026. The release date will be set after integration
 - The phone setup now uses a hidden token prompt, a new Terminal window, bot-specific local pairing, macOS consent while the person is at the Mac and a setup checklist.
 - `/fresh` starts blank; `/update` reloads the installed build without downloading, preserves the conversation when available and sends "⚡ Back and ready" after a successful restart.
 - `/opus` and `/fable` keep the current or default effort unless the person explicitly selects another effort.
-- The docs state that the Mac must stay awake, logged in and online; automatic recovery resumes a chat active within 30 minutes and otherwise starts blank. Restart is quiet. Stall detection logs locally, with phone alerts off by default.
+- The docs state that the Mac must stay awake, logged in and online; automatic recovery resumes a chat active within 30 minutes and otherwise starts blank. Restart is quiet. Stall detection logs locally; `options.stall_phone_alerts=true` enables one phone alert per suspected stall and is off by default.
 - The project is scoped to macOS 14 or newer. Bot names and count come from config; the docs state BotFather's pacing and account limits.
 - `scoped` is documented as Claude Code's `--permission-mode auto`.
 
@@ -43,10 +43,10 @@ Prepared Friday, October 2, 2026. The release date will be set after integration
 - Slash commands use installed engine paths rather than the location of the clone. Hooks are inert outside bot sessions.
 - Doctor and troubleshooting guidance cover overlay status, token duplication, exact logs and Claude Code version gates.
 - The installer carries the overlay verifier and patch files into the installed fleet. Doctor accepts the empty bot list that installation creates.
-- Rich message HTTP 404 falls back to plain text. Email sends require the exact, fresh consent record and full SMTP acceptance.
+- Rich message HTTP 404 falls back to plain text. Email sends require the active poller's one-time nonce for the exact digest and full SMTP acceptance; disk consent receipts are audit only.
 - Checklist Escape, compact, resume-label and watchdog rows read the producer's actual log path and success wording. The ops tests run real engines inside blocked-command sandboxes instead of manufacturing success strings.
 - The sandbox's untouched check pins known launchd labels, so a short-lived child PID cannot look like a changed daemon. Its summary names the shared roots and suite reuse behind the 42 grouped scenario results.
-- The integrated v0.3.0 fixes keep bot tokens out of local API process arguments, ignore button input in the `/fresh` and `/model` hooks, and keep email consent authority in the active server process. In the full permission stance, shell access can still reach mail credentials directly.
+- The integrated v0.3.0 fixes keep bot tokens out of local API process arguments, ignore button input in the `/fresh` and `/model` hooks, and keep email consent authority in the active poller process. Full inbox reads return bounded bodies and reply headers. In the full permission stance, shell access can still reach mail credentials directly.
 
 ### Removed
 

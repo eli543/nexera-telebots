@@ -327,6 +327,19 @@ describe('email service confirmation', () => {
     expect(JSON.stringify(h.events)).not.toContain(fixture.body)
   })
 
+  test('an inbox reply links a bounded full read to the confirmed send', async () => {
+    const h = harness(), read = 'b'.repeat(24)
+    expect((await h.service.callTool('email_preview', { chat_id: '1', email: fixture, read_receipt: read }))?.isError).toBeTrue()
+    mkdirSync(join(state, 'mail-reads'))
+    writeFileSync(join(state, 'mail-reads', `${read}.json`), JSON.stringify({ id: '7', at: Date.now() / 1000, full: true }), { mode: 0o600 })
+    expect((await h.service.callTool('email_preview', { chat_id: '1', email: fixture, read_receipt: read }))?.isError).not.toBeTrue()
+    const message = h.messages.get(h.messages.size)!
+    const id = message.reply_markup.inline_keyboard[0][0].callback_data.split(':')[1] as string
+    await h.tap(message, 0); await h.tap(message, 1)
+    expect((await h.service.callTool('email_send', { chat_id: '1', consent_id: id, email: fixture }))?.isError).not.toBeTrue()
+    expect(h.events.some(event => event.event === 'EMAIL-REPLY' && event.fields.id === id && event.fields.read === read && event.fields.status === 'sent')).toBe(true)
+  })
+
   test('Cancel consumes the keyboard without an injected message or backend call', async () => {
     const h = harness(), { message, id } = await h.preview()
     await h.tap(message, 0)

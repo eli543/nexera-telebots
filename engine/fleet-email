@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import socket
 import smtplib
 import ssl
@@ -239,6 +240,19 @@ def state_for(bot):
     fail("Bot state directory is unavailable.")
 
 
+def current_bot_state():
+    """Link an inbox read to this bot, without making the receipt send authority."""
+    selected = os.environ.get("TELEGRAM_STATE_DIR")
+    if not selected:
+        return None
+    fleet = load_json(FLEET_HOME / "fleet.json", {})
+    for item in fleet.get("bots", []) if isinstance(fleet, dict) else []:
+        if isinstance(item, dict) and isinstance(item.get("state_dir"), str):
+            if Path(item["state_dir"]).expanduser().resolve() == Path(selected).expanduser().resolve():
+                return state_for(item.get("key"))
+    return None
+
+
 def checked_send(req):
     consent_id, bot = req.get("consent_id"), req.get("bot")
     if not isinstance(consent_id, str) or not CONSENT_RE.fullmatch(consent_id):
@@ -337,7 +351,18 @@ def builtin(op, req, c):
             eligible = [uid for uid in ids if snoozed.get(uid, 0) <= time.time()][:limit]
             return [message_data(client, uid) for uid in eligible]
         if op == "read":
-            return message_data(client, req.get("id"), full=True)
+            message = message_data(client, req.get("id"), full=True)
+            state = current_bot_state()
+            if state:
+                receipt = secrets.token_hex(12)
+                atomic_json(state / "mail-reads" / (receipt + ".json"), {
+                    "id": message["id"], "at": time.time(), "full": True,
+                    "message_id_sha256": hashlib.sha256(message["message_id"].encode()).hexdigest(),
+                    "from": message["from"], "reply_to": message["reply_to"],
+                    "to": message["to"], "cc": message["cc"],
+                })
+                message["read_receipt"] = receipt
+            return message
         if op == "archive":
             uid = str(req.get("id", ""))
             if not uid.isdigit():

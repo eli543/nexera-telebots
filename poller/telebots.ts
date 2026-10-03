@@ -2,12 +2,13 @@
 // register handlers, spawn a process, or write files. The seam calls init first.
 import { Composer, GrammyError, InlineKeyboard, type Context } from 'grammy'
 import type { InlineKeyboardMarkup, ReactionType, ReactionTypeEmoji, UserFromGetMe } from 'grammy/types'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { execFile, execFileSync, spawn } from 'node:child_process'
 import { basename, isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { randomBytes } from 'node:crypto'
 import { EmailService } from './email.ts'
+import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js'
 import type { AttachmentMeta, EventFields, ExecOptions, ForwardParams, ReplyMarkup, Telebots, TelebotsDependencies } from './contracts.ts'
 
 export type UX = {
@@ -32,11 +33,11 @@ export const DEFAULT_UX: UX = {
   commands: [
     { command: 'esc', description: 'Interrupt the current task - read my newest message now' },
     { command: 'fresh', description: 'Restart this bot blank (fresh context, default model)' },
-    { command: 'update', description: 'Reload this chat in place: same conversation, newest Claude Code + skills' },
+    { command: 'update', description: 'Reload the installed build (saved chat kept; no download)' },
     { command: 'key', description: 'The key: what every reaction, bubble and command does' },
     { command: 'inbox', description: 'Your top threads as cards: Reply / Archive / Snooze by tap' },
-    { command: 'opus', description: 'Switch this chat to Opus at max effort (conversation kept)' },
-    { command: 'fable', description: 'Switch this chat to Fable at max effort (conversation kept)' },
+    { command: 'opus', description: 'Switch to Opus, keeping saved chat and current or default effort' },
+    { command: 'fable', description: 'Switch to Fable, keeping saved chat and current or default effort' },
     { command: 'model', description: 'Show or switch model + effort (e.g. /model fable high)' },
     { command: 'effort', description: 'Pick effort for this chat: low / medium / high / xhigh / max (conversation kept)' },
     { command: 'context', description: 'Show context usage - how full this chat is' },
@@ -64,6 +65,14 @@ const MODEL_RE = /^md:(opus|fable|sonnet|haiku)$/
 const MODEL_EFFORT_RE = /^me:(opus|fable|sonnet|haiku):(low|medium|high|xhigh|max)$/
 const QUICK_RE = /^qr:(\d{1,2}):(\d{1,2})$/
 const HANDOFF_RE = /^ho:(?:bot:)?([a-z0-9][a-z0-9-]{0,30})$/
+const NOTE_ID_RE = /^[a-f0-9]{24}$/
+const HANDOFF_RECEIPT_TOOL: Tool = {
+  name: 'handoff_receipt',
+  description: 'Record a handoff note after SendMessage reports delivery or after this named bot receives the complete cross-session HANDOFF note. Use the note ID from the note, and call received only in the destination session. This is local checklist evidence, not a replacement for phone acknowledgement.',
+  inputSchema: { type: 'object', additionalProperties: false, properties: {
+    note_id: { type: 'string' }, phase: { type: 'string', enum: ['sent', 'received'] },
+  }, required: ['note_id', 'phase'] },
+}
 const isEffort = (value: string): value is Effort => (EFFORTS as readonly string[]).includes(value)
 const readText = (path: string): string => { try { return readFileSync(path, 'utf8') } catch { return '' } }
 const safeMeta = (s: string): string => s.replace(/[<>\[\]\r\n;]/g, '_')
@@ -212,8 +221,28 @@ export class TelebotsModule implements Telebots {
     })
   }
 
-  get tools() { return this.email.tools }
-  callTool(name: string, args: Record<string, unknown>) { return this.email.callTool(name, args) }
+  get tools() { return [...this.email.tools, HANDOFF_RECEIPT_TOOL] }
+  async callTool(name: string, args: Record<string, unknown>): Promise<CallToolResult | null> {
+    if (name !== 'handoff_receipt') return this.email.callTool(name, args)
+    try {
+      const id = args.note_id, phase = args.phase
+      if (typeof id !== 'string' || !NOTE_ID_RE.test(id) || (phase !== 'sent' && phase !== 'received')) throw Error('Invalid handoff receipt.')
+      const self = this.self()?.key
+      if (!self) throw Error('This bot is not configured.')
+      const path = join(this.fleetHome, 'handoffs', `${id}.md`)
+      const info = lstatSync(path)
+      if (!info.isFile() || (info.mode & 0o777) !== 0o600 || info.size > 64_000) throw Error('Invalid handoff note.')
+      const note = readFileSync(path, 'utf8')
+      const source = /^SOURCE-KEY: ([a-z0-9][a-z0-9-]{0,30})$/m.exec(note)?.[1]
+      const target = /^TARGET-KEY: ([a-z0-9][a-z0-9-]{0,30})$/m.exec(note)?.[1]
+      if (!note.startsWith('HANDOFF from ') || !note.includes(`\nNOTE-ID: ${id}\n`) || !source || !target || source === target ||
+          (phase === 'sent' ? source !== self : target !== self)) throw Error('Invalid handoff note.')
+      this.logEvent(phase === 'sent' ? 'HANDOFF-SENT' : 'HANDOFF-RECEIVED', { id, source, target })
+      return { content: [{ type: 'text', text: `Handoff ${phase} receipt recorded for note ${id}.` }] }
+    } catch {
+      return { isError: true, content: [{ type: 'text', text: 'Handoff receipt refused. Check the local note ID and destination.' }] }
+    }
+  }
   beforeEdit(chatId: string, messageId: string | number): void {
     this.keyboards.set(`${chatId}:${messageId}`, null)
     this.email.beforeEdit(chatId, messageId)
@@ -226,7 +255,7 @@ export class TelebotsModule implements Telebots {
 
   logEvent(event: string, fields: EventFields = {}): void {
     // Allow only evidence fields, never message text, arbitrary errors, paths or tokens.
-    const keys = new Set(['n', 'kind', 'cmd', 'family', 'cell', 'emoji', 'id', 'status', 'offered', 'engine', 'ok', 'count', 'labels'])
+    const keys = new Set(['n', 'kind', 'cmd', 'family', 'cell', 'emoji', 'id', 'read', 'source', 'target', 'status', 'offered', 'engine', 'ok', 'count', 'labels'])
     const values = Object.entries(fields).filter(([key]) => keys.has(key)).map(([key, value]) => `${key}=${String(value).replace(/[\s\x00-\x1f]/g, '_').slice(0, 200)}`)
     try {
       mkdirSync(join(this.deps.stateDir, 'logs'), { recursive: true, mode: 0o700 })

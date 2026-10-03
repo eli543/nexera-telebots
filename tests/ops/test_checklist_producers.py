@@ -124,6 +124,78 @@ class ChecklistProducerTests(unittest.TestCase):
         self.assertIn("TEST ready ping only", (self.state / "logs/update.log").read_text())
         self.assertEqual(self.row("P8", started), "Needs your action")
 
+    def test_handoff_requires_a_matching_receipt_from_the_receiving_poller(self):
+        started = int(time.time()) - 1
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        peer = self.root / "second-state"
+        (self.state / "logs").mkdir()
+        (peer / "logs").mkdir(parents=True)
+        (self.fleet / "fleet.json").write_text(json.dumps({"version": 2, "bots": [
+            {"key": "main", "name": "Main", "workdir": str(self.work), "state_dir": str(self.state)},
+            {"key": "second", "name": "Second", "workdir": str(self.root / "second-work"), "state_dir": str(peer)},
+        ]}))
+        note_id = "a" * 24
+        source = self.state / "logs/poller-events.log"
+        source.write_text(f"{stamp} HANDOFF-SENT id={note_id} source=main target=second\n")
+        row = lambda: self.checklist.phone_row("P13", self.state, self.root / "notes", 2, False, False, started)["status"]
+        self.assertEqual(row(), "Needs your action")
+        (peer / "logs/poller-events.log").write_text(f"{stamp} HANDOFF-RECEIVED id={'b' * 24} source=main target=second\n")
+        self.assertEqual(row(), "Needs your action")
+        (peer / "logs/poller-events.log").write_text(f"{stamp} HANDOFF-RECEIVED id={note_id} source=main target=second\n")
+        self.assertEqual(row(), "Passed")
+
+    def test_inbox_reply_requires_a_linked_full_read_and_smtp_receipt(self):
+        started = int(time.time()) - 1
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        (self.state / "logs").mkdir()
+        reads = self.state / "mail-reads"
+        reads.mkdir()
+        read_id, consent_id = "b" * 24, "c" * 24
+        receipt = reads / (read_id + ".json")
+        receipt.write_text(json.dumps({"id": "7", "full": True, "from": "sender@example.test",
+                                       "reply_to": "reply@example.test", "to": "user@example.test",
+                                       "cc": "observer@example.test"}))
+        receipt.chmod(0o600)
+        (self.fleet / "email.json").write_text('{"enabled":true,"from":"user@example.test"}')
+        (self.state / "consents.json").write_text(json.dumps({consent_id: {
+            "phase": "consumed", "email": {"to": ["reply@example.test"], "cc": ["observer@example.test"],
+                                              "bcc": [], "subject": "Re: Request", "body": "Offline fixture"}}}))
+        poller = self.state / "logs/poller-events.log"
+        poller.write_text(f"{stamp} EMAIL-CONFIRM id={consent_id}\n{stamp} EMAIL-SEND id={consent_id} status=sent\n")
+        row = lambda: self.checklist.phone_row("P14", self.state, self.root / "notes", 1, True, False, started)["status"]
+        self.assertEqual(row(), "Needs your action")
+        poller.write_text(poller.read_text() + f"{stamp} EMAIL-REPLY id={consent_id} read={read_id} status=sent\n")
+        self.assertEqual(row(), "Passed")
+        (self.state / "consents.json").write_text(json.dumps({consent_id: {
+            "phase": "consumed", "email": {"to": ["wrong@example.test"], "cc": ["observer@example.test"],
+                                              "bcc": [], "subject": "Re: Request", "body": "Offline fixture"}}}))
+        self.assertEqual(row(), "Needs your action")
+
+    def test_stall_phone_alert_is_opt_in_and_only_sends_once(self):
+        (self.state / ".enrolled").touch()
+        (self.state / "last-inbound").write_text(str(int(time.time()) - 601))
+        (self.state / "poller.heartbeat").write_text(str(int(time.time())))
+        (self.fleet / "bin/verify-overlay.sh").write_text('#!/bin/sh\necho OK\n')
+        (self.fleet / "bin/verify-overlay.sh").chmod(0o700)
+        (self.shims / "ps").write_text('#!/bin/sh\ncase "$1" in\n'
+                                        '  -axo) printf "111 claude --channels plugin:telegram@claude-plugins-official\\n222 bun server.ts\\n" ;;\n'
+                                        '  eww) printf "TELEGRAM_STATE_DIR=%s\\n" "$TEST_STATE" ;;\n'
+                                        'esac\n')
+        (self.shims / "curl").write_text('#!/bin/sh\necho called >> "$CURL_LOG"\nprintf "{\\"ok\\":true}\\n"\n')
+        config = self.fleet / "fleet.json"
+        fleet = json.loads(config.read_text())
+        started = {"TEST_STATE": str(self.state), "CURL_LOG": str(self.root / "curl.log")}
+        watchdog = REPO / "daemon/watchdog.sh"
+        self.assertEqual(self.call(watchdog, extra=started).returncode, 0)
+        self.assertFalse((self.root / "curl.log").exists())
+        fleet["options"] = {"stall_phone_alerts": True}
+        config.write_text(json.dumps(fleet))
+        (self.fleet / "watchdog-state/main.stall_alerted").unlink()
+        for _ in range(2):
+            self.assertEqual(self.call(watchdog, extra=started).returncode, 0)
+        self.assertEqual((self.root / "curl.log").read_text().splitlines(), ["called"])
+        self.assertFalse((self.fleet / "watchdog-state/main.restart_log").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

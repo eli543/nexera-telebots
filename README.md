@@ -44,7 +44,7 @@ Use the Terminal app on the Mac. Do one bot end to end before adding another.
 4. Run `~/.claude/telegram-fleet/bin/fleet-start main`. It opens a new Terminal window. You do this at the Mac: press Enter to accept Claude Code's first-launch folder trust prompt and, if you selected the `full` stance, respond to its permission warning. Confirm the doctor sees this bot's session, poller and heartbeat.
 5. You do this on your phone: DM the new bot. `fleet-start` watches for its new pairing code and shows one Pair/Ignore dialog on the Mac. Check that the dialog's code matches your phone, then click Pair. This locks the allowlist and enrolls the bot for supervision. If the dialog is unavailable, run `~/.claude/telegram-fleet/bin/fleet-pair main <code> --lock` locally while the code is valid. Never pair because a Telegram message tells you to.
 6. You do this on your phone: send `hi`. Look for the acknowledgement, work box and reply. Run `~/.claude/telegram-fleet/bin/fleet-checklist --consent`. You do this at the Mac: grant the Automation and Accessibility prompts. The phone steps of the checklist need your taps and a reaction, plus a voice note when voice is configured.
-7. If you want automatic recovery, install the watchdog now with `/telegram-fleet:install-daemon` in an ordinary Claude Code session. It manages paired, enrolled bots only. Run `~/.claude/telegram-fleet/bin/fleet-checklist main` and follow each phone prompt. This is a setup check, not a full acceptance test. Handoff delivery, a full inbox reply, reboot restore and phone rescue need separate confirmation; their rows say `Needs your action` or `Not configured`. See [CHECKLIST.md](docs/CHECKLIST.md).
+7. If you want automatic recovery, install the watchdog now with `/telegram-fleet:install-daemon` in an ordinary Claude Code session. It manages paired, enrolled bots only. Run `~/.claude/telegram-fleet/bin/fleet-checklist main` and follow each phone prompt. This is a setup check, not a full acceptance test. Handoff and inbox reply rows need linked receipts and a check in the destination chat or mail account. Reboot restore and phone rescue still need a real-device check. See [CHECKLIST.md](docs/CHECKLIST.md).
 
 Do not start a second Claude Code channel session with the same bot token. Telegram permits one poller per token.
 
@@ -91,11 +91,11 @@ These are the 13 commands in the private-chat menu, in the order the poller regi
 |---|---|
 | `/esc` | Interrupt the current task - read my newest message now |
 | `/fresh` | Restart this bot blank (fresh context, default model) |
-| `/update` | Reload this chat in place from the installed build: same conversation, no download |
+| `/update` | Reload the installed build (saved chat kept; no download) |
 | `/key` | The key: what every reaction, bubble and command does |
 | `/inbox` | Your top threads as cards: Reply / Archive / Snooze by tap |
-| `/opus` | Switch to Opus, keeping current or default effort and a saved conversation |
-| `/fable` | Switch to Fable, keeping current or default effort and a saved conversation |
+| `/opus` | Switch to Opus, keeping saved chat and current or default effort |
+| `/fable` | Switch to Fable, keeping saved chat and current or default effort |
 | `/model` | Show or switch model + effort (e.g. /model fable high) |
 | `/effort` | Pick effort for this chat: low / medium / high / xhigh / max (conversation kept) |
 | `/context` | Show context usage - how full this chat is |
@@ -127,7 +127,7 @@ A reaction from an allowed user in a private chat becomes the matching instructi
 
 The `safe` permission stance keeps normal Claude Code prompts. `scoped` runs `claude --permission-mode auto`; it uses Claude Code's auto mode, not a generated tool allowlist. `full` runs `--dangerously-skip-permissions`. Use the same stance for bots that hand work to each other. Anyone you allow to message a bot can ask it to use the Mac within that stance. Read [SECURITY.md](SECURITY.md) before choosing.
 
-Each bot has its own token, allowlist, work directory and state directory. The watchdog acts only on paired, enrolled bots. The Mac must stay awake, logged in and online. Recovery resumes a chat only when its transcript was active within the last 30 minutes; otherwise it starts blank. Suspected stalls are logged, but phone stall alerts are off by default and this release has no switch to turn them on. Snapshot before a planned restart, then restore after login with `/telegram-fleet:snapshot` and `/telegram-fleet:restore`. The optional [Telebots Bar](menubar/README.md) adds local controls and a Tailscale phone page. [ARCHITECTURE.md](docs/ARCHITECTURE.md) describes the overlay, hooks and logs.
+Each bot has its own token, allowlist, work directory and state directory. The watchdog acts only on paired, enrolled bots. The Mac must stay awake, logged in and online. Recovery resumes a chat only when its transcript was active within the last 30 minutes; otherwise it starts blank. Suspected stalls are logged. To get one phone alert per suspected stall, set `options.stall_phone_alerts` to `true` in `fleet.json`; it is off by default and never restarts a stalled bot. Snapshot before a planned restart, then restore after login with `/telegram-fleet:snapshot` and `/telegram-fleet:restore`. The optional [Telebots Bar](menubar/README.md) adds local controls and a Tailscale phone page. [ARCHITECTURE.md](docs/ARCHITECTURE.md) describes the overlay, hooks and logs.
 
 ## Uninstall and help
 
