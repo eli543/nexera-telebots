@@ -45,7 +45,7 @@ Prepared Friday, October 2, 2026. The release date will be set after integration
 - The installer carries the overlay verifier and patch files into the installed fleet. Doctor accepts the empty bot list that installation creates.
 - Rich message HTTP 404 falls back to plain text. Email sends require the active poller's one-time nonce for the exact digest and full SMTP acceptance; disk consent receipts are audit only.
 - Checklist Escape, compact, resume-label and watchdog rows read the producer's actual log path and success wording. The ops tests run real engines inside blocked-command sandboxes instead of manufacturing success strings.
-- The sandbox's untouched check pins known launchd labels, so a short-lived child PID cannot look like a changed daemon. Its summary names the shared roots and suite reuse behind the 42 grouped scenario results.
+- The sandbox's untouched check matches protected process commands, so a short-lived child PID cannot look like a changed daemon. Its summary names the shared roots and suite reuse behind the 42 grouped scenario results.
 - Bot tokens stay out of local API process arguments. Full inbox reads return bounded bodies and reply headers.
 - OAuth credentials for usage checks now enter curl through stdin, not curl arguments. A source scan covers credential headers in engine, daemon and hook curl calls.
 - Tap labels reject newlines and other control characters. `/fresh` and `/model` parse structured hook input and reject synthetic button, reaction and email confirmation origins before reading the command body.
@@ -53,7 +53,7 @@ Prepared Friday, October 2, 2026. The release date will be set after integration
 - Email consent checks use a mode-0600 session authority file and an HMAC response. The normal poller workflow enforces two taps; shell permission in any stance can reach mail credentials or the authority file directly.
 - Handoff receipts use sender-issued one-use delivery IDs and are labeled agent-attested. Matching receipts are evidence of the agents' actions; the recipient still checks the destination chat.
 - Fleet notices use one shared sender that distinguishes Telegram acceptance from an attempted or failed send. The update checklist accepts only a confirmed Back and ready response. The watchdog keeps separate records for stall observed and phone notification accepted.
-- Uninstall stops the watchdog and waits for watchdog repair activity to end before restoring the stock plugin, then verifies the stock hash. A failed watchdog stop aborts teardown.
+- Uninstall stops the watchdog, waits for its PID file and watchdog repair lock to clear, then rechecks the plugin slot before deciding whether to restore it. It verifies the final stock hash whenever the pinned 0.0.7 slot is present and aborts if that check fails. A failed watchdog stop aborts teardown.
 - Setup and operations copy uses the Pair/Ignore dialog as the normal path, documents the manual pairing fallback and the fleet log locations. `/watch` ends when its session restarts, and `/update` describes the installed build.
 - These are offline checks. Release date and real-phone acceptance remain pending.
 
