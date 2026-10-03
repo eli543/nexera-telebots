@@ -454,7 +454,8 @@ def phone_row(code, state, notes, fleet_size, email_enabled, crash_test, started
             return result("Not configured", "phone rescue needs optional Telebots Bar and Tailscale")
         return result("Needs your action", "Phone rescue untested: with all bots down, reconnect through the Tailscale page and verify a bot reply")
     else: ok = False
-    detail = "recorded evidence found" if ok else "complete this phone step and rerun; phone delivery is not proven by an engine log alone"
+    detail = ("backend evidence recorded; confirm phone delivery directly" if ok
+              else "complete this phone step and rerun; phone delivery is not proven by an engine log alone")
     return result("Passed" if ok else "Needs your action", detail)
 
 
