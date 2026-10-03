@@ -105,7 +105,7 @@ except Exception:
       echo "NOT SENT (no bot token in $STATE_DIR/.env): $msg"
       return 1
     fi
-    resp=$(/usr/bin/curl -s -m 8 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+    resp=$(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$token" | /usr/bin/curl --config - -s -m 8 -X POST \
       --data-urlencode "chat_id=${CHAT_ID}" \
       --data-urlencode "text=${msg}" 2>/dev/null)
     echo "sent"

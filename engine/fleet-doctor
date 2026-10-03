@@ -74,7 +74,7 @@ api_base() {
 }
 getme_name() {
   local reply
-  reply=$(curl -sS --max-time 8 "$(api_base)/bot$1/getMe" 2>/dev/null) || return 1
+  reply=$(printf 'url = "%s/bot%s/getMe"\n' "$(api_base)" "$1" | curl --config - -sS --max-time 8 2>/dev/null) || return 1
   printf '%s' "$reply" | python3 -c 'import json,sys
 try:
  d=json.load(sys.stdin); r=d.get("result") or {}
@@ -277,7 +277,7 @@ else
     if [ $PING -eq 1 ]; then
       tok=$(token_of_state "$sdir"); cid=$(chat_id_of_state "$sdir")
       if [ -n "$tok" ] && [ -n "$cid" ]; then
-        if curl -s -m 8 -o /dev/null -X POST "https://api.telegram.org/bot${tok}/sendMessage" \
+        if printf 'url = "%s/bot%s/sendMessage"\n' "$(api_base)" "$tok" | curl --config - -s -m 8 -o /dev/null -X POST \
              --data-urlencode "chat_id=${cid}" --data-urlencode "text=fleet-doctor test ping"; then
           row ok "$key test ping" "sent to chat $cid"
         else

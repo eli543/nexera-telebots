@@ -287,7 +287,7 @@ PY
     echo "ERROR no bot token for $STATE_DIR"
     exit 4
   fi
-  curl -s -m 10 -o /dev/null -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TOKEN" | curl --config - -s -m 10 -o /dev/null -X POST \
     --data-urlencode "chat_id=${CHAT_ID}" \
     --data-urlencode "text=${MSG}" \
     && echo "sent" || echo "send FAILED"
