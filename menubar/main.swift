@@ -576,6 +576,7 @@ final class RefreshWorker: @unchecked Sendable {
         if let effort = ind.effort { parts.append(effort) }
         if let ctx = ind.contextPercent { parts.append("\(ctx)% ctx") }
         if ind.restartsLastHour > 0 { parts.append("\(ind.restartsLastHour) restart\(ind.restartsLastHour == 1 ? "" : "s")/h") }
+        if ind.stallSuspected && ind.stallPhoneNotified { parts.append("phone notified") }
         let detailLine = parts.isEmpty ? (h.state == .down ? "not running" : "no session details yet") : parts.joined(separator: " · ")
         var detailTip = h.state == .down
             ? "The model and effort this bot starts with (its saved model-state)"

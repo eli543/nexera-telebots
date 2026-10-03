@@ -24,7 +24,9 @@ Click it for a Liquid Glass panel (a material fallback before macOS 26):
   poller's own liveness ping, not the time of the last message), or `No poller` /
   `Down` in red, and a Reconnect button. A second line shows the model and version,
   effort and context used (`Fable 5.1 · max · 41% ctx`), plus restarts in the last
-  hour when there were any, `stall suspected` when the watchdog flagged one, and
+  hour when there were any, `stall suspected` when the watchdog observed one
+  (even with phone alerts off), `phone notified` only after Telegram accepted
+  that stall's optional alert, and
   `auto-recovery paused` when the watchdog's crash-loop breaker stopped restarting
   that bot (its tooltip says since when and why).
   When an action on a bot did not work, a red line under it says why and stays
@@ -206,8 +208,9 @@ The same things the engines read, and nothing hardcoded:
   launch alias (`Opus`) until the first reply; effort from the session's arguments,
   or the bot's saved `model-state` when it is down; context used from the same
   transcript record, the fleet's own formula; restarts from the watchdog's
-  `<key>.restart_log`; the stall flag from `<key>.stall_alerted`, counted only for
-  the session running now.
+  `<key>.restart_log`; the stall warning from `<key>.stall_observed`, counted only
+  for the session running now. `<key>.stall_alerted` adds `phone notified` only
+  when it matches that observation.
 - The watchdog's last pass and network check (`watchdog.last_pass` and
   `net.good_since` in its state folder). A watchdog that does not record them is
   covered by an unauthenticated check of `api.telegram.org` once a minute.

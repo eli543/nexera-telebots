@@ -39,6 +39,11 @@ class ChangelogReleaseTests(unittest.TestCase):
         self.assertIn("ID renewal and a fresh preview", text)
         self.assertIn("old ID is cancelled", text)
 
+    def test_observed_stalls_remain_visible_without_phone_alerts(self):
+        text = (ROOT / "CHANGELOG.md").read_text().split("## [0.2.0]", 1)[0]
+        self.assertIn("dashboards show observed stalls", text)
+        self.assertIn("phone alerts are off", text)
+
 
 if __name__ == "__main__":
     unittest.main()
