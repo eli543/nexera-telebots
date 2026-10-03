@@ -52,30 +52,14 @@ key="$(python3 "$CONFIG" bot-by-state "$TELEGRAM_STATE_DIR" 2>/dev/null)" || exi
 workdir="$(python3 "$CONFIG" bot "$key" workdir 2>/dev/null)"
 [ -z "$workdir" ] && exit 0
 
-# Extract the channel body + chat_id from the prompt in one python pass.
-body=""; chat_id=""; via=""
+# The shared parser rejects synthetic origins before reading the body. NUL
+# delimiters preserve field boundaries even if malformed text slips through.
+body=""; chat_id=""; session_id=""
 {
-  IFS= read -r body
-  IFS= read -r chat_id
-  IFS= read -r via
-} < <(printf '%s' "$input" | python3 -c "
-import json, sys, re
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    print(); print(); print(); sys.exit(0)
-prompt = d.get('prompt','') or ''
-m = re.search(r'<channel\b([^>]*)>(.*?)</channel>', prompt, re.DOTALL)
-attrs = m.group(1) if m else ''
-v = re.search(r'\bvia=\"([^\"]+)\"', attrs)
-print((m.group(2) if m else '').strip())
-mc = re.search(r'chat_id=\"([^\"]+)\"', attrs)
-print(mc.group(1) if mc else '')
-print(v.group(1) if v else '')
-" 2>/dev/null)
-
-# Taps and reactions are answers, even when their visible label is a command.
-case "$via" in button|reaction|email_confirm) exit 0 ;; esac
+  IFS= read -r -d '' body
+  IFS= read -r -d '' chat_id
+  IFS= read -r -d '' session_id
+} < <(printf '%s' "$input" | python3 "$(dirname "$0")/telebots-command-input.py" 2>/dev/null)
 
 # Body must be exactly /fresh.
 [ "$body" = "/fresh" ] || exit 0

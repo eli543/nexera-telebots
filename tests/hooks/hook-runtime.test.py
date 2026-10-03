@@ -117,7 +117,10 @@ if __name__ == '__main__':
         for via, command, hook in (("button", "/fresh", "telegram-fresh.sh"),
                                    ("reaction", "/model", "telegram-model.sh"),
                                    ("email_confirm", "/fresh", "telegram-fresh.sh"),
-                                   ("button", "/model opus", "telegram-model.sh")):
+                                   ("button", "/model opus", "telegram-model.sh"),
+                                   ("button", "/fresh\nExplain this command", "telegram-fresh.sh"),
+                                   ("reaction", "/model\nExplain this command", "telegram-model.sh"),
+                                   ("email_confirm", "/model\nExplain this command", "telegram-model.sh")):
             prompt = f'<channel source="plugin:telegram:telegram" chat_id="4242" via="{via}" message_id="9">{command}</channel>'
             result = self.run_hook(hook, self.event(prompt=prompt))
             self.assertEqual(result.returncode, 0, (via, command, result.stderr))

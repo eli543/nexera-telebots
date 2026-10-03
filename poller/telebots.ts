@@ -99,6 +99,9 @@ export function replyButtons(raw: unknown): InlineKeyboard | undefined {
   if (raw === undefined || raw === null) return undefined
   if (!Array.isArray(raw)) throw new Error('buttons must be an array of 1-6 short label strings')
   if (raw.length > 6) throw new Error(`too many buttons: ${raw.length} (1-6 allowed)`)
+  for (const [i, value] of raw.entries()) {
+    if (typeof value === 'string' && /[\p{Cc}\p{Zl}\p{Zp}]/u.test(value)) throw new Error(`button ${i + 1} contains a newline or control character`)
+  }
   const labels = raw.map(value => typeof value === 'string' ? value.trim() : '')
   for (const [i, label] of labels.entries()) {
     if (!label) throw new Error(`button ${i + 1} is empty - each label needs 1-40 characters`)

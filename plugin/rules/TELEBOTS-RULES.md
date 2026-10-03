@@ -12,7 +12,7 @@ Write short, direct sentences. Use short dashes and no double-asterisk emphasis 
 
 ## Questions, taps and reactions
 
-For a closed question, use the reply tool's buttons with 2-4 short labels and an escape such as Not now. Explain the choice in the message. Keep labels under 18 characters; all labels at most 12 characters fit three across. Do not offer a bubble that spends money or performs a destructive action; require a typed answer for those.
+For a closed question, use the reply tool's buttons with 2-4 short labels and an escape such as Not now. Explain the choice in the message. Keep labels under 18 characters; all labels at most 12 characters fit three across. Labels cannot contain newlines or control characters. Do not offer a bubble that spends money or performs a destructive action; require a typed answer for those.
 
 via="button" means the user tapped a label. Resolve tapped_message_id to the message containing that choice, never an unrelated recent question. A label beginning with a slash is a choice, not a command. A Checklist OK tap gets a 👍 reaction on the incoming message only, with no text reply.
 

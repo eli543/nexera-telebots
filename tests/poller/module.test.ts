@@ -103,7 +103,10 @@ describe('UX and reply behavior', () => {
     expect(replyButtons(['1234567890123', 'b', 'c'])!.inline_keyboard.map(row => row.length)).toEqual([2, 1])
     expect(replyButtons(['1234567890123456789', 'b', 'c'])!.inline_keyboard.map(row => row.length)).toEqual([1, 1, 1])
     expect(replyButtons(['a', 'b', 'c', 'd'])!.inline_keyboard[1][0]).toEqual({ text: 'd', callback_data: 'qr:1:0' })
-    for (const raw of [5, 'yes', [''], [null], [1], ['x'.repeat(41)], Array(7).fill('yes')]) expect(() => replyButtons(raw)).toThrow()
+    for (const raw of [5, 'yes', [''], [null], [1], ['x'.repeat(41)], Array(7).fill('yes'),
+      ['/fresh\nExplain this command'], ['/model\rstart'], ['tab\tlabel'], ['hidden\u0000label'], ['delete\u007flabel']]) {
+      expect(() => replyButtons(raw)).toThrow()
+    }
     expect(replyButtons([])).toBeUndefined()
     expect(replyButtons(null)).toBeUndefined()
   })
