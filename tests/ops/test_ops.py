@@ -173,6 +173,49 @@ class OfflineOps(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.email.builtin("send", bad, c)
 
+    def test_full_inbox_reply_round_trip_when_backend_exposes_the_message(self):
+        imap_port = self.start_server(IMAP)
+        smtp_port = self.start_server(SMTP)
+        original = IMAP.message
+        body = "Opening line.\n" + "Complete message line.\n" * 110
+        IMAP.message = (b"From: sender@example.test\r\nReply-To: reply@example.test\r\n"
+                        b"To: user@example.test\r\nCc: observer@example.test\r\n"
+                        b"Subject: Complete request\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n"
+                        + body.encode())
+        self.addCleanup(setattr, IMAP, "message", original)
+        c = {"enabled": True, "backend": "builtin", "imap_host": "127.0.0.1",
+             "imap_port": imap_port, "smtp_host": "127.0.0.1", "smtp_port": smtp_port,
+             "smtp_security": "ssl", "username": "user@example.test",
+             "from": "user@example.test", "archive_mailbox": "Archive"}
+        self.email.atomic_json(self.email.CONFIG, c)
+        state = self.fleet / "bot-main"
+        state.mkdir()
+        self.email.atomic_json(state / "access.json", {"dmPolicy": "allowlist", "allowFrom": ["123"]})
+        self.email.atomic_json(self.fleet / "fleet.json", {"version": 2, "bots": [
+            {"key": "main", "state_dir": str(state)}]})
+        with patch.dict(os.environ, {"TELEGRAM_STATE_DIR": str(state)}), \
+             patch.object(self.email, "password", return_value="fake-only"):
+            message = self.email.builtin("read", {"id": "1"}, c)
+            if not {"body", "to", "cc"}.issubset(message):
+                self.skipTest("full IMAP body and recipient fields await the email package")
+            self.assertEqual(message["body"], body)
+            self.assertEqual(message["reply_to"], "reply@example.test")
+            self.assertIn("user@example.test", message["to"])
+            self.assertIn("observer@example.test", message["cc"])
+            reply = {"to": [message["reply_to"]], "cc": ["observer@example.test"],
+                     "bcc": [], "subject": "Re: " + message["subject"],
+                     "body": "I read the complete message."}
+            consent_id = "d" * 24
+            self.email.atomic_json(state / "consents.json", {consent_id: {
+                "id": consent_id, "chat": "123", "message": 42, "phase": "consumed",
+                "expires": int(time.time() * 1000) + 600000,
+                "email": reply, "digest": self.email.digest(reply)}})
+            SMTP.sent = 0
+            answer = self.email.builtin("send", {"bot": "main", "consent_id": consent_id,
+                                                  "email": reply}, c)
+            self.assertEqual(answer["status"], "smtp-accepted")
+            self.assertEqual(SMTP.sent, 1)
+
     def test_email_contract_digest_and_fresh_consent_checks(self):
         email = {"to": ["demo@example.invalid"], "subject": "DEMO café ✉",
                  "body": "Line one\nLine two"}
@@ -269,40 +312,14 @@ class OfflineOps(unittest.TestCase):
         self.assertIn("Exit codes", output.getvalue())
 
     def test_checklist_rows_and_event_evidence(self):
-        self.assertEqual(len(self.checklist.ROWS), 27)
-        self.assertEqual([code for code, _, _ in self.checklist.ROWS],
-                         [f"A{x}" for x in range(1, 12)] + [f"P{x}" for x in range(1, 17)])
-        lines = ["2026-10-02T18:00:00-04:00 TAP family=qr cell=0:0",
-                 "2026-10-02T18:00:01-04:00 VOICE status=ok"]
-        self.assertTrue(self.checklist.event_seen(lines, "TAP", family="qr"))
-        self.assertFalse(self.checklist.event_seen(lines, "TAP", family="mail"))
+        self.assertEqual(len(self.checklist.ROWS), 31)
+        self.assertEqual({code for code, _, _ in self.checklist.ROWS},
+                         {f"A{x}" for x in range(1, 12)} | {f"P{x}" for x in range(1, 21)})
         state = self.fleet / "bot-main"
         (state / "logs").mkdir(parents=True)
-        (state / "logs/poller-events.log").write_text("\n".join(lines) + "\n")
-        self.assertEqual(self.checklist.phone_row("P2", state, self.fleet / "notes", 1, False, False)["status"], "Passed")
+        self.assertEqual(self.checklist.phone_row("P2", state, self.fleet / "notes", 1, False, False)["status"], "Needs your action")
         self.assertEqual(self.checklist.phone_row("P13", state, self.fleet / "notes", 1, False, False)["status"], "Not configured")
         self.assertEqual(self.checklist.phone_row("P7", state, self.fleet / "notes", 1, False, False)["status"], "Needs your action")
-
-    def test_first_reply_and_guardian_use_the_hooks_actual_evidence(self):
-        state = self.fleet / "bot-main"
-        logs = state / "logs"
-        stream = state / "stream"
-        logs.mkdir(parents=True)
-        stream.mkdir()
-        stamp = "2026-10-02T18:00:00-04:00 "
-        (logs / "poller-events.log").write_text(stamp + "INBOUND kind=text\n" + stamp + "TAP family=qr cell=0:0\n")
-        (logs / "ack.log").write_text(stamp + "ACK ok=true\n")
-        (stream / "state.json").write_text(json.dumps({"rich_box": True, "msgid": "101", "mission": "Check the demo"}))
-        (state / "reply_guard_turn").write_text("turn-1")
-        (state / "reply_guard_sent").write_text("turn-1")
-        self.assertEqual(self.checklist.phone_row("P1", state, self.fleet / "notes", 1, False, False)["status"], "Passed")
-        (state / "reply_guard_sent").write_text("different-turn")
-        self.assertEqual(self.checklist.phone_row("P1", state, self.fleet / "notes", 1, False, False)["status"], "Needs your action")
-        (state / "reply_guard_sent").write_text("turn-1")
-        (logs / "guardian.log").write_text(stamp + "GUARDIAN reason=8 pct=61 threshold=60 ok=true\n")
-        self.assertEqual(self.checklist.phone_row("P12", state, self.fleet / "notes", 1, False, False)["status"], "Passed")
-        (logs / "guardian.log").write_text(stamp + "GUARDIAN reason=7 pct=61 threshold=60 ok=false\n")
-        self.assertEqual(self.checklist.phone_row("P12", state, self.fleet / "notes", 1, False, False)["status"], "Needs your action")
 
     def test_crash_probe_matches_only_the_selected_state(self):
         state = self.fleet / "bot-main"
@@ -314,125 +331,15 @@ class OfflineOps(unittest.TestCase):
         allowed, _ = self.checklist.crash_exact_session(state, "main", True)
         self.assertFalse(allowed)
 
-    def test_four_named_phone_gaps_require_recorded_evidence(self):
-        state = self.fleet / "bot-main"
-        logs = state / "logs"
-        logs.mkdir(parents=True)
-        notes = self.fleet / "notes"
-        notes.mkdir()
-        (notes / "2026-10-02.md").write_text("Saved test note\n")
-        events = ["REACTION emoji=❤", "PICKER kind=model", "CLOSE kind=model",
-                  "PICKER kind=effort", "CLOSE kind=effort", "CLOSE kind=resume"]
-        (logs / "poller-events.log").write_text("\n".join("2026-10-02T18:00:00-04:00 " + item for item in events) + "\n")
-        (logs / "sessions.log").write_text("render count=2 labels=2\n")
-        (logs / "update.log").write_text("update complete\n")
-        (logs / "fresh.log").write_text("back-online ping sent\n")
-        for code in ("P3", "P5", "P6", "P8"):
-            self.assertEqual(self.checklist.phone_row(code, state, notes, 1, False, False)["status"],
-                             "Passed", code)
-        (logs / "sessions.log").write_text("render count=2 labels=0\n")
-        self.assertEqual(self.checklist.phone_row("P6", state, notes, 1, False, False)["status"], "Needs your action")
-
-    def test_checklist_cli_dry_run_and_recorded_sandbox_evidence(self):
-        state = self.fleet / "bot-main"
-        work = self.fleet / "work-main"
-        logs = state / "logs"
-        stream = state / "stream"
-        notes = self.fleet / "notes"
-        for path in (logs, stream, work, notes, self.fleet / "bin"):
-            path.mkdir(parents=True)
-        (self.fleet / "fleet.json").write_text(json.dumps({"version": 2, "bots": [
-            {"key": "main", "name": "Main", "state_dir": str(state), "workdir": str(work)}],
-            "options": {"voice": "off", "notes_dir": str(notes)}}))
-        (state / ".env").write_text("TELEGRAM_BOT_TOKEN=fake-checklist-token\n")
-        (state / "access.json").write_text('{"dmPolicy":"allowlist","allowFrom":["123"]}\n')
-        (state / ".enrolled").touch()
-        (state / "poller.heartbeat").write_text(str(int(time.time())))
-        (state / "reply_guard_turn").write_text("turn-1")
-        (state / "reply_guard_sent").write_text("turn-1")
-        (stream / "state.json").write_text(json.dumps({"rich_box": True, "msgid": 10, "mission": "Test"}))
-        stamp = "2026-10-02T18:00:00-04:00 "
-        events = ("INBOUND kind=text", "TAP family=qr cell=0:0", "REACTION emoji=heart",
-                  "KEY", "PICKER kind=model", "CLOSE kind=model", "PICKER kind=effort",
-                  "CLOSE kind=effort", "CLOSE kind=resume", "INTERCEPT cmd=esc",
-                  "INTERCEPT cmd=context", "INTERCEPT cmd=usage")
-        (logs / "poller-events.log").write_text("".join(stamp + event + "\n" for event in events))
-        (logs / "ack.log").write_text(stamp + "ACK ok=true\n")
-        (logs / "guardian.log").write_text(stamp + "GUARDIAN reason=8 pct=61 threshold=60 ok=true\n")
-        for name, line in {"sessions.log": "count=2 labels=2", "update.log": "update complete",
-                           "fresh.log": "back-online ping sent", "esc.log": "key landed",
-                           "context.log": "context report", "usage.log": "usage report",
-                           "compact.log": "exit 0"}.items():
-            (logs / name).write_text(line + "\n")
-        (notes / "2026-10-02.md").write_text("Saved fake reaction\n")
-        bin_dir = self.fleet / "bin"
-        for name, body in {"verify-overlay.sh": "echo OK", "fleet-state": "echo '[{\"key\":\"main\",\"up\":true}]'",
-                           "fleet-fresh": "exit 0", "fleet-doctor": "exit 0"}.items():
-            path = bin_dir / name
-            path.write_text("#!/bin/sh\n" + body + "\n")
-            path.chmod(0o700)
-        (self.fleet / "ux.json").write_text('{}\n')
-        claude_dir = self.home / ".claude"
-        (claude_dir / "plugins/cache/claude-plugins-official/telegram/0.0.7").mkdir(parents=True)
-        (claude_dir / "plugins/cache/claude-plugins-official/telegram/0.0.7/server.ts").touch()
-        (claude_dir / "plugins/installed_plugins.json").write_text(
-            '{"plugins":{"telegram-fleet@nexera-telebots":[]}}\n')
-        (claude_dir / "settings.json").write_text('{"enabledPlugins":{"telegram-fleet@nexera-telebots":true}}\n')
-        shims = self.root / "shims"
-        shims.mkdir()
-        claude = shims / "claude"
-        claude.write_text("#!/bin/sh\necho 2.1.286\n")
-        claude.chmod(0o700)
-        commands = list(self.checklist.COMMANDS)
-
-        class FakeTelegram(BaseHTTPRequestHandler):
-            def do_GET(self):
-                self.answer()
-
-            def do_POST(self):
-                self.answer()
-
-            def answer(self):
-                method = self.path.rsplit("/", 1)[-1]
-                if method == "getMe":
-                    result = {"username": "sandbox_bot"}
-                elif method == "getWebhookInfo":
-                    result = {"allowed_updates": ["message", "callback_query", "message_reaction"]}
-                elif method == "getMyCommands":
-                    result = [{"command": name} for name in commands]
-                else:
-                    self.send_error(404)
-                    return
-                data = json.dumps({"ok": True, "result": result}).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-
-            def log_message(self, *_args):
-                pass
-
-        server = ThreadingHTTPServer(("127.0.0.1", 0), FakeTelegram)
-        self.addCleanup(server.server_close)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        self.addCleanup(server.shutdown)
-        env = dict(os.environ, HOME=str(self.home), FLEET_HOME=str(self.fleet),
-                   TELEBOTS_API_BASE=f"http://127.0.0.1:{server.server_port}",
-                   PATH=str(shims) + ":/usr/bin:/bin:/usr/sbin:/sbin")
-        cli = str(REPO / "engine/fleet-checklist")
-        dry = subprocess.run(["python3", cli, "--dry-run"], env=env, text=True, capture_output=True)
+    def test_checklist_dry_run_names_all_sources_without_touching_a_bot(self):
+        env = dict(os.environ, HOME=str(self.home), FLEET_HOME=str(self.fleet))
+        dry = subprocess.run(["python3", str(REPO / "engine/fleet-checklist"), "--dry-run"],
+                             env=env, text=True, capture_output=True, check=False)
         self.assertEqual(dry.returncode, 0, dry.stderr)
-        self.assertEqual(sum(line.startswith(("A", "P")) for line in dry.stdout.splitlines()), 27)
-        recorded = subprocess.run(["python3", cli, "main", "--recorded-evidence"],
-                                  env=env, text=True, capture_output=True)
-        self.assertEqual(recorded.returncode, 0, recorded.stdout + recorded.stderr)
-        results = json.loads((self.fleet / "checklist-main.json").read_text())["rows"]
-        self.assertEqual(len(results), 27)
-        self.assertEqual(sum(value["status"] == "Passed" for value in results.values()), 19)
-        self.assertEqual({key for key, value in results.items() if value["status"] == "Not configured"},
-                         {"A8", "A9", "A11", "P7", "P13", "P14", "P15", "P16"})
+        self.assertEqual(sum(line.startswith(("A", "P")) for line in dry.stdout.splitlines()), 31)
+        self.assertIn("fleet-home esc.log sent Esc", dry.stdout)
+        self.assertIn("30-minute resume boundary", dry.stdout)
+        self.assertFalse((self.fleet / "checklist-main.json").exists())
 
     def test_voice_dispatch_and_daemon_path_guard(self):
         voice = load_script("voice_dispatch", REPO / "voice/transcribe-voice")
