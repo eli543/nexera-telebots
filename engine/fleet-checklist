@@ -41,7 +41,7 @@ ROWS = (
     ("P5", "Picker Close bubbles", "PICKER model and effort; CLOSE events"),
     ("P6", "Resume descriptions", "sessions render log with count and label count; CLOSE"),
     ("P7", "Voice note", "VOICE status=ok; voice-transcribe.log status=ok"),
-    ("P8", "Update and Back and ready", "update.log; fresh.log back-online ping sent"),
+    ("P8", "Update and Back and ready", "update.log; fresh.log back-online ping accepted"),
     ("P9", "Interrupt while busy", "INTERCEPT cmd=esc; fleet-home esc.log sent Esc"),
     ("P10", "Context and usage", "INTERCEPT events; context.log; usage.log"),
     ("P11", "Compact", "fleet-home compact.log delivered or Not enough messages"),
@@ -427,7 +427,7 @@ def phone_row(code, state, notes, fleet_size, email_enabled, crash_test, started
     elif code == "P8":
         update = "\n".join(log_lines_since(logs / "update.log", started))
         ok = (bool(re.search(r"fleet-fresh exit=0", update))
-              and bool(re.search(r"back-online ping sent", update))
+              and bool(re.search(r"back-online ping status=accepted", update))
               and "restart proof accepted" in fresh and restart_receipt(state, started, quiet="quiet"))
     elif code == "P9":
         esc = engine_run(state, "esc", started)
@@ -505,7 +505,7 @@ def phone_row(code, state, notes, fleet_size, email_enabled, crash_test, started
         ok = (bool(previous) and session_id(state) not in ("", previous)
               and event_seen(lines, "INTERCEPT", cmd="fresh")
               and restart_receipt(state, started, resume="fresh-reset")
-              and "restart proof accepted" in fresh and "back-online ping sent" in fresh
+              and "restart proof accepted" in fresh and "back-online ping status=accepted" in fresh
               and not (state / "model-state").exists())
     elif code == "P17":
         previous = (baseline or {}).get("session_id", "")

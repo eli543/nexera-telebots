@@ -37,6 +37,9 @@ FC_BIN="$(resolve_bin fleet-config)"
 FRESH="$(resolve_bin fleet-fresh)"
 VERIFY="$(resolve_bin verify-overlay.sh)"
 INSTALL_OVERLAY="$(resolve_bin install-overlay.sh)"
+TG_SEND="$(resolve_bin fleet-telegram-send.sh)"
+# shellcheck source=engine/fleet-telegram-send.sh
+source "$TG_SEND" || exit 2
 fc() { "$FC_BIN" "$@"; }
 
 # ---- tunables (identical to the live watchdog) -----------------------------
@@ -98,12 +101,13 @@ first_pid_matching() {
 # alert <text> [token] [chat] - default to the alert bot; NEVER sends in dry-run.
 alert() {
   [ $DRY_RUN -eq 1 ] && { log "[DRY-RUN] alert suppressed: $1"; return 0; }
-  local tok="${2:-}" cid="${3:-}"
+  local tok="${2:-}" cid="${3:-}" status rc
   [ -z "$tok" ] && tok="$(token_of_state "$ALERT_STATE")"
   [ -z "$cid" ] && cid="$(chat_id_of_state "$ALERT_STATE")"
-  { [ -z "$tok" ] || [ -z "$cid" ]; } && { log "alert skipped (no alert token/chat)"; return 0; }
-  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$tok" | curl --config - -s --max-time 10 \
-    --data-urlencode "chat_id=${cid}" --data-urlencode "text=$1" >/dev/null 2>&1
+  status=$(telegram_send "$tok" "$cid" "$1")
+  rc=$?
+  log "alert status=$status"
+  return "$rc"
 }
 
 # Is Telegram reachable with this bot's token? Read-only (getWebhookInfo does not

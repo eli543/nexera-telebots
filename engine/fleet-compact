@@ -14,6 +14,10 @@ if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
 fi
 FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+TG_SEND="$FLEET_HOME/bin/fleet-telegram-send.sh"
+[ -f "$TG_SEND" ] || TG_SEND="$SELF_DIR/fleet-telegram-send.sh"
+# shellcheck source=engine/fleet-telegram-send.sh
+source "$TG_SEND" || exit 2
 FC_BIN="$FLEET_HOME/bin/fleet-config"
 [ -x "$FC_BIN" ] || FC_BIN="$SELF_DIR/fleet-config"
 mkdir -p "$FLEET_HOME/logs"
@@ -88,13 +92,13 @@ except Exception:
   [ -n "$CHAT_ID" ] || echo "WARN no chat id in $STATE_DIR/access.json - nothing can be sent"
 
   tg() {
-    local msg="$1" token resp
+    local msg="$1" token status
     if [ "$DRYRUN" = "1" ]; then
-      echo "DRYRUN would send Telegram status (${#msg} characters)"
+      echo "telegram send status=skipped dryrun=1 length=${#msg}"
       return 0
     fi
     if [ -z "$CHAT_ID" ]; then
-      echo "NOT SENT (no chat id): $msg"
+      echo "telegram send status=failed reason=no-chat"
       return 1
     fi
     token=""
@@ -102,15 +106,13 @@ except Exception:
       token=$(grep -E '^TELEGRAM_BOT_TOKEN=' "$STATE_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]')
     fi
     if [ -z "$token" ]; then
-      echo "NOT SENT (no bot token in $STATE_DIR/.env): $msg"
+      echo "telegram send status=failed reason=no-token"
       return 1
     fi
-    resp=$(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$token" | /usr/bin/curl --config - -s -m 8 -X POST \
-      --data-urlencode "chat_id=${CHAT_ID}" \
-      --data-urlencode "text=${msg}" 2>/dev/null)
-    echo "sent"
-    echo "telegram send attempted"
-    return 0
+    status=$(telegram_send "$token" "$CHAT_ID" "$msg" "" 8)
+    local rc=$?
+    echo "telegram send status=$status"
+    return "$rc"
   }
 
   if [ "$DRYRUN" = 1 ] && [ "${TELEBOTS_TEST:-0}" = 1 ]; then

@@ -34,6 +34,7 @@ class ChecklistProducerTests(unittest.TestCase):
         (self.state / "access.json").write_text('{"dmPolicy":"allowlist","allowFrom":["123"]}\n')
         (self.state / ".env").write_text("TELEGRAM_BOT_TOKEN=fake-sandbox-only\n")
         shutil.copy2(REPO / "engine/fleet-config", self.fleet / "bin/fleet-config")
+        shutil.copy2(REPO / "engine/fleet-telegram-send.sh", self.fleet / "bin/fleet-telegram-send.sh")
         for name, body in {
             "ps": '#!/bin/sh\ncase "$*" in *comm=*) echo claude ;; *tty=*) echo ttys999 ;; esac\n',
             "lsof": '#!/bin/sh\nprintf "COMMAND PID USER FD TYPE NAME\\nclaude 999 1 cwd DIR %s\\n" "$BOT_WORK"\n',
@@ -122,6 +123,30 @@ class ChecklistProducerTests(unittest.TestCase):
             "CC_UPDATE_READY_DRYRUN": "1", "TELEBOTS_API_BASE": "http://127.0.0.1:12345"})
         self.assertEqual(ready.returncode, 0, ready.stderr)
         self.assertIn("TEST ready ping only", (self.state / "logs/update.log").read_text())
+        self.assertIn("back-online ping status=accepted", (self.state / "logs/update.log").read_text())
+        self.assertEqual(self.row("P8", started), "Needs your action")
+
+    def test_update_ready_ping_rejection_is_only_attempted(self):
+        update = self.safe_engine("fleet-update")
+        (self.shims / "curl").write_text('#!/bin/sh\nprintf "{\\"ok\\":false}\\n"\n')
+        result = self.call(update, 999999, self.work, 123, extra={
+            "CC_UPDATE_READY_DRYRUN": "1", "TELEBOTS_API_BASE": "http://127.0.0.1:12345"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("back-online ping status=attempted", (self.state / "logs/update.log").read_text())
+
+    def test_update_rejected_telegram_response_is_not_delivery_evidence(self):
+        started = int(time.time()) - 1
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        fresh_stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        (self.state / "logs").mkdir()
+        (self.state / "logs/update.log").write_text(
+            f"{stamp} fleet-fresh exit=0\n{stamp} back-online ping sent\n")
+        (self.fleet / "logs").mkdir()
+        (self.fleet / "logs/fresh.log").write_text(
+            f"=== {fresh_stamp} restart pid=999999 cwd={self.work} ===\nrestart proof accepted\n")
+        old = self.checklist.restart_receipt
+        self.checklist.restart_receipt = lambda *_args, **_kwargs: True
+        self.addCleanup(setattr, self.checklist, "restart_receipt", old)
         self.assertEqual(self.row("P8", started), "Needs your action")
 
     def test_handoff_requires_a_matching_receipt_from_the_receiving_poller(self):
