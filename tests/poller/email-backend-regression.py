@@ -4,6 +4,8 @@
 import importlib.machinery
 import importlib.util
 import contextlib
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -46,6 +48,24 @@ class FakeIMAP:
             self.fetched.append((args[0], args[1]))
             return "OK", [(b"BODY[]", self.message)]
         raise AssertionError(operation)
+
+
+class FakeAuthority:
+    def __init__(self, response):
+        self.response = response
+        self.proof = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        pass
+
+    def sendall(self, value):
+        self.proof = json.loads(value)
+
+    def recv(self, _limit):
+        return json.dumps(self.response).encode()
 
 
 class EmailBackendRegression(unittest.TestCase):
@@ -142,6 +162,31 @@ class EmailBackendRegression(unittest.TestCase):
                     self.assertEqual(email_backend.main(["fleet-email", operation]), 0)
                 self.assertEqual(run.call_args.args[0], [str(adapter), operation])
                 self.assertEqual(json.loads(run.call_args.kwargs["input"]), expected)
+
+    def test_authority_comes_from_private_state_file_and_requires_hmac(self):
+        state = self.home / "state"
+        state.mkdir()
+        email_backend.atomic_json(self.home / "fleet.json", {"version": 2, "bots": [
+            {"key": "main", "state_dir": str(state)}]})
+        email_backend.atomic_json(state / "access.json", {"dmPolicy": "allowlist", "allowFrom": ["123"]})
+        secret = "a" * 64
+        email_backend.atomic_json(state / "email-authority.json", {"port": 11111, "secret": secret})
+        value = {"to": ["demo@example.invalid"], "subject": "DEMO", "body": "No send"}
+        nonce = "b" * 64
+        request = {"bot": "main", "consent_id": "c" * 24, "email": value,
+                   "chat": "123", "message": 42, "digest": email_backend.digest(value), "nonce": nonce}
+        mac = hmac.new(bytes.fromhex(secret), f"{nonce}:{request['digest']}".encode(), hashlib.sha256).hexdigest()
+        accepted = FakeAuthority({"ok": True, "mac": mac})
+        with patch.dict(os.environ, {"TELEGRAM_STATE_DIR": str(state), "TELEBOTS_EMAIL_AUTHORITY_PORT": "22222"}), \
+             patch.object(email_backend.socket, "create_connection", return_value=accepted) as connect:
+            self.assertEqual(email_backend.checked_send(request)[0], email_backend.canonical_email(value))
+            connect.assert_called_once_with(("127.0.0.1", 11111), timeout=3)
+        self.assertEqual(accepted.proof["nonce"], nonce)
+        forged = FakeAuthority({"ok": True})
+        with patch.dict(os.environ, {"TELEGRAM_STATE_DIR": str(state), "TELEBOTS_EMAIL_AUTHORITY_PORT": "22222"}), \
+             patch.object(email_backend.socket, "create_connection", return_value=forged):
+            with self.assertRaises(ValueError):
+                email_backend.checked_send(request)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ from email.header import decode_header, make_header
 from email.message import EmailMessage
 from html.parser import HTMLParser
 import hashlib
+import hmac
 import imaplib
 import json
 import os
@@ -271,16 +272,29 @@ def checked_send(req):
             or not all(isinstance(item, str) for item in access["allowFrom"])
             or chat not in access["allowFrom"]):
         fail("The original chat is not on the current allowlist.")
-    port = os.environ.get("TELEBOTS_EMAIL_AUTHORITY_PORT", "")
-    if not port.isdigit() or not 1 <= int(port) <= 65535:
+    authority_path = state / "email-authority.json"
+    try:
+        authority_stat = authority_path.lstat()
+        if not stat.S_ISREG(authority_stat.st_mode) or stat.S_IMODE(authority_stat.st_mode) != 0o600:
+            fail("The poller email authority is unavailable.")
+        authority = load_json(authority_path)
+        port, secret = authority.get("port"), authority.get("secret")
+    except (OSError, AttributeError, TypeError, ValueError):
+        fail("The poller email authority is unavailable.")
+    if (type(port) is not int or not 1 <= port <= 65535
+            or not isinstance(secret, str) or not re.fullmatch(r"[0-9a-f]{64}", secret)):
         fail("The poller email authority is unavailable.")
     proof = {"consent_id": consent_id, "chat": chat, "message": message,
              "digest": proof_digest, "nonce": nonce}
     try:
-        with socket.create_connection(("127.0.0.1", int(port)), timeout=3) as channel:
+        with socket.create_connection(("127.0.0.1", port), timeout=3) as channel:
             channel.sendall((json.dumps(proof, separators=(",", ":")) + "\n").encode("utf-8"))
-            response = channel.recv(256)
-        if json.loads(response).get("ok") is not True:
+            response = channel.recv(512)
+        parsed = json.loads(response)
+        expected_mac = hmac.new(bytes.fromhex(secret), f"{nonce}:{proof_digest}".encode(), hashlib.sha256).hexdigest()
+        if (not isinstance(parsed, dict) or parsed.get("ok") is not True
+                or not isinstance(parsed.get("mac"), str)
+                or not hmac.compare_digest(parsed["mac"], expected_mac)):
             fail("The poller did not authorize this send.")
     except (OSError, ValueError, json.JSONDecodeError):
         fail("The poller did not authorize this send.")

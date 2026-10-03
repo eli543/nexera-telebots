@@ -190,8 +190,9 @@ refused. Phases are `preview`, `confirm`, `authorized`, `consumed`, `cancelled`.
 
 The poller calls `fleet-email send` with only `send` in argv. JSON stdin carries
 the exact email, chat, message ID, digest and a random one-time nonce. The
-backend checks the current allowlist and spends that nonce through a local
-127.0.0.1 authority held by the poller. It never trusts an `authorized` or
+backend checks the current allowlist and reads the endpoint and per-session
+secret from a mode-0600 bot state file. It requires an HMAC over the nonce and
+digest from the local 127.0.0.1 authority. It never trusts an `authorized` or
 `consumed` phase read from disk. This check also wraps custom adapters. Only
 then does the adapter claim `<state>/mail-attempts/<id>` with exclusive creation
 before contacting SMTP. Return `{"ok":true}` only for confirmed success.
@@ -199,9 +200,9 @@ Failed or uncertain attempts remain spent and are never retried automatically.
 The poller's 30-second backend deadline does not send a signal; the adapter
 must set its own bounded network deadlines.
 
-In the `full` permission stance, an assistant with shell access could still
-reach the mail credentials directly, so the two-tap is a strong default there
-and a hard boundary only under `safe` and `scoped`.
+The normal poller workflow enforces two taps. An assistant with shell permission
+in any stance could reach the mail credentials or authority file directly, so
+the boundary is as strong as your permission stance makes shell access.
 
 ## Verification boundaries
 
