@@ -18,6 +18,10 @@ PID="${1:-}"; WORKDIR="${2:-}"; CHAT="${3:-}"
 [[ "$PID" =~ ^[1-9][0-9]*$ && "$CHAT" =~ ^-?[0-9]+$ ]] || { echo 'fleet-update: invalid pid or chat_id' >&2; exit 2; }
 FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+TG_SEND="$FLEET_HOME/bin/fleet-telegram-send.sh"
+[[ -f "$TG_SEND" ]] || TG_SEND="$SELF_DIR/fleet-telegram-send.sh"
+# shellcheck source=engine/fleet-telegram-send.sh
+source "$TG_SEND" || exit 2
 FC="$FLEET_HOME/bin/fleet-config"; [[ -x "$FC" ]] || FC="$SELF_DIR/fleet-config"
 FRESH="$FLEET_HOME/bin/fleet-fresh"; [[ -x "$FRESH" ]] || FRESH="$SELF_DIR/fleet-fresh"
 KEY="$("$FC" bot-by-workdir "$WORKDIR" key 2>/dev/null)" || { echo 'fleet-update: unknown workdir' >&2; exit 2; }
@@ -60,42 +64,39 @@ if [[ "$TEST_READY" != 1 ]]; then
 fi
 
 notice() {
-  local message="$1" with_continue="${2:-0}" token="" base="https://api.telegram.org"
+  local message="$1" with_continue="${2:-0}" token="" markup=""
   [[ -f "$STATE/.env" ]] && token="$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$STATE/.env" | head -1)"
-  [[ -n "$token" ]] || return 0
-  if [[ "${TELEBOTS_TEST:-0}" == 1 && "${TELEBOTS_API_BASE:-}" =~ ^http://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?/?$ ]]; then
-    base="${TELEBOTS_API_BASE%/}"
-  fi
-  local args=()
   if [[ "$with_continue" == 1 ]]; then
-    args+=(--data-urlencode 'reply_markup={"inline_keyboard":[[{"text":"Continue","callback_data":"qr:0:0"}]]}')
+    markup='{"inline_keyboard":[[{"text":"Continue","callback_data":"qr:0:0"}]]}'
   fi
-  printf 'url = "%s/bot%s/sendMessage"\n' "$base" "$token" | curl --config - -s -o /dev/null --max-time 10 -X POST \
-    --data-urlencode "chat_id=$CHAT" --data-urlencode "text=$message" "${args[@]}" || true
+  telegram_send "$token" "$CHAT" "$message" "$markup"
 }
 
 if [[ "${CC_UPDATE_READY_DRYRUN:-0}" == 1 && "${TELEBOTS_TEST:-0}" == 1 && "$FLEET_HOME" == "${TELEBOTS_SANDBOX_ROOT:-/nonexistent}"/* && "${TELEBOTS_API_BASE:-}" =~ ^http://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?/?$ ]]; then
   log 'TEST ready ping only; no process or Terminal action'
-  notice '⚡ Back and ready. Tap Continue to pick up where we left off.' 1
+  status=$(notice '⚡ Back and ready. Tap Continue to pick up where we left off.' 1)
+  log "back-online ping status=$status"
   exit 0
 fi
 
 if [[ "$TARGET" == fresh-keep ]]; then
-  notice "Reloading $NAME. This new session will keep the model you selected."
+  status=$(notice "Reloading $NAME. This new session will keep the model you selected.")
 else
-  notice "Reloading $NAME in the same conversation. Anything mid-task stops; tap Continue when it is back."
+  status=$(notice "Reloading $NAME in the same conversation. Anything mid-task stops; tap Continue when it is back.")
 fi
+log "reload notice status=$status"
 "$FRESH" "$PID" "$WORKDIR" "$TARGET" quiet
 RC=$?
 log "fleet-fresh exit=$RC target=$TARGET"
 if [[ "$RC" == 0 ]]; then
   if [[ "$TARGET" == fresh-keep ]]; then
-    notice '⚡ Back and ready. This session is blank on the same model.'
+    status=$(notice '⚡ Back and ready. This session is blank on the same model.')
   else
-    notice '⚡ Back and ready. Tap Continue to pick up where we left off.' 1
+    status=$(notice '⚡ Back and ready. Tap Continue to pick up where we left off.' 1)
   fi
-  log 'back-online ping sent'
+  log "back-online ping status=$status"
 else
-  notice "Update did not finish (exit $RC). Check the bot's update log on the Mac."
+  status=$(notice "Update did not finish (exit $RC). Check the bot's update log on the Mac.")
+  log "failure notice status=$status"
 fi
 exit "$RC"

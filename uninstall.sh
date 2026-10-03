@@ -105,7 +105,7 @@ $candidates
 EOF
 }
 
-# Restore first. An unknown or damaged modified slot must stop uninstall before
+# Preflight first. An unknown or damaged modified slot must stop uninstall before
 # a daemon, session, state file or installation is removed.
 step "Preflight official Telegram plugin restoration"
 if [ ! -f "$REPO_DIR/poller/restore-stock.sh" ]; then
@@ -117,9 +117,7 @@ if ! RESTORE_PLAN="$(/bin/bash "$REPO_DIR/poller/restore-stock.sh" --preflight)"
   exit 1
 fi
 case "$RESTORE_PLAN" in
-  RESTORE)
-    step "Restore the verified 0.0.7 plugin slot before teardown"
-    run /bin/bash "$REPO_DIR/poller/restore-stock.sh" ;;
+  RESTORE) note "The modified 0.0.7 slot can be restored after the watchdog stops." ;;
   STOCK) note "The 0.0.7 plugin slot is already stock." ;;
   ABSENT) note "No 0.0.7 plugin slot is installed." ;;
   OTHER_VERSION:*) note "Only a different official plugin version is present; leaving it untouched." ;;
@@ -128,12 +126,48 @@ esac
 
 # ---- watchdog ---------------------------------------------------------------
 
-step "Stop and remove the watchdog daemon"
+wait_for_watchdog_shutdown() {
+  local pid_file="$FLEET_HOME/watchdog-state/watchdog-loop.pid"
+  local repair_lock="$FLEET_HOME/watchdog-state/watchdog.lock"
+  local waited=0
+  while [ -f "$pid_file" ] || [ -d "$repair_lock" ]; do
+    if [ "$waited" -ge 60 ]; then
+      note "Watchdog PID file or repair lock is still present. Uninstall stopped before restoration."
+      return 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  note "Watchdog loop PID file and repair lock are clear."
+}
+
+step "Stop and verify the watchdog daemon"
 if [ -f "$PLIST_PATH" ]; then
-  run launchctl bootout "gui/$(id -u)/$PLIST_LABEL" || true
+  if ! run launchctl bootout "gui/$(id -u)/$PLIST_LABEL"; then
+    note "Watchdog stop failed. Nothing else was removed."
+    exit 1
+  fi
+  if [ "$DRY_RUN" -eq 0 ]; then
+    wait_for_watchdog_shutdown || exit 1
+  else
+    note "Would wait for watchdog-loop.pid and watchdog.lock to clear."
+  fi
   run rm -f "$PLIST_PATH"
 else
   note "No watchdog plist found."
+  if [ "$DRY_RUN" -eq 0 ]; then wait_for_watchdog_shutdown || exit 1; fi
+fi
+
+if [ "$RESTORE_PLAN" = RESTORE ]; then
+  step "Restore and verify the stock 0.0.7 plugin slot"
+  run /bin/bash "$REPO_DIR/poller/restore-stock.sh"
+  if [ "$DRY_RUN" -eq 0 ]; then
+    if ! VERIFIED_PLAN="$(/bin/bash "$REPO_DIR/poller/restore-stock.sh" --preflight)" || [ "$VERIFIED_PLAN" != STOCK ]; then
+      note "Stock plugin hash could not be verified. Uninstall stopped."
+      exit 1
+    fi
+    note "Stock plugin hash verified."
+  fi
 fi
 
 step "Stop and remove the optional voice agent"

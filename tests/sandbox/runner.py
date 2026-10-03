@@ -333,7 +333,7 @@ def changed_items(before: dict[str, object], after: dict[str, object]) -> list[s
 
 
 def snapshot(real_home: Path | None, main: Path | None) -> dict[str, object]:
-    """Record protected files and the launchd-owned daemon PIDs by label."""
+    """Record protected files and named daemon PIDs through read-only ps."""
     found: dict[str, object] = {}
     if real_home:
         cache = real_home / ".claude/plugins/cache/claude-plugins-official/telegram"
@@ -354,10 +354,11 @@ def snapshot(real_home: Path | None, main: Path | None) -> dict[str, object]:
                                env={"HOME": str(real_home or Path.home()), "PATH": "/usr/bin:/bin",
                                     "GIT_OPTIONAL_LOCKS": "0"})
             found[f"git:{main}:{label}"] = (r.returncode, r.stdout, r.stderr)
-    labels = ("com.nexera.channel-watchdog", "com.claude-fleet.menubar",
-              "com.nexera.transcribe-voice-daemon")
+    markers = {"com.nexera.channel-watchdog": "channel-watchdog-loop",
+               "com.claude-fleet.menubar": "Telebots Bar.app/Contents/MacOS/Telebots Bar",
+               "com.nexera.transcribe-voice-daemon": "transcribe-voice-daemon"}
     try:
-        listed = subprocess.run(["/bin/launchctl", "list"], text=True,
+        listed = subprocess.run(["/bin/ps", "-axo", "pid=,command="], text=True,
                                 capture_output=True, check=False,
                                 env={"HOME": str(real_home or Path.home()), "PATH": "/usr/bin:/bin"})
     except OSError:
@@ -365,13 +366,16 @@ def snapshot(real_home: Path | None, main: Path | None) -> dict[str, object]:
     if listed is None or listed.returncode:
         found["live-daemon-labels"] = "unavailable"
     else:
-        pids = {}
+        pids: dict[str, list[str]] = {label: [] for label in markers}
         for line in listed.stdout.splitlines():
-            fields = line.split(None, 2)
-            if len(fields) == 3 and fields[2] in labels:
-                pids[fields[2]] = fields[0]
-        for label in labels:
-            found[f"live-daemon:{label}"] = pids.get(label, "not loaded")
+            fields = line.strip().split(None, 1)
+            if len(fields) != 2 or not fields[0].isdigit():
+                continue
+            for label, marker in markers.items():
+                if marker in fields[1]:
+                    pids[label].append(fields[0])
+        for label in markers:
+            found[f"live-daemon:{label}"] = tuple(sorted(pids[label]))
     return found
 
 

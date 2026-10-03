@@ -56,13 +56,16 @@ class UntouchedSnapshotTests(unittest.TestCase):
         after = self.snapshot()
         self.assertEqual(runner.changed_items(before, after), [str(self.server)])
 
-    def test_launchd_labels_ignore_transient_processes_and_detect_daemon_change(self) -> None:
-        first = "PID Status Label\n1649 0 com.nexera.channel-watchdog\n1648 0 com.claude-fleet.menubar\n1655 0 com.nexera.transcribe-voice-daemon\n"
-        second = first.replace("1649 0 com.nexera.channel-watchdog", "1700 0 com.nexera.channel-watchdog")
+    def test_read_only_ps_detects_daemon_change_without_launchctl(self) -> None:
+        first = ("1649 /bin/bash /tmp/channel-watchdog-loop.sh\n"
+                 "1648 /Applications/Telebots Bar.app/Contents/MacOS/Telebots Bar\n"
+                 "1655 /usr/bin/python3 /tmp/transcribe-voice-daemon.py\n"
+                 "2000 /bin/bash tests/run.sh\n")
+        second = first.replace("1649 /bin/bash", "1700 /bin/bash")
 
         def listing(output):
             def read(command, **_kwargs):
-                self.assertEqual(command, ["/bin/launchctl", "list"])
+                self.assertEqual(command, ["/bin/ps", "-axo", "pid=,command="])
                 return subprocess.CompletedProcess(command, 0, stdout=output)
             with patch.object(runner.subprocess, "run", side_effect=read):
                 return runner.snapshot(self.home, None)

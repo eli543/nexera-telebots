@@ -27,6 +27,8 @@ TARGET-KEY: <target-key>
 
 Keep the note around 1,500 words or fewer. Include the user's actual request and corrections, the goal, work already done and its evidence, decisions, open questions, relevant file links, remaining steps with a completion check for each, binding constraints and outstanding approvals, and the result the user expects. Distinguish verified facts from assumptions. Include quoted instructions only when they help preserve the task; never copy secrets or unrelated private material. Do not ask the target to expose internal reasoning.
 
+Before preview, call this bot's `handoff_receipt` with the note ID and `phase="issue"`. The sending poller generates a fresh delivery ID, appends it to the local note, and records its issue. Read the updated note and use those exact bytes for the preview and SendMessage. If issuing fails, stop and report the pending handoff. An issued ID alone says nothing was delivered.
+
 ## Preview and confirm
 
 Show the note through the reply tool, with `✉️ Send it`, `✏️ Edit` and `✖ Cancel` bubbles. Record the returned preview message id, chat id, target key, note path and SHA-256 of the exact note in a pending file beside it. The first Send it tap only swaps the keyboard to Cancel and Confirm send; nothing is delivered yet.
@@ -37,13 +39,13 @@ Deliver only on a `Confirm send` event with `via="button"`, from this chat and a
 
 Run ListAgents and match the exact stable session name `telebots-<target-key>`. Never use a worktree prefix, another bot's row, a Telegram API message, or a file drop as a substitute for delivery. If the match is missing or ambiguous, keep the note pending and tell the user. A uniform fleet permission stance and Claude Code 2.1.224 or newer are required; a terminal approval hold is a pending delivery, not success.
 
-Call SendMessage with the matched session name, the complete note starting with `HANDOFF from`, and the title as summary. After SendMessage confirms delivery, call this bot's `handoff_receipt` tool with the note ID and `phase="sent"`. Mark the pending record delivered, tell the user which bot received which task, and stop performing that task here. Update its task entry to record the handoff; do not claim its underlying work is finished. A sent receipt alone does not prove pickup.
+Call SendMessage with the matched session name, the complete note starting with `HANDOFF from`, including its delivery ID, and the title as summary. After SendMessage confirms delivery, call this bot's `handoff_receipt` tool with the note ID, delivery ID and `phase="sent"`. Mark the pending record delivered, tell the user which bot received which task, and stop performing that task here. Update its task entry to record the handoff; do not claim its underlying work is finished. A sent receipt is an agent attestation, not independent transport proof.
 
 On a definitely failed send or missing target, keep the note and retry once after 20 seconds. Report a second failure as pending. On an uncertain result or approval hold, do not resend until delivery state can be checked: a duplicate note can duplicate work. Never launch or reset the target as a delivery workaround.
 
 ## Receive a handoff
 
-Only an actual cross-session message beginning `HANDOFF from` is a transfer. Read it fully and inspect the relevant linked files. Check that the note ID, source key and this bot's target key match the local note. Call this bot's `handoff_receipt` tool with that note ID and `phase="received"`; its poller records `HANDOFF-RECEIVED`. Reply to the user through this bot's Telegram reply tool: `Picked up "<title>" from <Source>.` Start at the remaining steps and preserve all outstanding approvals. The recommended effort is advice, not permission to change the model or settings. If this is a duplicate transfer, acknowledge its existing state without starting the work twice. Do not pass received work onward without asking the user.
+Only an actual cross-session message beginning `HANDOFF from` is a transfer. Read it fully and inspect the relevant linked files. Check that the note ID, delivery ID, source key and this bot's target key match the local note. Call this bot's `handoff_receipt` tool with that note ID, delivery ID and `phase="received"`; its poller records `HANDOFF-RECEIVED` once only when the sender's fresh issue and sent receipts match. If the sender's sent receipt has not appeared yet, ask it to complete that receipt and retry this check once. Reply to the user through this bot's Telegram reply tool: `Picked up "<title>" from <Source>.` Start at the remaining steps and preserve all outstanding approvals. The recommended effort is advice, not permission to change the model or settings. If this is a duplicate transfer, acknowledge its existing state without starting the work twice. Do not pass received work onward without asking the user.
 
 ## Questions, replies and status
 

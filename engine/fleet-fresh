@@ -94,6 +94,10 @@ esac
 FLEET_HOME="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "${FLEET_HOME:-$HOME/.claude/telegram-fleet}")" || exit 2
 export FLEET_HOME
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+TG_SEND="$FLEET_HOME/bin/fleet-telegram-send.sh"
+[[ -f "$TG_SEND" ]] || TG_SEND="$SELF_DIR/fleet-telegram-send.sh"
+# shellcheck source=engine/fleet-telegram-send.sh
+source "$TG_SEND" || exit 2
 
 resolve_bin() {  # $1 = tool name -> absolute path or bare name (PATH)
   if [ -x "$FLEET_HOME/bin/$1" ]; then printf '%s\n' "$FLEET_HOME/bin/$1"; return; fi
@@ -262,43 +266,34 @@ on_exit() {
 # One-shot Telegram notice FROM this bot, into its own chat. Best effort: a failed
 # send never changes what the restart does. The token is read only here.
 tg_notice() {   # tg_notice <text>
-  local tok chat
+  local tok chat status
   tok="$(token_of_state "$STATE_DIR")"
   chat="$(chat_id_of_state "$STATE_DIR")"
   if [ -z "$tok" ] || [ -z "$chat" ]; then
-    echo "$(date '+%F %T') notice skipped: no token/chat for $KEY"
+    echo "$(date '+%F %T') notice status=failed reason=no-token-or-chat"
     return 1
   fi
-  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$tok" | curl --config - -s -o /dev/null --max-time 10 -X POST \
-    --data-urlencode "chat_id=${chat}" \
-    --data-urlencode "text=$1" \
-    && echo "$(date '+%F %T') notice sent: $1" \
-    || echo "$(date '+%F %T') notice curl failed"
+  status=$(telegram_send "$tok" "$chat" "$1")
+  local rc=$?
+  echo "$(date '+%F %T') notice status=$status"
+  return "$rc"
 }
 
 send_ready_ping() {
-  local tok chat base
+  local tok chat markup="" status
   tok="$(token_of_state "$STATE_DIR")"
   chat="$(chat_id_of_state "$STATE_DIR")"
   if [ -z "$tok" ] || [ -z "$chat" ]; then
-    echo "$(date '+%F %T') back-online ping skipped: no token/chat for $KEY"
+    echo "$(date '+%F %T') back-online ping status=failed reason=no-token-or-chat"
     return 1
   fi
-  base=https://api.telegram.org
-  if [ "${TELEBOTS_TEST:-0}" = 1 ] && [[ "${TELEBOTS_API_BASE:-}" =~ ^http://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?/?$ ]]; then
-    base="${TELEBOTS_API_BASE%/}"
-  fi
-  local args=()
   if [[ "$RESUME_ID" =~ $UUID_RE ]]; then
-    args+=(--data-urlencode 'reply_markup={"inline_keyboard":[[{"text":"Continue","callback_data":"qr:0:0"}]]}')
+    markup='{"inline_keyboard":[[{"text":"Continue","callback_data":"qr:0:0"}]]}'
   fi
-  if printf 'url = "%s/bot%s/sendMessage"\n' "$base" "$tok" | curl --config - -s -o /dev/null --max-time 10 -X POST \
-    --data-urlencode "chat_id=$chat" --data-urlencode "text=⚡ Back and ready" "${args[@]}" 2>/dev/null; then
-    echo "$(date '+%F %T') back-online ping sent"
-  else
-    echo "$(date '+%F %T') back-online ping curl failed"
-    return 1
-  fi
+  status=$(telegram_send "$tok" "$chat" '⚡ Back and ready' "$markup")
+  local rc=$?
+  echo "$(date '+%F %T') back-online ping status=$status"
+  return "$rc"
 }
 
 # ---- bash-native command timeout ---------------------------------------------

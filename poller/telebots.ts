@@ -2,11 +2,11 @@
 // register handlers, spawn a process, or write files. The seam calls init first.
 import { Composer, GrammyError, InlineKeyboard, type Context } from 'grammy'
 import type { InlineKeyboardMarkup, ReactionType, ReactionTypeEmoji, UserFromGetMe } from 'grammy/types'
-import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { execFile, execFileSync, spawn } from 'node:child_process'
 import { basename, isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { EmailService } from './email.ts'
 import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js'
 import type { AttachmentMeta, EventFields, ExecOptions, ForwardParams, ReplyMarkup, Telebots, TelebotsDependencies } from './contracts.ts'
@@ -66,11 +66,13 @@ const MODEL_EFFORT_RE = /^me:(opus|fable|sonnet|haiku):(low|medium|high|xhigh|ma
 const QUICK_RE = /^qr:(\d{1,2}):(\d{1,2})$/
 const HANDOFF_RE = /^ho:(?:bot:)?([a-z0-9][a-z0-9-]{0,30})$/
 const NOTE_ID_RE = /^[a-f0-9]{24}$/
+const DELIVERY_LIFETIME_MS = 60 * 60 * 1000
+type DeliveryRecord = { delivery_id: string; note_id: string; source: string; target: string; issued_at: number; digest: string; phase: 'issued' | 'sent' | 'received' }
 const HANDOFF_RECEIPT_TOOL: Tool = {
   name: 'handoff_receipt',
-  description: 'Record a handoff note after SendMessage reports delivery or after this named bot receives the complete cross-session HANDOFF note. Use the note ID from the note, and call received only in the destination session. This is local checklist evidence, not a replacement for phone acknowledgement.',
+  description: 'The sending bot calls issue before preview: it adds a one-use delivery ID to the local note. After SendMessage reports delivery, the sender calls sent with that ID. The receiving bot calls received with the same ID only after it gets the full cross-session note. These are agent attestations, not independent transport proof.',
   inputSchema: { type: 'object', additionalProperties: false, properties: {
-    note_id: { type: 'string' }, phase: { type: 'string', enum: ['sent', 'received'] },
+    note_id: { type: 'string' }, phase: { type: 'string', enum: ['issue', 'sent', 'received'] }, delivery_id: { type: 'string' },
   }, required: ['note_id', 'phase'] },
 }
 const isEffort = (value: string): value is Effort => (EFFORTS as readonly string[]).includes(value)
@@ -99,6 +101,9 @@ export function replyButtons(raw: unknown): InlineKeyboard | undefined {
   if (raw === undefined || raw === null) return undefined
   if (!Array.isArray(raw)) throw new Error('buttons must be an array of 1-6 short label strings')
   if (raw.length > 6) throw new Error(`too many buttons: ${raw.length} (1-6 allowed)`)
+  for (const [i, value] of raw.entries()) {
+    if (typeof value === 'string' && /[\p{Cc}\p{Zl}\p{Zp}]/u.test(value)) throw new Error(`button ${i + 1} contains a newline or control character`)
+  }
   const labels = raw.map(value => typeof value === 'string' ? value.trim() : '')
   for (const [i, label] of labels.entries()) {
     if (!label) throw new Error(`button ${i + 1} is empty - each label needs 1-40 characters`)
@@ -226,7 +231,7 @@ export class TelebotsModule implements Telebots {
     if (name !== 'handoff_receipt') return this.email.callTool(name, args)
     try {
       const id = args.note_id, phase = args.phase
-      if (typeof id !== 'string' || !NOTE_ID_RE.test(id) || (phase !== 'sent' && phase !== 'received')) throw Error('Invalid handoff receipt.')
+      if (typeof id !== 'string' || !NOTE_ID_RE.test(id) || !['issue', 'sent', 'received'].includes(String(phase))) throw Error('Invalid handoff receipt.')
       const self = this.self()?.key
       if (!self) throw Error('This bot is not configured.')
       const path = join(this.fleetHome, 'handoffs', `${id}.md`)
@@ -236,9 +241,44 @@ export class TelebotsModule implements Telebots {
       const source = /^SOURCE-KEY: ([a-z0-9][a-z0-9-]{0,30})$/m.exec(note)?.[1]
       const target = /^TARGET-KEY: ([a-z0-9][a-z0-9-]{0,30})$/m.exec(note)?.[1]
       if (!note.startsWith('HANDOFF from ') || !note.includes(`\nNOTE-ID: ${id}\n`) || !source || !target || source === target ||
-          (phase === 'sent' ? source !== self : target !== self)) throw Error('Invalid handoff note.')
-      this.logEvent(phase === 'sent' ? 'HANDOFF-SENT' : 'HANDOFF-RECEIVED', { id, source, target })
-      return { content: [{ type: 'text', text: `Handoff ${phase} receipt recorded for note ${id}.` }] }
+          (phase === 'received' ? target !== self : source !== self)) throw Error('Invalid handoff note.')
+      const directory = join(this.fleetHome, 'handoffs', 'deliveries')
+      if (phase === 'issue') {
+        if (args.delivery_id !== undefined || /^DELIVERY-ID:/m.test(note)) throw Error('Delivery ID already exists.')
+        mkdirSync(directory, { recursive: true, mode: 0o700 })
+        const delivery = randomBytes(12).toString('hex')
+        const updated = note + (note.endsWith('\n') ? '' : '\n') + `DELIVERY-ID: ${delivery}\n`
+        if (Buffer.byteLength(updated) > 64_000) throw Error('Handoff note is too large.')
+        const record: DeliveryRecord = { delivery_id: delivery, note_id: id, source, target,
+          issued_at: this.now(), digest: createHash('sha256').update(updated).digest('hex'), phase: 'issued' }
+        const receiptPath = join(directory, `${delivery}.json`)
+        writeFileSync(receiptPath, JSON.stringify(record) + '\n', { flag: 'wx', mode: 0o600 })
+        try { writeFileSync(path, updated, { mode: 0o600 }) } catch (error) { unlinkSync(receiptPath); throw error }
+        this.logEvent('HANDOFF-ISSUED', { id, source, target, delivery })
+        return { content: [{ type: 'text', text: `Delivery ID: ${delivery}. Preview the updated note before sending.` }] }
+      }
+      const delivery = args.delivery_id
+      if (typeof delivery !== 'string' || !NOTE_ID_RE.test(delivery) || !note.includes(`\nDELIVERY-ID: ${delivery}\n`)) throw Error('Invalid delivery ID.')
+      const receiptPath = join(directory, `${delivery}.json`)
+      const lock = `${receiptPath}.lock`
+      mkdirSync(lock, { mode: 0o700 })
+      try {
+        const receiptInfo = lstatSync(receiptPath)
+        if (!receiptInfo.isFile() || (receiptInfo.mode & 0o777) !== 0o600 || receiptInfo.size > 4096) throw Error('Invalid delivery record.')
+        const record = JSON.parse(readFileSync(receiptPath, 'utf8')) as DeliveryRecord
+        if (record.delivery_id !== delivery || record.note_id !== id || record.source !== source || record.target !== target ||
+            !Number.isFinite(record.issued_at) || record.issued_at > this.now() || this.now() - record.issued_at > DELIVERY_LIFETIME_MS ||
+            record.digest !== createHash('sha256').update(note).digest('hex') ||
+            record.phase !== (phase === 'sent' ? 'issued' : 'sent')) throw Error('Invalid delivery record.')
+        record.phase = phase as 'sent' | 'received'
+        const temporary = `${receiptPath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
+        try {
+          writeFileSync(temporary, JSON.stringify(record) + '\n', { flag: 'wx', mode: 0o600 })
+          renameSync(temporary, receiptPath)
+        } finally { try { unlinkSync(temporary) } catch {} }
+      } finally { rmdirSync(lock) }
+      this.logEvent(phase === 'sent' ? 'HANDOFF-SENT' : 'HANDOFF-RECEIVED', { id, source, target, delivery })
+      return { content: [{ type: 'text', text: `Agent-attested handoff ${phase} recorded for note ${id}.` }] }
     } catch {
       return { isError: true, content: [{ type: 'text', text: 'Handoff receipt refused. Check the local note ID and destination.' }] }
     }
@@ -255,7 +295,7 @@ export class TelebotsModule implements Telebots {
 
   logEvent(event: string, fields: EventFields = {}): void {
     // Allow only evidence fields, never message text, arbitrary errors, paths or tokens.
-    const keys = new Set(['n', 'kind', 'cmd', 'family', 'cell', 'emoji', 'id', 'read', 'source', 'target', 'status', 'offered', 'engine', 'ok', 'count', 'labels'])
+    const keys = new Set(['n', 'kind', 'cmd', 'family', 'cell', 'emoji', 'id', 'read', 'source', 'target', 'delivery', 'status', 'offered', 'engine', 'ok', 'count', 'labels'])
     const values = Object.entries(fields).filter(([key]) => keys.has(key)).map(([key, value]) => `${key}=${String(value).replace(/[\s\x00-\x1f]/g, '_').slice(0, 200)}`)
     try {
       mkdirSync(join(this.deps.stateDir, 'logs'), { recursive: true, mode: 0o700 })

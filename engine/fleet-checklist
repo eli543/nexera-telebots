@@ -41,12 +41,12 @@ ROWS = (
     ("P5", "Picker Close bubbles", "PICKER model and effort; CLOSE events"),
     ("P6", "Resume descriptions", "sessions render log with count and label count; CLOSE"),
     ("P7", "Voice note", "VOICE status=ok; voice-transcribe.log status=ok"),
-    ("P8", "Update and Back and ready", "update.log; fresh.log back-online ping sent"),
+    ("P8", "Update and Back and ready", "update.log; fresh.log back-online ping accepted"),
     ("P9", "Interrupt while busy", "INTERCEPT cmd=esc; fleet-home esc.log sent Esc"),
     ("P10", "Context and usage", "INTERCEPT events; context.log; usage.log"),
     ("P11", "Compact", "fleet-home compact.log delivered or Not enough messages"),
     ("P12", "Context nudge and Keep going", "guardian.log GUARDIAN reason=8 pct= threshold= ok=true; TAP"),
-    ("P13", "Completed handoff", "source send and receiving poller receipt with one note ID; needs two bots"),
+    ("P13", "Agent-attested handoff delivery", "fresh one-use delivery ID in both poller receipts; needs two bots"),
     ("P14", "Full inbox reply", "linked full read, two-tap confirmation and SMTP receipt"),
     ("P15", "Watchdog recovery", "fleet-home watchdog.log result; quiet restart ledger; 30-minute resume boundary"),
     ("P17", "Model switch keeps history", "model-state and model.log; same session id; restart ledger"),
@@ -427,7 +427,7 @@ def phone_row(code, state, notes, fleet_size, email_enabled, crash_test, started
     elif code == "P8":
         update = "\n".join(log_lines_since(logs / "update.log", started))
         ok = (bool(re.search(r"fleet-fresh exit=0", update))
-              and bool(re.search(r"back-online ping sent", update))
+              and bool(re.search(r"back-online ping status=accepted", update))
               and "restart proof accepted" in fresh and restart_receipt(state, started, quiet="quiet"))
     elif code == "P9":
         esc = engine_run(state, "esc", started)
@@ -444,17 +444,31 @@ def phone_row(code, state, notes, fleet_size, email_enabled, crash_test, started
         source = bot_record(state)
         fleet = read_json(ROOT / "fleet.json", {})
         for sent in matching_events(lines, "HANDOFF-SENT"):
-            note_id, target = sent.get("id", ""), sent.get("target", "")
-            if not source or sent.get("source") != source.get("key") or not re.fullmatch(r"[a-f0-9]{24}", note_id):
+            note_id, target, delivery = sent.get("id", ""), sent.get("target", ""), sent.get("delivery", "")
+            if (not source or sent.get("source") != source.get("key") or
+                    not re.fullmatch(r"[a-f0-9]{24}", note_id) or not re.fullmatch(r"[a-f0-9]{24}", delivery) or
+                    not event_seen(lines, "HANDOFF-ISSUED", id=note_id, source=source["key"], target=target, delivery=delivery)):
+                continue
+            record_path = ROOT / "handoffs" / "deliveries" / (delivery + ".json")
+            try:
+                record = read_json(record_path, {})
+                fresh = (record_path.stat().st_mode & 0o777 == 0o600 and
+                         started * 1000 <= record.get("issued_at", 0) <= time.time() * 1000 and
+                         record.get("phase") == "received" and record.get("delivery_id") == delivery and
+                         record.get("note_id") == note_id and record.get("source") == source["key"] and
+                         record.get("target") == target)
+            except (OSError, TypeError, ValueError):
+                fresh = False
+            if not fresh:
                 continue
             peer = next((item for item in fleet.get("bots", []) if item.get("key") == target and target != source.get("key")), None)
             if not peer:
                 continue
             target_state = Path(peer.get("state_dir", "")).expanduser()
             received = log_lines_since(target_state / "logs/poller-events.log", started)
-            if event_seen(received, "HANDOFF-RECEIVED", id=note_id, source=source["key"], target=target):
-                return result("Passed", "sending and receiving pollers recorded the same note ID; check the acknowledgement in the second chat")
-        return result("Needs your action", "complete the handoff; the second bot has not recorded a matching HANDOFF-RECEIVED receipt")
+            if event_seen(received, "HANDOFF-RECEIVED", id=note_id, source=source["key"], target=target, delivery=delivery):
+                return result("Passed", "agent-attested delivery ID matched in both pollers; check the acknowledgement in the second chat")
+        return result("Needs your action", "complete the handoff; both pollers need matching receipts for a fresh one-use delivery ID")
     elif code == "P14":
         if not email_enabled: return result("Not configured", "email is optional")
         for reply in matching_events(lines, "EMAIL-REPLY"):
@@ -467,7 +481,8 @@ def phone_row(code, state, notes, fleet_size, email_enabled, crash_test, started
                 consent = read_json(state / "consents.json", {}).get(consent_id, {})
                 own = read_json(ROOT / "email.json", {}).get("from", "")
                 full_read = (receipt.stat().st_mtime >= started and receipt.stat().st_mode & 0o777 == 0o600
-                             and read_record.get("full") is True and reply_recipients_match(read_record, consent, own))
+                             and read_record.get("full") is True and read_record.get("truncated") is not True
+                             and reply_recipients_match(read_record, consent, own))
             except OSError:
                 full_read = False
             if full_read and event_seen(lines, "EMAIL-CONFIRM", id=consent_id) and event_seen(lines, "EMAIL-SEND", id=consent_id, status="sent"):
@@ -490,7 +505,7 @@ def phone_row(code, state, notes, fleet_size, email_enabled, crash_test, started
         ok = (bool(previous) and session_id(state) not in ("", previous)
               and event_seen(lines, "INTERCEPT", cmd="fresh")
               and restart_receipt(state, started, resume="fresh-reset")
-              and "restart proof accepted" in fresh and "back-online ping sent" in fresh
+              and "restart proof accepted" in fresh and "back-online ping status=accepted" in fresh
               and not (state / "model-state").exists())
     elif code == "P17":
         previous = (baseline or {}).get("session_id", "")

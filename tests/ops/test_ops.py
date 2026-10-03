@@ -1,6 +1,7 @@
 """Offline WP4 checks. Run with a scrubbed HOME and no Telegram token."""
 
 import hashlib
+import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.machinery
 import importlib.util
@@ -96,6 +97,7 @@ class SMTP(socketserver.StreamRequestHandler):
 class EmailAuthority(socketserver.StreamRequestHandler):
     issued = {}
     accepted = 0
+    secret = "d" * 64
 
     def handle(self):
         try:
@@ -105,7 +107,12 @@ class EmailAuthority(socketserver.StreamRequestHandler):
         except (ValueError, TypeError, AttributeError):
             allowed = False
         type(self).accepted += int(allowed)
-        self.wfile.write(json.dumps({"ok": allowed}).encode() + b"\n")
+        response = {"ok": allowed}
+        if allowed:
+            response["mac"] = hmac.new(bytes.fromhex(type(self).secret),
+                                       f"{proof['nonce']}:{proof['digest']}".encode(),
+                                       hashlib.sha256).hexdigest()
+        self.wfile.write(json.dumps(response).encode() + b"\n")
         self.wfile.flush()
 
 
@@ -159,7 +166,9 @@ class OfflineOps(unittest.TestCase):
                    "nonce": nonce}
         EmailAuthority.issued[nonce] = {key: request[key] for key in
                                          ("consent_id", "chat", "message", "digest", "nonce")}
-        os.environ["TELEBOTS_EMAIL_AUTHORITY_PORT"] = str(self.authority_port)
+        state = self.fleet / "bot-main"
+        self.email.atomic_json(state / "email-authority.json", {
+            "port": self.authority_port, "secret": EmailAuthority.secret})
         return request
 
     def test_email_against_local_imap_and_smtp(self):

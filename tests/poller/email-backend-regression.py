@@ -3,8 +3,14 @@
 
 import importlib.machinery
 import importlib.util
+import contextlib
+import hashlib
+import hmac
+import io
+import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -44,6 +50,24 @@ class FakeIMAP:
         raise AssertionError(operation)
 
 
+class FakeAuthority:
+    def __init__(self, response):
+        self.response = response
+        self.proof = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        pass
+
+    def sendall(self, value):
+        self.proof = json.loads(value)
+
+    def recv(self, _limit):
+        return json.dumps(self.response).encode()
+
+
 class EmailBackendRegression(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="mail-backend-", dir=os.environ["TELEBOTS_SANDBOX_ROOT"])
@@ -51,6 +75,7 @@ class EmailBackendRegression(unittest.TestCase):
         self.home = Path(self.temp.name)
         self.addCleanup(patch.stopall)
         patch.object(email_backend, "FLEET_HOME", self.home).start()
+        patch.object(email_backend, "CONFIG", self.home / "email.json").start()
         patch.object(email_backend, "password", return_value="fixture-only").start()
         self.config = {"username": "me@example.test", "archive_mailbox": "Archive"}
 
@@ -99,6 +124,20 @@ class EmailBackendRegression(unittest.TestCase):
         with self.assertRaises(ValueError):
             email_backend.builtin("read", {"id": "1"}, self.config)
 
+    def test_truncated_read_receipt_is_not_full(self):
+        state = self.home / "state"
+        state.mkdir()
+        email_backend.atomic_json(self.home / "fleet.json", {"version": 2, "bots": [
+            {"key": "main", "state_dir": str(state)}]})
+        raw = b"From: sender@example.test\r\n\r\n" + b"x" * (email_backend.MAX_BODY_CHARS + 1)
+        patch.object(email_backend, "imap_client", return_value=FakeIMAP(raw)).start()
+        with patch.dict(os.environ, {"TELEGRAM_STATE_DIR": str(state)}):
+            message = email_backend.builtin("read", {"id": "1"}, self.config)
+        self.assertTrue(message["truncated"])
+        record = email_backend.load_json(state / "mail-reads" / (message["read_receipt"] + ".json"), {})
+        self.assertFalse(record["full"])
+        self.assertTrue(record["truncated"])
+
     def test_direct_send_refuses_a_forged_consumed_audit_record(self):
         state = self.home / "state"
         state.mkdir()
@@ -113,6 +152,53 @@ class EmailBackendRegression(unittest.TestCase):
             "digest": email_backend.digest(value)}})
         request = {"bot": "main", "consent_id": consent_id, "email": value}
         with patch.dict(os.environ, {"TELEGRAM_STATE_DIR": str(state)}):
+            with self.assertRaises(ValueError):
+                email_backend.checked_send(request)
+
+    def test_custom_adapter_receives_each_non_send_operation_payload(self):
+        adapter = self.home / "fake-adapter"
+        adapter.write_text("#!/bin/sh\nexit 0\n")
+        adapter.chmod(0o700)
+        email_backend.atomic_json(self.home / "email.json", {"enabled": True, "backend": str(adapter)})
+        operations = (
+            ("test", {}, {}),
+            ("inbox", {"limit": 4}, {"limit": 4}),
+            ("read", {"id": "17"}, {"id": "17"}),
+            ("archive", {"id": "18"}, {"id": "18"}),
+            ("snooze", {"id": "19", "hours": 24}, {"id": "19", "hours": 24}),
+        )
+        for operation, request, expected in operations:
+            with self.subTest(operation=operation):
+                child = subprocess.CompletedProcess([str(adapter), operation], 0, '{"status":"ok"}', "")
+                with (patch.object(email_backend.subprocess, "run", return_value=child) as run,
+                      patch.object(email_backend.sys, "stdin", io.StringIO(json.dumps(request))),
+                      contextlib.redirect_stdout(io.StringIO())):
+                    self.assertEqual(email_backend.main(["fleet-email", operation]), 0)
+                self.assertEqual(run.call_args.args[0], [str(adapter), operation])
+                self.assertEqual(json.loads(run.call_args.kwargs["input"]), expected)
+
+    def test_authority_comes_from_private_state_file_and_requires_hmac(self):
+        state = self.home / "state"
+        state.mkdir()
+        email_backend.atomic_json(self.home / "fleet.json", {"version": 2, "bots": [
+            {"key": "main", "state_dir": str(state)}]})
+        email_backend.atomic_json(state / "access.json", {"dmPolicy": "allowlist", "allowFrom": ["123"]})
+        secret = "a" * 64
+        email_backend.atomic_json(state / "email-authority.json", {"port": 11111, "secret": secret})
+        value = {"to": ["demo@example.invalid"], "subject": "DEMO", "body": "No send"}
+        nonce = "b" * 64
+        request = {"bot": "main", "consent_id": "c" * 24, "email": value,
+                   "chat": "123", "message": 42, "digest": email_backend.digest(value), "nonce": nonce}
+        mac = hmac.new(bytes.fromhex(secret), f"{nonce}:{request['digest']}".encode(), hashlib.sha256).hexdigest()
+        accepted = FakeAuthority({"ok": True, "mac": mac})
+        with patch.dict(os.environ, {"TELEGRAM_STATE_DIR": str(state), "TELEBOTS_EMAIL_AUTHORITY_PORT": "22222"}), \
+             patch.object(email_backend.socket, "create_connection", return_value=accepted) as connect:
+            self.assertEqual(email_backend.checked_send(request)[0], email_backend.canonical_email(value))
+            connect.assert_called_once_with(("127.0.0.1", 11111), timeout=3)
+        self.assertEqual(accepted.proof["nonce"], nonce)
+        forged = FakeAuthority({"ok": True})
+        with patch.dict(os.environ, {"TELEGRAM_STATE_DIR": str(state), "TELEBOTS_EMAIL_AUTHORITY_PORT": "22222"}), \
+             patch.object(email_backend.socket, "create_connection", return_value=forged):
             with self.assertRaises(ValueError):
                 email_backend.checked_send(request)
 

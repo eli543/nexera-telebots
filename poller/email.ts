@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto'
+import { createHash, createHmac, randomBytes } from 'node:crypto'
 import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { spawn } from 'node:child_process'
@@ -261,8 +261,11 @@ export class EmailService {
   private readonly replyReads = new Map<string, string>()
   private readonly authority: Server
   private readonly authorityReady: Promise<number>
+  private readonly authoritySecret = randomBytes(32).toString('hex')
+  private readonly authorityPath: string
 
   constructor(private readonly options: EmailServiceOptions) {
+    this.authorityPath = join(options.stateDir, 'email-authority.json')
     this.consents = new ConsentStore(options.stateDir, options.now)
     // Disk receipts are audit records only. A controller restart begins with no
     // in-memory consent, even if a receipt says authorized or consumed.
@@ -279,7 +282,7 @@ export class EmailService {
         if (Buffer.byteLength(input) > 2048) { socket.destroy(); return }
         if (!input.includes('\n')) return
         answered = true
-        let ok = false
+        let ok = false, mac: string | undefined
         try {
           const value: unknown = JSON.parse(input.slice(0, input.indexOf('\n')))
           if (plainObject(value) && typeof value.nonce === 'string') {
@@ -289,10 +292,14 @@ export class EmailService {
               value.consent_id === pending.id && value.chat === pending.chat && value.message === pending.message &&
               value.digest === pending.digest && record.phase === 'consumed' && record.chat === pending.chat &&
               record.message === pending.message && record.digest === pending.digest
-            if (ok) this.pending.delete(value.nonce)
+            if (ok && pending) {
+              this.pending.delete(value.nonce)
+              mac = createHmac('sha256', Buffer.from(this.authoritySecret, 'hex'))
+                .update(`${value.nonce}:${pending.digest}`).digest('hex')
+            }
           }
         } catch { /* Invalid proof never authorizes a send. */ }
-        socket.end(JSON.stringify({ ok }) + '\n')
+        socket.end(JSON.stringify(ok ? { ok: true, mac } : { ok: false }) + '\n')
       })
     })
     this.authorityReady = new Promise(resolve => {
@@ -300,12 +307,29 @@ export class EmailService {
       this.authority.listen(0, '127.0.0.1', () => {
         this.authority.unref()
         const address = this.authority.address()
-        resolve(address && typeof address !== 'string' ? address.port : 0)
+        const port = address && typeof address !== 'string' ? address.port : 0
+        if (!port) { resolve(0); return }
+        const temporary = `${this.authorityPath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
+        try {
+          writeFileSync(temporary, JSON.stringify({ port, secret: this.authoritySecret }) + '\n', { flag: 'wx', mode: 0o600 })
+          renameSync(temporary, this.authorityPath)
+          resolve(port)
+        } catch {
+          try { unlinkSync(temporary) } catch {}
+          this.authority.close()
+          resolve(0)
+        }
       })
     })
   }
 
-  dispose(): void { this.pending.clear(); this.replyReads.clear(); this.authority.close() }
+  dispose(): void {
+    this.pending.clear(); this.replyReads.clear(); this.authority.close()
+    try {
+      const current: unknown = JSON.parse(readFileSync(this.authorityPath, 'utf8'))
+      if (plainObject(current) && current.secret === this.authoritySecret) unlinkSync(this.authorityPath)
+    } catch {}
+  }
 
   private checkedReadReceipt(value: unknown): string | undefined {
     if (value === undefined) return undefined
@@ -492,9 +516,7 @@ export class EmailService {
 
   private async runBackend(executable: string, op: 'send', payload: EmailBackendPayload): Promise<unknown> {
     return await new Promise((resolve, reject) => {
-      const address = this.authority.address()
-      const env: NodeJS.ProcessEnv = { FLEET_HOME: this.options.fleetHome, TELEGRAM_STATE_DIR: this.options.stateDir,
-        TELEBOTS_EMAIL_AUTHORITY_PORT: address && typeof address !== 'string' ? String(address.port) : '' }
+      const env: NodeJS.ProcessEnv = { FLEET_HOME: this.options.fleetHome, TELEGRAM_STATE_DIR: this.options.stateDir }
       for (const key of ['HOME', 'PATH', 'TMPDIR', 'LANG', 'LC_ALL', 'TELEBOTS_TEST', 'TELEBOTS_SANDBOX_ROOT']) if (process.env[key]) env[key] = process.env[key]
       // A soft deadline makes the result uncertain without signalling a child.
       // The adapter must set its own socket deadlines. Never retry after this.

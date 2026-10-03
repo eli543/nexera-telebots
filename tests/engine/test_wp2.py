@@ -245,6 +245,47 @@ class EngineTests(unittest.TestCase):
         self.assertFalse((state / ".enrolled").exists())
         self.assertIn("d4e5f6", json.loads((state / "access.json").read_text())["pending"])
 
+    def test_dialog_pair_rejects_changed_sender_creation_or_policy(self):
+        _work, state = self.bot()
+        shims = self.base / "pair-mismatch-shims"
+        shims.mkdir()
+        dialog = shims / "osascript"
+        dialog.write_text("#!/bin/sh\n/usr/bin/python3 - \"$PAIR_ACCESS\" \"$PAIR_MUTATION\" <<'PY'\n"
+                          "import json, sys\nfrom pathlib import Path\n"
+                          "path = Path(sys.argv[1]); value = json.loads(path.read_text())\n"
+                          "item = value['pending']['a1b2c3']\n"
+                          "if sys.argv[2] == 'sender': item['senderId'] = '88'\n"
+                          "elif sys.argv[2] == 'created': item['createdAt'] += 1\n"
+                          "else: value['dmPolicy'] = 'allowlist'\n"
+                          "path.write_text(json.dumps(value))\nPY\nprintf 'Pair\\n'\n")
+        dialog.chmod(0o700)
+
+        def pending():
+            time.sleep(1)
+            access = json.loads((state / "access.json").read_text())
+            access["pending"]["a1b2c3"] = {"senderId": "77", "chatId": "77",
+                                              "createdAt": int(time.time() * 1000),
+                                              "expiresAt": int(time.time() * 1000) + 60_000}
+            (state / "access.json").write_text(json.dumps(access))
+
+        for mutation in ("sender", "created", "policy"):
+            with self.subTest(mutation=mutation):
+                (state / ".enrolled").unlink(missing_ok=True)
+                (state / "access.json").write_text(json.dumps({"dmPolicy": "pairing", "allowFrom": ["42"],
+                                                                "groups": {}, "pending": {}}))
+                writer = threading.Thread(target=pending)
+                writer.start()
+                env = {**self.env, "CC_START_PAIR_ONLY": "1", "CC_START_PAIR_WAIT": "5",
+                       "PAIR_ACCESS": str(state / "access.json"), "PAIR_MUTATION": mutation,
+                       "PATH": str(shims) + ":" + self.env["PATH"]}
+                result = subprocess.run([str(ENGINE / "fleet-start"), "alpha"], cwd=ROOT,
+                                        env=env, text=True, capture_output=True, timeout=15)
+                writer.join()
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("pairing failed", result.stderr)
+                self.assertFalse((state / ".enrolled").exists())
+                self.assertEqual(json.loads((state / "access.json").read_text())["allowFrom"], ["42"])
+
     def test_start_launch_fresh_update_and_ready_bubbles(self):
         work, state = self.bot()
         start = self.run_engine("fleet-start", "alpha", extra={"CC_START_DRYRUN": "1"})

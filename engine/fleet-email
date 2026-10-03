@@ -6,6 +6,7 @@ from email.header import decode_header, make_header
 from email.message import EmailMessage
 from html.parser import HTMLParser
 import hashlib
+import hmac
 import imaplib
 import json
 import os
@@ -271,16 +272,29 @@ def checked_send(req):
             or not all(isinstance(item, str) for item in access["allowFrom"])
             or chat not in access["allowFrom"]):
         fail("The original chat is not on the current allowlist.")
-    port = os.environ.get("TELEBOTS_EMAIL_AUTHORITY_PORT", "")
-    if not port.isdigit() or not 1 <= int(port) <= 65535:
+    authority_path = state / "email-authority.json"
+    try:
+        authority_stat = authority_path.lstat()
+        if not stat.S_ISREG(authority_stat.st_mode) or stat.S_IMODE(authority_stat.st_mode) != 0o600:
+            fail("The poller email authority is unavailable.")
+        authority = load_json(authority_path)
+        port, secret = authority.get("port"), authority.get("secret")
+    except (OSError, AttributeError, TypeError, ValueError):
+        fail("The poller email authority is unavailable.")
+    if (type(port) is not int or not 1 <= port <= 65535
+            or not isinstance(secret, str) or not re.fullmatch(r"[0-9a-f]{64}", secret)):
         fail("The poller email authority is unavailable.")
     proof = {"consent_id": consent_id, "chat": chat, "message": message,
              "digest": proof_digest, "nonce": nonce}
     try:
-        with socket.create_connection(("127.0.0.1", int(port)), timeout=3) as channel:
+        with socket.create_connection(("127.0.0.1", port), timeout=3) as channel:
             channel.sendall((json.dumps(proof, separators=(",", ":")) + "\n").encode("utf-8"))
-            response = channel.recv(256)
-        if json.loads(response).get("ok") is not True:
+            response = channel.recv(512)
+        parsed = json.loads(response)
+        expected_mac = hmac.new(bytes.fromhex(secret), f"{nonce}:{proof_digest}".encode(), hashlib.sha256).hexdigest()
+        if (not isinstance(parsed, dict) or parsed.get("ok") is not True
+                or not isinstance(parsed.get("mac"), str)
+                or not hmac.compare_digest(parsed["mac"], expected_mac)):
             fail("The poller did not authorize this send.")
     except (OSError, ValueError, json.JSONDecodeError):
         fail("The poller did not authorize this send.")
@@ -356,7 +370,8 @@ def builtin(op, req, c):
             if state:
                 receipt = secrets.token_hex(12)
                 atomic_json(state / "mail-reads" / (receipt + ".json"), {
-                    "id": message["id"], "at": time.time(), "full": True,
+                    "id": message["id"], "at": time.time(),
+                    "full": not message["truncated"], "truncated": message["truncated"],
                     "message_id_sha256": hashlib.sha256(message["message_id"].encode()).hexdigest(),
                     "from": message["from"], "reply_to": message["reply_to"],
                     "to": message["to"], "cc": message["cc"],
@@ -400,6 +415,29 @@ def setup():
     return {"status": "configured", "address": value["from"], "sent": False}
 
 
+def adapter_payload(op, req):
+    if op == "send":
+        return {key: req[key] for key in ("bot", "consent_id", "email")}
+    if op == "test":
+        return {}
+    if op == "inbox":
+        limit = req.get("limit", 5)
+        if type(limit) is not int or not 1 <= limit <= 20:
+            fail("Inbox limit must be 1 to 20.")
+        return {"limit": limit}
+    uid = str(req.get("id", ""))
+    if not uid.isdigit():
+        fail("Invalid inbox ID.")
+    if op in ("read", "archive"):
+        return {"id": uid}
+    if op == "snooze":
+        hours = req.get("hours")
+        if type(hours) not in (int, float) or not 0 < hours <= 720:
+            fail("Snooze needs a message ID and 1 to 720 hours.")
+        return {"id": uid, "hours": hours}
+    fail("Unsupported email action.")
+
+
 def main(argv):
     if len(argv) == 2 and argv[1] in ("--help", "-h"):
         print("fleet-email setup|test|inbox|read|archive|snooze|send")
@@ -433,7 +471,7 @@ def main(argv):
                              ("HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "FLEET_HOME",
                               "TELEGRAM_STATE_DIR", "TELEBOTS_TEST", "TELEBOTS_SANDBOX_ROOT")
                              if key in os.environ}
-                child_req = {key: req[key] for key in ("bot", "consent_id", "email")}
+                child_req = adapter_payload(op, req)
                 result = subprocess.run([backend, op], input=json.dumps(child_req), text=True,
                                         capture_output=True, check=False, timeout=30,
                                         env=child_env)

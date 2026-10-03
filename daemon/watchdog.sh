@@ -37,6 +37,9 @@ FC_BIN="$(resolve_bin fleet-config)"
 FRESH="$(resolve_bin fleet-fresh)"
 VERIFY="$(resolve_bin verify-overlay.sh)"
 INSTALL_OVERLAY="$(resolve_bin install-overlay.sh)"
+TG_SEND="$(resolve_bin fleet-telegram-send.sh)"
+# shellcheck source=engine/fleet-telegram-send.sh
+source "$TG_SEND" || exit 2
 fc() { "$FC_BIN" "$@"; }
 
 # ---- tunables (identical to the live watchdog) -----------------------------
@@ -98,12 +101,13 @@ first_pid_matching() {
 # alert <text> [token] [chat] - default to the alert bot; NEVER sends in dry-run.
 alert() {
   [ $DRY_RUN -eq 1 ] && { log "[DRY-RUN] alert suppressed: $1"; return 0; }
-  local tok="${2:-}" cid="${3:-}"
+  local tok="${2:-}" cid="${3:-}" status rc
   [ -z "$tok" ] && tok="$(token_of_state "$ALERT_STATE")"
   [ -z "$cid" ] && cid="$(chat_id_of_state "$ALERT_STATE")"
-  { [ -z "$tok" ] || [ -z "$cid" ]; } && { log "alert skipped (no alert token/chat)"; return 0; }
-  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$tok" | curl --config - -s --max-time 10 \
-    --data-urlencode "chat_id=${cid}" --data-urlencode "text=$1" >/dev/null 2>&1
+  status=$(telegram_send "$tok" "$cid" "$1")
+  rc=$?
+  log "alert status=$status"
+  return "$rc"
 }
 
 # Is Telegram reachable with this bot's token? Read-only (getWebhookInfo does not
@@ -164,7 +168,7 @@ restart_channel() {
 # ALERT-ONLY, never restarts (also matches a session legitimately inside one long
 # tool call). The ping itself is OFF by default; detection still logs.
 check_stall() {
-  local key="$1" sdir="$2" li li_ts proj latest tm flag
+  local key="$1" sdir="$2" li li_ts proj latest tm flag observed
   li="$sdir/last-inbound"
   [ -f "$li" ] || return 0
   li_ts=$(head -1 "$li" 2>/dev/null | tr -cd '0-9'); [ -z "$li_ts" ] && return 0
@@ -173,16 +177,21 @@ check_stall() {
   latest=$(ls -t "$proj"/*.jsonl 2>/dev/null | head -1)
   [ -n "$latest" ] && tm=$(stat -f %m "$latest" 2>/dev/null || echo 0)
   flag="$STATE/$key.stall_alerted"
+  observed="$STATE/$key.stall_observed"
   if [ "$li_ts" -gt "$tm" ] && [ $(( now - li_ts )) -ge "$STALL_MIN" ]; then
-    if [ ! -f "$flag" ] || [ "$(cat "$flag" 2>/dev/null)" != "$li_ts" ]; then
+    if [ ! -f "$observed" ] || [ "$(cat "$observed" 2>/dev/null)" != "$li_ts" ]; then
       log "$key: STALL suspected - inbound $(( now - li_ts ))s ago, no transcript activity since. ALERT-ONLY, no restart. (phone alerts=$STALL_PHONE_ALERTS)"
-      if [ "$STALL_PHONE_ALERTS" = true ]; then
-        alert "I received a message but have shown no transcript activity for 10 minutes. I may be stalled. Please check this bot on the Mac." "$(token_of_state "$sdir")" "$(chat_id_of_state "$sdir")"
+      [ $DRY_RUN -eq 0 ] && printf '%s\n' "$li_ts" > "$observed"
+    fi
+    if [ "$STALL_PHONE_ALERTS" = true ]; then
+      if [ ! -f "$flag" ] || [ "$(cat "$flag" 2>/dev/null)" != "$li_ts" ]; then
+        if alert "I received a message but have shown no transcript activity for 10 minutes. I may be stalled. Please check this bot on the Mac." "$(token_of_state "$sdir")" "$(chat_id_of_state "$sdir")"; then
+          [ $DRY_RUN -eq 0 ] && printf '%s\n' "$li_ts" > "$flag"
+        fi
       fi
-      [ $DRY_RUN -eq 0 ] && printf '%s\n' "$li_ts" > "$flag"
     fi
   else
-    [ $DRY_RUN -eq 0 ] && rm -f "$flag" 2>/dev/null
+    [ $DRY_RUN -eq 0 ] && rm -f "$flag" "$observed" 2>/dev/null
   fi
   return 0
 }

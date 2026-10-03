@@ -222,11 +222,14 @@ describe('email service confirmation', () => {
       const proof = { nonce: payload.nonce, consent_id: payload.consent_id,
         chat: payload.chat, message: payload.message, digest: payload.digest }
       expect(await query({ ...proof, digest: '0'.repeat(64) })).toEqual({ ok: false })
-      expect(await query(proof)).toEqual({ ok: true })
+      expect(await query(proof)).toMatchObject({ ok: true, mac: expect.any(String) })
       expect(await query(proof)).toEqual({ ok: false })
       return { ok: true }
     } })
     const { id } = await h.confirm()
+    const authorityFile = join(state, 'email-authority.json')
+    expect(statSync(authorityFile).mode & 0o777).toBe(0o600)
+    expect(JSON.parse(readFileSync(authorityFile, 'utf8'))).toMatchObject({ port: expect.any(Number), secret: expect.any(String) })
     expect((await h.service.callTool('email_send', { chat_id: '1', consent_id: id, email: fixture }))?.isError).not.toBeTrue()
   })
 

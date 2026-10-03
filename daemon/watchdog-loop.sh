@@ -15,6 +15,17 @@ set -u
 
 FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+STATE="$FLEET_HOME/watchdog-state"
+PID_FILE="$STATE/watchdog-loop.pid"
+umask 077
+mkdir -p "$STATE"
+printf '%s\n' "$$" > "$PID_FILE.tmp.$$"
+mv "$PID_FILE.tmp.$$" "$PID_FILE"
+cleanup() {
+  if [ "$(cat "$PID_FILE" 2>/dev/null)" = "$$" ]; then rm -f "$PID_FILE"; fi
+}
+trap cleanup EXIT
+trap 'exit 0' INT TERM
 
 # watchdog.sh sits beside this file (both installed into $FLEET_HOME/bin).
 if [ -x "$FLEET_HOME/bin/watchdog.sh" ]; then

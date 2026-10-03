@@ -50,7 +50,7 @@ Do not start a second Claude Code channel session with the same bot token. Teleg
 
 ### What needs a human
 
-You do this: create each bot in BotFather; paste its token into the hidden Mac dialog; accept the first-launch folder trust prompt in the bot's Terminal window; match the pairing code on your phone to the Mac dialog and click Pair; click Allow on macOS Automation and Accessibility prompts; complete the phone taps, reaction and, when voice is configured, a voice note in the checklist. Optional email requires your app password, and the phone page requires your Tailscale sign-in. A helper can run the local commands but cannot complete those steps for you.
+You do this: create each bot in BotFather; paste its token into the hidden Mac dialog; accept the first-launch folder trust prompt in the bot's Terminal window; match the pairing code on your phone to the Pair/Ignore dialog and click Pair; click Allow on macOS Automation and Accessibility prompts; complete the phone taps, reaction and, when voice is configured, a voice note in the checklist. If the dialog is unavailable, use the local `fleet-pair` fallback while the code is valid. Optional email requires your app password, and the phone page requires your Tailscale sign-in. A helper can run the local commands but cannot complete those steps for you.
 
 ### More bots
 
@@ -117,7 +117,7 @@ The installed Mac commands live in `~/.claude/telegram-fleet/bin/`. The setup pa
 | 🔥 | Put this at the top of my local priorities list |
 | 👏 | Finish the task, record it as done, then save the summary |
 | 😁 | Explain this simply |
-| 🥰 | Watch this with supported read-only checks for up to 24 hours |
+| 🥰 | Watch this with supported read-only checks for up to 24 hours; a session restart ends the watch |
 
 A reaction from an allowed user in a private chat becomes the matching instruction. Removing a reaction does nothing. A reaction never authorizes an email send. Closed questions may appear as tap bubbles; a tap is sent as your answer. Money and destructive actions need a direct decision, not a bubble.
 

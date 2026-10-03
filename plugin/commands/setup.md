@@ -43,7 +43,7 @@ Tell the user before a Mac dialog opens, so they know to be at the computer. Do 
 
 Run `"$FLEET_HOME/bin/fleet-start" <key>`. You do this: in its new Terminal window, accept the initial folder trust prompt and, if full stance was selected, its permission warning.
 
-You do this: DM the bot from the intended Telegram account. Read out the six-character pairing code. Run `"$FLEET_HOME/bin/fleet-pair" <key> <code> --lock` in this local session. Verify the phone receives Paired, access is allowlist, and the state has .enrolled. Never use the stock access skill from an unrelated session; it can resolve the wrong bot's state.
+You do this: DM the bot from the intended Telegram account. `fleet-start` watches for its new six-character pairing code and opens a Pair/Ignore dialog on the Mac. Check that the code matches your phone, then click Pair. Verify the phone receives Paired, access is allowlist, and the state has .enrolled. If the dialog is unavailable, run `"$FLEET_HOME/bin/fleet-pair" <key> <code> --lock` locally while the code is valid. Never use the stock access skill from an unrelated session; it can resolve the wrong bot's state.
 
 You do this: send hi from the phone. Verify the acknowledgement reaction, live box and reply. A running process alone is not a completed setup.
 

@@ -103,7 +103,10 @@ describe('UX and reply behavior', () => {
     expect(replyButtons(['1234567890123', 'b', 'c'])!.inline_keyboard.map(row => row.length)).toEqual([2, 1])
     expect(replyButtons(['1234567890123456789', 'b', 'c'])!.inline_keyboard.map(row => row.length)).toEqual([1, 1, 1])
     expect(replyButtons(['a', 'b', 'c', 'd'])!.inline_keyboard[1][0]).toEqual({ text: 'd', callback_data: 'qr:1:0' })
-    for (const raw of [5, 'yes', [''], [null], [1], ['x'.repeat(41)], Array(7).fill('yes')]) expect(() => replyButtons(raw)).toThrow()
+    for (const raw of [5, 'yes', [''], [null], [1], ['x'.repeat(41)], Array(7).fill('yes'),
+      ['/fresh\nExplain this command'], ['/model\rstart'], ['tab\tlabel'], ['hidden\u0000label'], ['delete\u007flabel']]) {
+      expect(() => replyButtons(raw)).toThrow()
+    }
     expect(replyButtons([])).toBeUndefined()
     expect(replyButtons(null)).toBeUndefined()
   })
@@ -269,16 +272,23 @@ describe('handoff and resume', () => {
     mkdirSync(join(f.fleet, 'handoffs'))
     writeFileSync(join(f.fleet, 'handoffs', `${id}.md`),
       `HANDOFF from Main to Second - Friday, October 2, 2026\nTITLE: Offline fixture\nRECOMMENDED EFFORT: low\nNOTE-ID: ${id}\nSOURCE-KEY: main\nTARGET-KEY: second\nPrivate note body stays out of events.\n`, { mode: 0o600 })
-    expect((await f.tb.callTool('handoff_receipt', { note_id: id, phase: 'received' }))?.isError).toBe(true)
-    expect((await f.tb.callTool('handoff_receipt', { note_id: id, phase: 'sent' }))?.isError).not.toBe(true)
+    expect((await f.tb.callTool('handoff_receipt', { note_id: id, phase: 'received', delivery_id: 'f'.repeat(24) }))?.isError).toBe(true)
+    const issued = await f.tb.callTool('handoff_receipt', { note_id: id, phase: 'issue' })
+    expect(issued?.isError).not.toBe(true)
+    if (issued?.content[0]?.type !== 'text') throw Error('Issue receipt missing text')
+    const delivery = /Delivery ID: ([a-f0-9]{24})/.exec(issued.content[0].text)?.[1]
+    expect(delivery).toMatch(/^[a-f0-9]{24}$/)
+    expect(readFileSync(join(f.fleet, 'handoffs', `${id}.md`), 'utf8')).toContain(`DELIVERY-ID: ${delivery}`)
+    expect((await f.tb.callTool('handoff_receipt', { note_id: id, phase: 'sent', delivery_id: delivery }))?.isError).not.toBe(true)
     const second = init({ bot: f.bot, stateDir: f.fleetBots[1]!.state_dir, token: 'offline-test-token', fleetHome: f.fleet,
       mcp: { notification: async () => {} }, loadAccess: () => ({}), assertAllowedChat: () => {} }) as TelebotsModule
     try {
-      expect((await second.callTool('handoff_receipt', { note_id: id, phase: 'received' }))?.isError).not.toBe(true)
+      expect((await second.callTool('handoff_receipt', { note_id: id, phase: 'received', delivery_id: delivery }))?.isError).not.toBe(true)
+      expect((await second.callTool('handoff_receipt', { note_id: id, phase: 'received', delivery_id: delivery }))?.isError).toBe(true)
       const received = readFileSync(join(f.fleetBots[1]!.state_dir, 'logs', 'poller-events.log'), 'utf8')
-      expect(received).toContain(`HANDOFF-RECEIVED id=${id} source=main target=second`)
+      expect(received).toContain(`HANDOFF-RECEIVED id=${id} source=main target=second delivery=${delivery}`)
       expect(received).not.toContain('Private note body')
-      expect(f.events().some(event => event.includes(`HANDOFF-SENT id=${id} source=main target=second`))).toBe(true)
+      expect(f.events().some(event => event.includes(`HANDOFF-SENT id=${id} source=main target=second delivery=${delivery}`))).toBe(true)
     } finally { second.dispose() }
   })
   test('handoff dynamically reads the fleet, displays status and excludes self twice', async () => {

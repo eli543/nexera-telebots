@@ -37,9 +37,20 @@ def main(argv):
     parser.add_argument("key", help="bot key from fleet.json")
     parser.add_argument("code", help="six-character code shown by the bot")
     parser.add_argument("--lock", action="store_true", help="set allowlist policy and enroll this bot in the watchdog")
+    parser.add_argument("--expect-sender", help=argparse.SUPPRESS)
+    parser.add_argument("--expect-created", help=argparse.SUPPRESS)
+    parser.add_argument("--expect-policy", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9]{6}", args.code):
         print("fleet-pair: code must be six letters or numbers", file=sys.stderr)
+        return 2
+    snapshot = (args.expect_sender, args.expect_created, args.expect_policy)
+    if any(value is not None for value in snapshot) and (
+            not all(value is not None for value in snapshot)
+            or not re.fullmatch(r"[0-9]{1,20}", args.expect_sender)
+            or not re.fullmatch(r"[0-9]{1,16}", args.expect_created)
+            or args.expect_policy != "pairing"):
+        print("fleet-pair: invalid dialog snapshot", file=sys.stderr)
         return 2
     home = Path(os.environ.get("FLEET_HOME", "~/.claude/telegram-fleet")).expanduser().resolve()
     helper = home / "bin" / "fleet-config"
@@ -62,6 +73,12 @@ def main(argv):
                 return 3
             sender = str(item.get("senderId", ""))
             chat = str(item.get("chatId", ""))
+            if args.expect_sender is not None and (
+                    sender != args.expect_sender
+                    or str(item.get("createdAt", "")) != args.expect_created
+                    or access.get("dmPolicy") != args.expect_policy):
+                print("fleet-pair: pairing request changed since the local dialog opened", file=sys.stderr)
+                return 3
             if not re.fullmatch(r"[0-9]{1,20}", sender) or not re.fullmatch(r"-?[0-9]{1,20}", chat):
                 print("fleet-pair: pending entry has an invalid sender or chat", file=sys.stderr)
                 return 3
