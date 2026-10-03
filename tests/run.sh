@@ -53,11 +53,14 @@ PY
   touch "$unit_root/.telebots-sandbox"
   mkdir -p "$unit_root/home" "$unit_root/tmp" "$unit_root/cache" "$unit_root/tools" "$unit_root/logs" "$unit_root/inputs"
   cp -R "$ROOT/tests/sandbox/shims" "$unit_root/shims"
-  /usr/bin/python3 - "$ROOT" "$unit_root/repo" <<'PY'
-import shutil
+  /usr/bin/python3 - "$ROOT" "$unit_root/repo" "$unit_root/inputs/repo-files.nul" <<'PY'
+from pathlib import Path
 import sys
-shutil.copytree(sys.argv[1], sys.argv[2], symlinks=True,
-                ignore=shutil.ignore_patterns('.git', 'node_modules', '__pycache__', '*.pyc'))
+sys.path.insert(0, str(Path(sys.argv[1]) / "tests/sandbox"))
+from repo_files import copy_files, git_paths, write_manifest
+
+source, destination, manifest = map(Path, sys.argv[1:])
+write_manifest(manifest, copy_files(source, destination, git_paths(source)))
 PY
   if [ -n "$stock_source" ]; then
     cp "$stock_source" "$unit_root/inputs/stock-server.ts"
@@ -108,7 +111,7 @@ fi
 
 HOOK_TEST_DIR="$ROOT/tests/hooks"
 echo "== Python unit tests =="
-for test in "$HOOK_TEST_DIR"/*.test.py "$ROOT/tests/engine"/*.test.py "$ROOT/tests/engine"/test_*.py "$ROOT/tests/ops"/*.test.py "$ROOT/tests/ops"/test_*.py; do
+for test in "$HOOK_TEST_DIR"/*.test.py "$ROOT/tests/engine"/*.test.py "$ROOT/tests/engine"/test_*.py "$ROOT/tests/ops"/*.test.py "$ROOT/tests/ops"/test_*.py "$ROOT/tests/sandbox"/*.test.py; do
   [ -f "$test" ] || continue
   case "$test" in
     */streamer-smoke.test.py) python3 "$test" --require-404-fallback ;;
