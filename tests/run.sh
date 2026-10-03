@@ -21,6 +21,8 @@ shutil.copytree(sys.argv[1], sys.argv[2], symlinks=True,
 PY
   if [ -n "${TELEBOTS_STOCK_SERVER_SOURCE:-}" ]; then
     cp "$TELEBOTS_STOCK_SERVER_SOURCE" "$unit_root/inputs/stock-server.ts"
+  elif [ -f "$base/inputs/stock-server.ts" ]; then
+    cp "$base/inputs/stock-server.ts" "$unit_root/inputs/stock-server.ts"
   fi
   if [ -n "${TELEBOTS_LIVE_STREAMER_SOURCE:-}" ]; then
     cp "$TELEBOTS_LIVE_STREAMER_SOURCE" "$unit_root/inputs/live-tg-stream.py"
