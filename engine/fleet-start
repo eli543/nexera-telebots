@@ -75,7 +75,7 @@ watch_for_pairing() {
     if [[ -n "$code" ]]; then
       if ! choice="$(osascript -e 'on run argv' \
         -e 'set messageText to "A Telegram user sent pairing code " & (item 1 of argv) & " to " & (item 2 of argv) & ". Pair and lock the allowlist to them?"' \
-        -e 'return button returned of (display dialog messageText buttons {"Ignore", "Pair"} default button "Pair" with icon caution)' \
+        -e 'return button returned of (display dialog messageText buttons {"Ignore", "Pair"} default button "Ignore" with icon caution)' \
         -e 'end run' -- "$code" "$KEY" 2>/dev/null)"; then
         echo "fleet-start: local pairing dialog was unavailable. Use fleet-pair locally while the code is valid." >&2
         return 1
