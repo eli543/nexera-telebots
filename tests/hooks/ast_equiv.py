@@ -4,6 +4,7 @@
 Comments and docstrings do not affect this check. The only permitted differences
 are the public configuration, local timezone and optional AI extras adaptations.
 The fingerprint file contains hashes, never source text or private paths.
+Regenerate it from the pinned source with --write-baseline <live-path>.
 """
 
 import argparse
@@ -23,6 +24,7 @@ ALLOWED_FUNCTIONS = {
     "_models_keychain_key": "Use the optional public key service without an account pin.",
     "_models_cache_maybe_refresh": "Refresh only when optional AI extras are enabled.",
     "_models_refresh_main": "Require a bot session and optional AI extras before refreshing.",
+    "_apply_rich_result": "HTTP 404 from a rich endpoint falls back to plain text.",
 }
 ALLOWED_CONSTANTS = {
     "BOT_IDENTITIES": "The private identity table is empty; configuration supplies names.",
@@ -90,16 +92,24 @@ def compare(reference, port):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--live", type=Path, help="Optional read-only original v30.22 source")
+    source_group = parser.add_mutually_exclusive_group()
+    source_group.add_argument("--live", type=Path, help="Optional read-only original v30.22 source")
+    source_group.add_argument("--write-baseline", type=Path,
+                              help="Regenerate the fixture from the pinned read-only v30.22 source")
     parser.add_argument("--port", type=Path, default=PORT)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     baseline = json.loads(BASELINE.read_text())
-    if args.live:
-        raw = args.live.read_bytes()
+    live_source = args.live or args.write_baseline
+    if live_source:
+        raw = live_source.read_bytes()
         if hashlib.sha256(raw).hexdigest() != baseline["source_sha256"]:
             raise SystemExit("FAIL: reference source is not the pinned v30.22 input")
         reference = fingerprints(raw.decode())
+        if args.write_baseline:
+            baseline["ast"] = reference
+            BASELINE.write_text(json.dumps(baseline, indent=2, sort_keys=True) + "\n")
+            print("Wrote pinned v30.22 AST fixture: " + str(BASELINE))
     else:
         reference = baseline["ast"]
     source = args.port.read_text()

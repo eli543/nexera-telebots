@@ -95,7 +95,14 @@ RESTART_STATE="$FLEET_HOME/restart-state"
 WATCHDOG_LOG="$FLEET_HOME/logs/watchdog.log"
 # Locks live under /tmp (cleared at boot), named for this fleet so parallel fleets
 # or a test run never collide. fleet-fresh and fleet-snapshot use the same names.
-LOCK_BASE="/tmp/nexera-telebots-$(printf '%s' "$FLEET_HOME" | cksum | awk '{print $1}')"
+LOCK_ROOT=/tmp
+if [[ ${TELEBOTS_TEST:-} == 1 ]]; then
+  case "${TMPDIR:-}" in
+    "${TELEBOTS_SANDBOX_ROOT:?}"/*) LOCK_ROOT="${TMPDIR%/}" ;;
+    *) echo "The test lock directory is outside the sandbox." >&2; exit 8 ;;
+  esac
+fi
+LOCK_BASE="$LOCK_ROOT/nexera-telebots-$(printf '%s' "$FLEET_HOME" | cksum | awk '{print $1}')"
 FLEET_LOCK="$LOCK_BASE-fleet-lock"   # the snapshot/restore transaction lock
 RESTORE_WAIT=120        # seconds each launched bot gets to come back before it counts as failed
 LOCK_STALE=180          # must match fleet-fresh: a restart lock that records NO pid and is older than this belonged to a crashed run

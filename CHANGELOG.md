@@ -38,6 +38,8 @@ Prepared Friday, October 2, 2026. The release date will be set after integration
 - `/usage` deduplicates transcript usage by message and request and includes subagent transcripts in fleet token burn.
 - Slash commands use installed engine paths rather than the location of the clone. Hooks are inert outside bot sessions.
 - Doctor and troubleshooting guidance cover overlay status, token duplication, exact logs and Claude Code version gates.
+- The installer carries the overlay verifier and patch files into the installed fleet. Doctor accepts the empty bot list that installation creates.
+- Rich message HTTP 404 falls back to plain text. Email sends require the exact, fresh consent record and full SMTP acceptance.
 
 ### Removed
 

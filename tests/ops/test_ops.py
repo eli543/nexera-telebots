@@ -1,11 +1,14 @@
 """Offline WP4 checks. Run with a scrubbed HOME and no Telegram token."""
 
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import socketserver
 import subprocess
@@ -14,6 +17,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[2]
@@ -139,9 +143,11 @@ class OfflineOps(unittest.TestCase):
         self.email.atomic_json(self.email.CONFIG, c)
         state = self.fleet / "bot-main"
         state.mkdir()
+        self.email.atomic_json(state / "access.json", {"dmPolicy": "allowlist", "allowFrom": ["123"]})
         self.email.atomic_json(self.fleet / "fleet.json", {"version": 2, "bots": [
             {"key": "main", "state_dir": str(state)}]})
-        with patch.object(self.email, "password", return_value="fake-only"):
+        with patch.dict(os.environ, {"TELEGRAM_STATE_DIR": str(state)}), \
+             patch.object(self.email, "password", return_value="fake-only"):
             self.assertEqual(self.email.builtin("test", {}, c)["sent"], False)
             inbox = self.email.builtin("inbox", {"limit": 5}, c)
             self.assertEqual(inbox[0]["subject"], "Sample")
@@ -152,10 +158,13 @@ class OfflineOps(unittest.TestCase):
                      "subject": "Exact", "body": "One time"}
             consent_id = "a" * 24
             self.email.atomic_json(state / "consents.json", {consent_id: {
-                "phase": "consumed", "expires": time.time() * 1000 + 600000,
+                "id": consent_id, "chat": "123", "message": 42,
+                "phase": "consumed", "expires": int(time.time() * 1000) + 600000,
                 "email": value, "digest": self.email.digest(value)}})
             request = {"bot": "main", "consent_id": consent_id, "email": value}
-            self.assertEqual(self.email.builtin("send", request, c)["status"], "smtp-accepted")
+            answer = self.email.builtin("send", request, c)
+            self.assertEqual(answer["status"], "smtp-accepted")
+            self.assertIs(answer["ok"], True)
             self.assertEqual(SMTP.sent, 1)
             with self.assertRaises(ValueError):
                 self.email.builtin("send", request, c)
@@ -163,6 +172,78 @@ class OfflineOps(unittest.TestCase):
             bad = dict(request, email=dict(value, subject="Changed"))
             with self.assertRaises(ValueError):
                 self.email.builtin("send", bad, c)
+
+    def test_email_contract_digest_and_fresh_consent_checks(self):
+        email = {"to": ["demo@example.invalid"], "subject": "DEMO café ✉",
+                 "body": "Line one\nLine two"}
+        self.assertEqual(self.email.digest(email),
+                         "d5e25cc947ef111213510e5b11d285e3109c062b94923f04500d7dd9a8ae9573")
+        self.assertEqual(self.email.digest({"body": email["body"], "cc": [], "bcc": [],
+                                            "subject": email["subject"], "to": email["to"]}),
+                         self.email.digest(email))
+        state = self.fleet / "bot-main"
+        state.mkdir()
+        self.email.atomic_json(self.fleet / "fleet.json", {"version": 2, "bots": [
+            {"key": "main", "state_dir": str(state)}]})
+        self.email.atomic_json(state / "access.json", {"dmPolicy": "allowlist", "allowFrom": ["123"]})
+        consent_id = "b" * 24
+        record = {"id": consent_id, "chat": "123", "message": 42, "phase": "consumed",
+                  "expires": int(time.time() * 1000) + 600000,
+                  "email": self.email.canonical_email(email), "digest": self.email.digest(email)}
+        path = state / "consents.json"
+        request = {"bot": "main", "consent_id": consent_id, "email": email}
+        with patch.dict(os.environ, {"TELEGRAM_STATE_DIR": str(state)}):
+            self.email.atomic_json(path, {consent_id: record})
+            self.assertEqual(self.email.checked_send(request)[0], self.email.canonical_email(email))
+            for change in ({"id": "c" * 24}, {"chat": "124"}, {"message": 0},
+                           {"expires": int(time.time() * 1000)}, {"phase": "authorized"}):
+                self.email.atomic_json(path, {consent_id: dict(record, **change)})
+                with self.assertRaises(ValueError):
+                    self.email.checked_send(request)
+            self.email.atomic_json(path, {consent_id: record})
+            path.chmod(0o644)
+            with self.assertRaises(ValueError):
+                self.email.checked_send(request)
+            path.chmod(0o600)
+            self.email.atomic_json(state / "access.json", {"dmPolicy": "allowlist", "allowFrom": []})
+            with self.assertRaises(ValueError):
+                self.email.checked_send(request)
+        with patch.dict(os.environ, {"TELEGRAM_STATE_DIR": str(self.home)}):
+            with self.assertRaises(ValueError):
+                self.email.checked_send(request)
+
+    def test_custom_adapter_claims_its_own_attempt(self):
+        state = self.fleet / "bot-main"
+        state.mkdir()
+        self.email.atomic_json(self.fleet / "fleet.json", {"version": 2, "bots": [
+            {"key": "main", "state_dir": str(state)}]})
+        self.email.atomic_json(state / "access.json", {"dmPolicy": "allowlist", "allowFrom": ["123"]})
+        value = {"to": ["demo@example.invalid"], "subject": "DEMO", "body": "Do not send"}
+        consent_id = "c" * 24
+        self.email.atomic_json(state / "consents.json", {consent_id: {
+            "id": consent_id, "chat": "123", "message": 42, "phase": "consumed",
+            "expires": int(time.time() * 1000) + 600000,
+            "email": self.email.canonical_email(value), "digest": self.email.digest(value)}})
+        adapter = self.root / "custom-adapter"
+        adapter.write_text("#!/usr/bin/env python3\nimport json, os, pathlib, sys\n"
+                           "req = json.load(sys.stdin)\n"
+                           "path = pathlib.Path(os.environ['TELEGRAM_STATE_DIR']) / 'mail-attempts' / req['consent_id']\n"
+                           "path.parent.mkdir(mode=0o700, exist_ok=True)\n"
+                           "fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)\n"
+                           "os.close(fd)\nprint(json.dumps({'ok': True}))\n")
+        adapter.chmod(0o700)
+        self.email.atomic_json(self.email.CONFIG, {"enabled": True, "backend": str(adapter)})
+        request = {"bot": "main", "consent_id": consent_id, "email": value}
+        with patch.dict(os.environ, {"TELEGRAM_STATE_DIR": str(state)}), \
+             patch.object(self.email.sys, "stdin", io.StringIO(json.dumps(request))):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(self.email.main(["fleet-email", "send"]), 0)
+            self.assertIs(json.loads(output.getvalue())["ok"], True)
+        self.assertEqual((state / "mail-attempts" / consent_id).stat().st_mode & 0o777, 0o600)
+        with patch.dict(os.environ, {"TELEGRAM_STATE_DIR": str(state)}), \
+             patch.object(self.email.sys, "stdin", io.StringIO(json.dumps(request))):
+            self.assertEqual(self.email.main(["fleet-email", "send"]), 1)
 
     def test_email_setup_uses_keychain_prompt_and_saves_no_password(self):
         answers = ["mail.example.test", "993", "smtp.example.test", "465", "ssl",
@@ -181,6 +262,12 @@ class OfflineOps(unittest.TestCase):
         self.assertNotIn("password", saved.lower())
         self.assertEqual((self.fleet / "email.json").stat().st_mode & 0o777, 0o600)
 
+    def test_email_help_is_safe_before_account_setup(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(self.email.main(["fleet-email", "--help"]), 0)
+        self.assertIn("Exit codes", output.getvalue())
+
     def test_checklist_rows_and_event_evidence(self):
         self.assertEqual(len(self.checklist.ROWS), 27)
         self.assertEqual([code for code, _, _ in self.checklist.ROWS],
@@ -195,6 +282,27 @@ class OfflineOps(unittest.TestCase):
         self.assertEqual(self.checklist.phone_row("P2", state, self.fleet / "notes", 1, False, False)["status"], "Passed")
         self.assertEqual(self.checklist.phone_row("P13", state, self.fleet / "notes", 1, False, False)["status"], "Not configured")
         self.assertEqual(self.checklist.phone_row("P7", state, self.fleet / "notes", 1, False, False)["status"], "Needs your action")
+
+    def test_first_reply_and_guardian_use_the_hooks_actual_evidence(self):
+        state = self.fleet / "bot-main"
+        logs = state / "logs"
+        stream = state / "stream"
+        logs.mkdir(parents=True)
+        stream.mkdir()
+        stamp = "2026-10-02T18:00:00-04:00 "
+        (logs / "poller-events.log").write_text(stamp + "INBOUND kind=text\n" + stamp + "TAP family=qr cell=0:0\n")
+        (logs / "ack.log").write_text(stamp + "ACK ok=true\n")
+        (stream / "state.json").write_text(json.dumps({"rich_box": True, "msgid": "101", "mission": "Check the demo"}))
+        (state / "reply_guard_turn").write_text("turn-1")
+        (state / "reply_guard_sent").write_text("turn-1")
+        self.assertEqual(self.checklist.phone_row("P1", state, self.fleet / "notes", 1, False, False)["status"], "Passed")
+        (state / "reply_guard_sent").write_text("different-turn")
+        self.assertEqual(self.checklist.phone_row("P1", state, self.fleet / "notes", 1, False, False)["status"], "Needs your action")
+        (state / "reply_guard_sent").write_text("turn-1")
+        (logs / "guardian.log").write_text(stamp + "GUARDIAN reason=8 pct=61 threshold=60 ok=true\n")
+        self.assertEqual(self.checklist.phone_row("P12", state, self.fleet / "notes", 1, False, False)["status"], "Passed")
+        (logs / "guardian.log").write_text(stamp + "GUARDIAN reason=7 pct=61 threshold=60 ok=false\n")
+        self.assertEqual(self.checklist.phone_row("P12", state, self.fleet / "notes", 1, False, False)["status"], "Needs your action")
 
     def test_crash_probe_matches_only_the_selected_state(self):
         state = self.fleet / "bot-main"
@@ -224,6 +332,107 @@ class OfflineOps(unittest.TestCase):
                              "Passed", code)
         (logs / "sessions.log").write_text("render count=2 labels=0\n")
         self.assertEqual(self.checklist.phone_row("P6", state, notes, 1, False, False)["status"], "Needs your action")
+
+    def test_checklist_cli_dry_run_and_recorded_sandbox_evidence(self):
+        state = self.fleet / "bot-main"
+        work = self.fleet / "work-main"
+        logs = state / "logs"
+        stream = state / "stream"
+        notes = self.fleet / "notes"
+        for path in (logs, stream, work, notes, self.fleet / "bin"):
+            path.mkdir(parents=True)
+        (self.fleet / "fleet.json").write_text(json.dumps({"version": 2, "bots": [
+            {"key": "main", "name": "Main", "state_dir": str(state), "workdir": str(work)}],
+            "options": {"voice": "off", "notes_dir": str(notes)}}))
+        (state / ".env").write_text("TELEGRAM_BOT_TOKEN=fake-checklist-token\n")
+        (state / "access.json").write_text('{"dmPolicy":"allowlist","allowFrom":["123"]}\n')
+        (state / ".enrolled").touch()
+        (state / "poller.heartbeat").write_text(str(int(time.time())))
+        (state / "reply_guard_turn").write_text("turn-1")
+        (state / "reply_guard_sent").write_text("turn-1")
+        (stream / "state.json").write_text(json.dumps({"rich_box": True, "msgid": 10, "mission": "Test"}))
+        stamp = "2026-10-02T18:00:00-04:00 "
+        events = ("INBOUND kind=text", "TAP family=qr cell=0:0", "REACTION emoji=heart",
+                  "KEY", "PICKER kind=model", "CLOSE kind=model", "PICKER kind=effort",
+                  "CLOSE kind=effort", "CLOSE kind=resume", "INTERCEPT cmd=esc",
+                  "INTERCEPT cmd=context", "INTERCEPT cmd=usage")
+        (logs / "poller-events.log").write_text("".join(stamp + event + "\n" for event in events))
+        (logs / "ack.log").write_text(stamp + "ACK ok=true\n")
+        (logs / "guardian.log").write_text(stamp + "GUARDIAN reason=8 pct=61 threshold=60 ok=true\n")
+        for name, line in {"sessions.log": "count=2 labels=2", "update.log": "update complete",
+                           "fresh.log": "back-online ping sent", "esc.log": "key landed",
+                           "context.log": "context report", "usage.log": "usage report",
+                           "compact.log": "exit 0"}.items():
+            (logs / name).write_text(line + "\n")
+        (notes / "2026-10-02.md").write_text("Saved fake reaction\n")
+        bin_dir = self.fleet / "bin"
+        for name, body in {"verify-overlay.sh": "echo OK", "fleet-state": "echo '[{\"key\":\"main\",\"up\":true}]'",
+                           "fleet-fresh": "exit 0", "fleet-doctor": "exit 0"}.items():
+            path = bin_dir / name
+            path.write_text("#!/bin/sh\n" + body + "\n")
+            path.chmod(0o700)
+        (self.fleet / "ux.json").write_text('{}\n')
+        claude_dir = self.home / ".claude"
+        (claude_dir / "plugins/cache/claude-plugins-official/telegram/0.0.7").mkdir(parents=True)
+        (claude_dir / "plugins/cache/claude-plugins-official/telegram/0.0.7/server.ts").touch()
+        (claude_dir / "plugins/installed_plugins.json").write_text(
+            '{"plugins":{"telegram-fleet@nexera-telebots":[]}}\n')
+        (claude_dir / "settings.json").write_text('{"enabledPlugins":{"telegram-fleet@nexera-telebots":true}}\n')
+        shims = self.root / "shims"
+        shims.mkdir()
+        claude = shims / "claude"
+        claude.write_text("#!/bin/sh\necho 2.1.286\n")
+        claude.chmod(0o700)
+        commands = list(self.checklist.COMMANDS)
+
+        class FakeTelegram(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.answer()
+
+            def do_POST(self):
+                self.answer()
+
+            def answer(self):
+                method = self.path.rsplit("/", 1)[-1]
+                if method == "getMe":
+                    result = {"username": "sandbox_bot"}
+                elif method == "getWebhookInfo":
+                    result = {"allowed_updates": ["message", "callback_query", "message_reaction"]}
+                elif method == "getMyCommands":
+                    result = [{"command": name} for name in commands]
+                else:
+                    self.send_error(404)
+                    return
+                data = json.dumps({"ok": True, "result": result}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FakeTelegram)
+        self.addCleanup(server.server_close)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        env = dict(os.environ, HOME=str(self.home), FLEET_HOME=str(self.fleet),
+                   TELEBOTS_API_BASE=f"http://127.0.0.1:{server.server_port}",
+                   PATH=str(shims) + ":/usr/bin:/bin:/usr/sbin:/sbin")
+        cli = str(REPO / "engine/fleet-checklist")
+        dry = subprocess.run(["python3", cli, "--dry-run"], env=env, text=True, capture_output=True)
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertEqual(sum(line.startswith(("A", "P")) for line in dry.stdout.splitlines()), 27)
+        recorded = subprocess.run(["python3", cli, "main", "--recorded-evidence"],
+                                  env=env, text=True, capture_output=True)
+        self.assertEqual(recorded.returncode, 0, recorded.stdout + recorded.stderr)
+        results = json.loads((self.fleet / "checklist-main.json").read_text())["rows"]
+        self.assertEqual(len(results), 27)
+        self.assertEqual(sum(value["status"] == "Passed" for value in results.values()), 19)
+        self.assertEqual({key for key, value in results.items() if value["status"] == "Not configured"},
+                         {"A8", "A9", "A11", "P7", "P13", "P14", "P15", "P16"})
 
     def test_voice_dispatch_and_daemon_path_guard(self):
         voice = load_script("voice_dispatch", REPO / "voice/transcribe-voice")
@@ -429,6 +638,99 @@ class OfflineOps(unittest.TestCase):
                                  env=env, capture_output=True, text=True, check=False)
         self.assertIn("dry", restore.stdout.lower() + restore.stderr.lower())
         self.assertNotIn("osascript", blocked.read_text() if blocked.exists() else "")
+
+    def test_snapshot_restore_transaction_and_health_gate_in_sandbox(self):
+        state = self.fleet / "bot-main"
+        work = self.fleet / "work-main"
+        state.mkdir()
+        work.mkdir()
+        (self.fleet / "fleet.json").write_text(json.dumps({"version": 2, "bots": [
+            {"key": "main", "name": "Main", "state_dir": str(state), "workdir": str(work)}]}) + "\n")
+        bin_dir = self.fleet / "bin"
+        bin_dir.mkdir()
+        for name in ("fleet-config", "fleet-launch", "fleet-fresh"):
+            shutil.copy2(REPO / "engine" / name, bin_dir / name)
+        project = subprocess.run([str(bin_dir / "fleet-config"), "project-dir", "main"],
+                                 env=dict(os.environ, HOME=str(self.home), FLEET_HOME=str(self.fleet)),
+                                 text=True, capture_output=True, check=True).stdout.strip()
+        Path(project).mkdir(parents=True)
+        session = "11111111-2222-3333-4444-555555555555"
+        (state / "session.id").write_text(session + "\n")
+        (Path(project) / (session + ".jsonl")).write_text('{}\n')
+        (state / "poller.heartbeat").write_text(str(int(time.time())))
+        mode = self.root / "process-mode"
+        mode.write_text("down")
+        shims = self.root / "shims"
+        shims.mkdir()
+        ps = shims / "ps"
+        ps.write_text("#!/bin/sh\n"
+                      f'mode=$(cat "{mode}")\n'
+                      'if [ "$1" = "-p" ]; then echo "Fri Oct  2 12:00:00 2026"; exit 0; fi\n'
+                      'if [ "$1" = "-axo" ]; then\n'
+                      '  if [ "$mode" = up ]; then\n'
+                      '    echo "111 claude --channels plugin:telegram@claude-plugins-official"\n'
+                      '    echo "222 bun server.ts"\n'
+                      '  fi\n  exit 0\nfi\n'
+                      f'if [ "$1" = eww ]; then echo "TELEGRAM_STATE_DIR={state}"; exit 0; fi\n'
+                      'if [ "$1" = "-o" ] && [ "$2" = etime= ]; then echo 00:05; exit 0; fi\n'
+                      'if [ "$1" = "-o" ] && [ "$2" = ppid= ]; then echo 111; exit 0; fi\n'
+                      'exit 1\n')
+        ps.chmod(0o700)
+        osa_log = self.root / "osascript-calls"
+        osascript = shims / "osascript"
+        osascript.write_text(f'#!/bin/sh\necho attempted >> "{osa_log}"\nexit 1\n')
+        osascript.chmod(0o700)
+        bash_env = self.root / "bash-env"
+        bash_env.write_text('kill() { [ "$1" = -0 ] && return 0; return 1; }\n')
+        site = self.root / "python-site"
+        site.mkdir()
+        (site / "sitecustomize.py").write_text("import os\nos.kill = lambda pid, sig: None\n")
+        env = dict(os.environ, HOME=str(self.home), FLEET_HOME=str(self.fleet),
+                   BASH_ENV=str(bash_env), PYTHONPATH=str(site),
+                   PATH=str(shims) + ":/usr/bin:/bin:/usr/sbin:/sbin")
+        env.pop("TELEGRAM_BOT_TOKEN", None)
+        original = (REPO / "engine/fleet-restore").read_text()
+        self.assertEqual(original.count("/usr/bin/osascript"), 1)
+        safe_restore = self.root / "fleet-restore-sandbox"
+        safe_restore.write_text(original.replace("/usr/bin/osascript", str(osascript)))
+        safe_restore.chmod(0o700)
+
+        def call(script, *args):
+            return subprocess.run(["/bin/bash", str(script), *args], env=env,
+                                  capture_output=True, text=True, timeout=30, check=False)
+
+        snapshot = call(REPO / "engine/fleet-snapshot")
+        self.assertEqual(snapshot.returncode, 0, snapshot.stdout + snapshot.stderr)
+        snap = self.fleet / "restart-state/snapshot.tsv"
+        switch = self.fleet / "watchdog-state/main.disabled"
+        self.assertIn("generation=", snap.read_text().splitlines()[0])
+        self.assertTrue(switch.is_file())
+        saved = snap.read_text()
+        snap.write_text(saved.replace(str(work), str(self.root / "wrong-work")))
+        rejected = call(safe_restore)
+        self.assertEqual(rejected.returncode, 2, rejected.stdout + rejected.stderr)
+        self.assertIn("REJECTED", rejected.stdout)
+        self.assertFalse(osa_log.exists())
+        self.assertTrue(switch.is_file())
+        snap.write_text(saved)
+        failed_launch = call(safe_restore)
+        self.assertEqual(failed_launch.returncode, 1, failed_launch.stdout + failed_launch.stderr)
+        self.assertIn("LAUNCH FAILED", failed_launch.stdout)
+        self.assertTrue(snap.is_file())
+        self.assertEqual(osa_log.read_text().splitlines(), ["attempted"])
+        mode.write_text("up")
+        (state / "poller.heartbeat").write_text(str(int(time.time()) - 1000))
+        stale = call(safe_restore)
+        self.assertEqual(stale.returncode, 1, stale.stdout + stale.stderr)
+        self.assertIn("PENDING WATCHDOG", stale.stdout)
+        self.assertTrue(snap.is_file())
+        (state / "poller.heartbeat").write_text(str(int(time.time())))
+        recovered = call(safe_restore)
+        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+        self.assertIn("archived", recovered.stdout)
+        self.assertFalse(snap.exists())
+        self.assertFalse(switch.exists())
+        self.assertEqual(osa_log.read_text().splitlines(), ["attempted"])
 
 
 if __name__ == "__main__":

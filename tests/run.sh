@@ -21,12 +21,18 @@ shutil.copytree(sys.argv[1], sys.argv[2], symlinks=True,
 PY
   if [ -n "${TELEBOTS_STOCK_SERVER_SOURCE:-}" ]; then
     cp "$TELEBOTS_STOCK_SERVER_SOURCE" "$unit_root/inputs/stock-server.ts"
+  elif [ -f "$base/inputs/stock-server.ts" ]; then
+    cp "$base/inputs/stock-server.ts" "$unit_root/inputs/stock-server.ts"
+  fi
+  if [ -n "${TELEBOTS_LIVE_STREAMER_SOURCE:-}" ]; then
+    cp "$TELEBOTS_LIVE_STREAMER_SOURCE" "$unit_root/inputs/live-tg-stream.py"
   fi
   rm -f "$unit_root/shims/bun"
   for tool in bun shellcheck; do
     found="$(command -v "$tool" || true)"
     if [ -n "$found" ]; then ln -s "$found" "$unit_root/tools/$tool"; fi
   done
+  /bin/bash "$ROOT/tests/sandbox/sbenv" "$unit_root" /usr/bin/git -C "$ROOT" diff --check
   exec /bin/bash "$ROOT/tests/sandbox/sbenv" "$unit_root" /bin/bash "$unit_root/repo/tests/run.sh" "$MODE" "$real_home" "$main_checkout"
 fi
 
@@ -61,16 +67,25 @@ else
   echo "actionlint unavailable; Ruby YAML parser passed."
 fi
 
-# One path variable changes when WP3 moves these two tests to tests/hooks/.
-HOOK_TEST_DIR="$ROOT/tests"
+HOOK_TEST_DIR="$ROOT/tests/hooks"
 echo "== Python unit tests =="
 for test in "$HOOK_TEST_DIR"/*.test.py "$ROOT/tests/engine"/*.test.py "$ROOT/tests/engine"/test_*.py "$ROOT/tests/ops"/*.test.py "$ROOT/tests/ops"/test_*.py; do
   [ -f "$test" ] || continue
-  python3 "$test"
+  case "$test" in
+    */streamer-smoke.test.py) python3 "$test" --require-404-fallback ;;
+    *) python3 "$test" ;;
+  esac
 done
 if [ -f "$ROOT/tests/hooks/ast_equiv.py" ]; then
-  python3 "$ROOT/tests/hooks/ast_equiv.py" --self-test
+  if [ -f "$TELEBOTS_SANDBOX_ROOT/inputs/live-tg-stream.py" ]; then
+    python3 "$ROOT/tests/hooks/ast_equiv.py" --live "$TELEBOTS_SANDBOX_ROOT/inputs/live-tg-stream.py" --self-test
+  else
+    python3 "$ROOT/tests/hooks/ast_equiv.py" --self-test
+  fi
 fi
+
+echo "== Documentation commands =="
+/bin/bash "$ROOT/tests/docs-check.sh"
 
 if [ -f poller/telebots.ts ]; then
   echo "== TypeScript and Bun tests =="
@@ -80,11 +95,8 @@ if [ -f poller/telebots.ts ]; then
   if [ -f poller/tsconfig.json ]; then
     bun x tsc --noEmit --project poller/tsconfig.json
   fi
-  if [ "$MODE" = "--unit-only" ]; then
-    bun test tests/poller/module.test.ts tests/poller/email.test.ts
-  else
-    bun test tests/poller
-  fi
+  /bin/bash tests/sandbox/typecheck-overlay.sh
+  bun test tests/poller
 else
   echo "SKIP TypeScript and Bun tests: WP1 poller is not present in this worktree."
 fi
@@ -98,7 +110,11 @@ if [ "$MODE" != "--static-only" ] && [ "$MODE" != "--unit-only" ]; then
   if [ "$MODE" = "--phase1" ]; then
     /bin/bash tests/sandbox/run.sh --base "$(dirname "$TELEBOTS_SANDBOX_ROOT")/scenario-runs" --real-home "${2:?}" --main-checkout "${3:?}" --phase1
   else
-    /bin/bash tests/sandbox/run.sh --base "$(dirname "$TELEBOTS_SANDBOX_ROOT")/scenario-runs" --real-home "${2:?}" --main-checkout "${3:?}"
+    scenario_args=(--base "$(dirname "$TELEBOTS_SANDBOX_ROOT")/scenario-runs" --real-home "${2:?}" --main-checkout "${3:?}" --stock-server "$TELEBOTS_STOCK_SERVER")
+    if [ -f "$TELEBOTS_SANDBOX_ROOT/inputs/live-tg-stream.py" ]; then
+      scenario_args+=(--live-streamer "$TELEBOTS_SANDBOX_ROOT/inputs/live-tg-stream.py")
+    fi
+    /bin/bash tests/sandbox/run.sh "${scenario_args[@]}"
   fi
 fi
 if [ "$privacy_status" -ne 0 ]; then exit "$privacy_status"; fi

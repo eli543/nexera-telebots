@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -123,8 +124,7 @@ def suite(root: Path, command: tuple[str, ...], name: str) -> str:
     (root / "logs" / (name + ".stderr")).write_text(redact.sub("[redacted]", result.stderr))
     if result.returncode:
         raise AssertionError(f"{name} exited {result.returncode}; see sandbox logs")
-    lines = [line for line in result.stdout.splitlines() if line.strip()]
-    return lines[-1] if lines else "exit 0"
+    return result.stdout + result.stderr
 
 
 def integration_suite(root: Path, name: str) -> str:
@@ -138,18 +138,23 @@ def integration_suite(root: Path, name: str) -> str:
                        set((root / "repo/tests/engine").glob("test_*.py")))
         if not tests:
             raise AssertionError("tests/engine has no scenario tests")
-        for test in tests:
-            suite(root, ("python3", str(test)), "engine-" + test.stem)
-        return f"{len(tests)} engine test files passed"
+        return suite(root, ("python3", "-m", "unittest", "discover", "-s", "tests/engine",
+                            "-p", "test_*.py", "-v"), name)
     if name == "hooks":
         tests = sorted((root / "repo/tests/hooks").glob("*.test.py"))
         if not tests:
             raise AssertionError("tests/hooks has no scenario tests")
+        output = ""
         for test in tests:
-            suite(root, ("python3", str(test)), "hooks-" + test.stem)
-        return f"{len(tests)} hook test files passed"
+            args = ("--require-404-fallback",) if test.name == "streamer-smoke.test.py" else ()
+            output += suite(root, ("python3", str(test), *args), "hooks-" + test.stem)
+        live = root / "inputs/live-tg-stream.py"
+        args = ("--live", str(live)) if live.is_file() else ()
+        output += suite(root, ("python3", "tests/hooks/ast_equiv.py", *args, "--self-test"), "hooks-ast")
+        return output
     if name == "ops":
-        return suite(root, ("python3", "tests/ops/test_ops.py"), name)
+        return suite(root, ("python3", "-m", "unittest", "discover", "-s", "tests/ops",
+                            "-p", "test_*.py", "-v"), name)
     raise AssertionError("unknown integration suite")
 
 
@@ -160,6 +165,14 @@ def install(root: Path) -> None:
 
 
 def scenario_1(root: Path) -> str:
+    uv_dir = root / "uv-tools"
+    interpreter = uv_dir / "mlx-whisper/bin/python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("#!/bin/sh\nexit 0\n")
+    interpreter.chmod(0o700)
+    uv = root / "tools/uv"
+    uv.write_text('#!/bin/sh\nif [ "$1" = tool ] && [ "$2" = dir ]; then printf "%s\\n" "$TELEBOTS_SANDBOX_ROOT/uv-tools"; else exit 1; fi\n')
+    uv.chmod(0o700)
     safe = sh(root, "/bin/bash", "-c",
               'test -z "${TELEGRAM_BOT_TOKEN+x}" && '
               'for value in "$HOME" "$FLEET_HOME" "$TELEGRAM_STATE_DIR" "$TMPDIR"; do '
@@ -177,13 +190,52 @@ def scenario_1(root: Path) -> str:
     assert data["version"] == 2 and data["bots"] == []
     assert (fleet / "ux.json").is_file()
     assert (fleet / "bin/fleet-config").is_file()
-    assert not (root / "home/Library/LaunchAgents/com.claude-fleet.watchdog.plist").exists()
+    for name in ("install-overlay.sh", "verify-overlay.sh", "restore-stock.sh",
+                 "overlay-common.sh", "seam-0.0.7.patch", "telebots.ts",
+                 "email.ts", "contracts.ts", "ux.json"):
+        assert (fleet / "bin" / name).is_file(), f"installed overlay support missing: {name}"
+    verified = sh(root, str(fleet / "bin/verify-overlay.sh"), "--status")
+    assert verified.returncode == 0 and verified.stdout.strip() == "OK", verified.stderr
+    reapplied = sh(root, str(fleet / "bin/install-overlay.sh"))
+    assert reapplied.returncode == 0, reapplied.stderr
     assert "launchctl" not in (root / "logs/shims.log").read_text()
-    return "empty fleet, overlay and ux.json installed; no watchdog call"
+    doctor = sh(root, str(fleet / "bin/fleet-doctor"))
+    assert doctor.returncode == 0, doctor.stdout + doctor.stderr
+    assert "[ ok ]  overlay status" in doctor.stdout and "[warn]  bots" in doctor.stdout
+    assert (fleet / "templates/com.claude-fleet.watchdog.plist.template").is_file()
+    with (fleet / "templates/com.claude-fleet.voice.plist.template").open("rb") as stream:
+        voice = plistlib.load(stream)
+    assert voice["ProgramArguments"] == [str(interpreter), str(fleet / "bin/transcribe-voice-daemon")]
+    assert voice["EnvironmentVariables"]["FLEET_HOME"] == str(fleet)
+    assert not (root / "home/Library/LaunchAgents/com.claude-fleet.watchdog.plist").exists()
+    return "empty fleet, installed overlay verifier, watchdog and rendered voice templates; no watchdog call"
+
+
+EVIDENCE = {
+    2: ("overlay", "applies stock, deploys all imports"),
+    3: ("engine", "test_add_bot_validates_before_config_and_hides_token"),
+    4: ("poller", "F2.4 starts the real patched poller"),
+    5: ("poller", "F2.5 retains stock pairing"),
+    6: ("poller", "F2.6-7 delivers text"),
+    7: ("poller", "F2.7 checks private chat"),
+    8: ("poller", "F2.8-9 swaps Send it"),
+    9: ("poller", "F2.8-9 swaps Send it"),
+    10: ("poller", "F2.10 renders the shared legend"),
+    11: ("poller", "F2.11 walks model then effort"),
+    12: ("poller", "F2.12 lists configured peers"),
+    13: ("poller", "F2.13 spawns every intercept"),
+    14: ("poller", "F2.14 downloads and transcribes voice"),
+    15: ("poller", "F2.15 requires exact email"),
+    16: ("engine", "test_compact_classifier_uses_fixture_without_osascript"),
+    17: ("hooks", "PASS: HTTP 404 uses plain fallback"),
+    18: ("ops", "test_watchdog_version_change_alerts_once_without_restarting"),
+    19: ("ops", "test_snapshot_restore_transaction_and_health_gate_in_sandbox"),
+}
 
 
 def scenario_20(root: Path) -> str:
     install(root)
+    prior_launchctl = (root / "logs/shims.log").read_text().count("launchctl")
     agents = root / "home/Library/LaunchAgents"
     agents.mkdir(parents=True)
     for name in ("com.claude-fleet.watchdog.plist", "com.claude-fleet.voice.plist"):
@@ -202,7 +254,7 @@ def scenario_20(root: Path) -> str:
         assert (slot / "server.ts").read_bytes() == expected_stock.read_bytes()
     else:
         assert (slot / "server.ts").read_text() == "stock sandbox fixture\n"
-    assert (root / "logs/shims.log").read_text().count("launchctl") == 2
+    assert (root / "logs/shims.log").read_text().count("launchctl") - prior_launchctl == 2
     return "stock restored; watchdog and voice plists removed; state kept"
 
 
@@ -288,6 +340,7 @@ def main() -> int:
     parser.add_argument("--real-home", type=Path, help="read-only infrastructure snapshot target")
     parser.add_argument("--main-checkout", type=Path, help="read-only git snapshot target")
     parser.add_argument("--stock-server", type=Path, help="verified upstream 0.0.7 server.ts for integration")
+    parser.add_argument("--live-streamer", type=Path, help="read-only pinned live v30.22 source for AST proof")
     args = parser.parse_args()
     if not args.real_home or not args.main_checkout:
         parser.error("--real-home and --main-checkout are required for the untouched check")
@@ -310,36 +363,48 @@ def main() -> int:
         pass_dir = Path(tempfile.mkdtemp(prefix=f"wp5-pass-{turn}-", dir=base))
         results = []
         group_results: dict[str, tuple[str, str]] = {}
+        root = sandbox(pass_dir, 0, args.phase1, stock, bun)
+        if not args.phase1 and args.live_streamer and args.live_streamer.is_file():
+            shutil.copy2(args.live_streamer, root / "inputs/live-tg-stream.py")
         print(f"PASS {turn} root={pass_dir}", flush=True)
         for number, title, required in SCENARIOS:
-            root = sandbox(pass_dir, number, args.phase1, stock, bun)
+            current = sandbox(pass_dir, number, args.phase1, stock, bun) if number == 21 else root
             try:
                 if number == 1:
-                    detail = scenario_1(root)
+                    detail = scenario_1(current)
                     status = "PASS"
                 elif number == 20:
-                    detail = scenario_20(root)
+                    detail = scenario_20(current)
                     status = "PASS"
                 elif number == 21:
-                    detail = scenario_21(root)
+                    detail = scenario_21(current)
                     status = "PASS"
                 elif not args.phase1:
-                    group = (
-                        "overlay" if number == 2 else
-                        "engine" if number in (3, 5, 16) else
-                        "poller" if 4 <= number <= 15 else
-                        "hooks" if number == 17 else
-                        "ops"
-                    )
+                    group, marker = EVIDENCE[number]
                     if group not in group_results:
                         try:
-                            detail = integration_suite(root, group)
-                            group_results[group] = ("PASS", detail)
+                            output = integration_suite(current, group)
+                            group_results[group] = ("PASS", output)
                         except (AssertionError, OSError) as exc:
                             group_results[group] = ("FAIL", str(exc))
-                    status, detail = group_results[group]
+                    status, output = group_results[group]
+                    if status == "PASS" and marker not in output:
+                        status, detail = "FAIL", f"{group} suite lacks assertion: {marker}"
+                    elif status == "PASS":
+                        detail = f"{group} suite assertion: {marker}"
+                    else:
+                        detail = output
+                    if status == "PASS" and number == 12:
+                        guardian = suite(current, ("python3", "tests/hooks/hook-runtime.test.py", "-k", "guardian"), "guardian")
+                        if "test_guardian_61_and_91_single_bot_cells" not in guardian:
+                            status, detail = "FAIL", "single-bot guardian assertion missing"
+                    if status == "PASS" and number == 15:
+                        backend = suite(current, ("python3", "-m", "unittest", "discover", "-s", "tests/ops",
+                                                  "-p", "test_*.py", "-v", "-k", "custom_adapter"), "email-backend")
+                        if "test_custom_adapter_claims_its_own_attempt" not in backend:
+                            status, detail = "FAIL", "email adapter contract assertion missing"
                 else:
-                    detail = scenario_stub(root, number, title, required)
+                    detail = scenario_stub(current, number, title, required)
                     status = "STUB"
             except (AssertionError, OSError) as exc:
                 detail = str(exc)

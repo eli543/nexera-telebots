@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Loopback-only transport and lifecycle checks for the live streamer port.
-
-The optional --require-404-fallback check records a known contract conflict:
-v30.22 retries unsupported rich endpoints instead of switching to plain text.
-"""
+"""Loopback-only transport and lifecycle checks for the streamer port."""
 
 import importlib.util
 import json
@@ -134,18 +130,15 @@ class StreamerSmoke(unittest.TestCase):
         self.assertFalse(streamer.load_state(str(self.sdir)).get("rich_box"))
         print("PASS: rich content refusal uses plain fallback")
 
-    def test_404_retains_live_retry_behavior(self):
+    def test_404_uses_plain_fallback(self):
         self.server.rich_code = 404
         self.prompt()
         st = streamer.load_state(str(self.sdir))
         methods = [method for method, params in self.server.calls]
-        if REQUIRE_404_FALLBACK:
-            self.assertIn("sendMessage", methods,
-                          "F.2 requires 404 fallback; pinned v30.22 does not provide it")
-        else:
-            self.assertNotIn("sendMessage", methods)
-            self.assertTrue(st.get("rich_pending_open"))
-            print("OBSERVED: HTTP 404 leaves a pending rich open; F.2 fallback is unmet")
+        self.assertIn("sendMessage", methods)
+        self.assertFalse(st.get("rich_pending_open"))
+        self.assertFalse(st.get("rich_box"))
+        print("PASS: HTTP 404 uses plain fallback")
 
     def test_429_cooldown_prevents_another_request(self):
         self.server.rich_code = 429

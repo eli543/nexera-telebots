@@ -198,7 +198,7 @@ now=$(date +%s)
 keys=$(fc bots 2>/dev/null || true)
 if [ -z "$keys" ]; then
   echo "--- bots ----------------------------------------------------"
-  row red "bots" "none configured"
+  row warn "bots" "none configured yet (expected after install; run fleet-add-bot)"
 else
   for key in $keys; do
     echo "--- bot: $key ----------------------------------------------"
