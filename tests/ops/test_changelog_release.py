@@ -29,6 +29,11 @@ class ChangelogReleaseTests(unittest.TestCase):
         self.assertIn("user confirms the note", text)
         self.assertNotIn("A handoff passes only when both pollers", text)
 
+    def test_custom_adapter_ids_are_described_without_changing_imap_uids(self):
+        text = (ROOT / "CHANGELOG.md").read_text().split("## [0.2.0]", 1)[0]
+        self.assertIn("opaque message IDs", text)
+        self.assertIn("numeric UIDs", text)
+
 
 if __name__ == "__main__":
     unittest.main()
