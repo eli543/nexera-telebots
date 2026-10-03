@@ -56,7 +56,7 @@ Prepared Friday, October 2, 2026. The release date will be set after integration
 - Fleet notices use one shared sender that distinguishes Telegram acceptance from an attempted or failed send. The update checklist accepts only a confirmed Back and ready response. Telebots Bar reads the engine's accepted, attempted or failed ping status while judging reconnect health separately. The watchdog keeps separate records for stall observed and phone notification accepted; the Mac and phone dashboards show observed stalls even when phone alerts are off, and show `phone notified` only for a matching accepted alert.
 - Uninstall stops the watchdog, waits for its PID file and watchdog repair lock to clear, then rechecks the plugin slot before deciding whether to restore it. It verifies the final stock hash whenever the pinned 0.0.7 slot is present and aborts if that check fails. A failed watchdog stop aborts teardown.
 - Setup and operations copy uses the Pair/Ignore dialog as the normal path, documents the manual pairing fallback and the fleet log locations. `/watch` ends when its session restarts, and `/update` describes the installed build.
-- These are offline checks. Release date and real-phone acceptance remain pending.
+- The dashboard changes have source and fixture checks; Telebots Bar was not built or launched in this fix round. The other release checks are offline. Release date and real Mac and phone acceptance remain pending.
 
 ### Removed
 

@@ -54,6 +54,17 @@ class ChangelogReleaseTests(unittest.TestCase):
         self.assertIn("autotranscribe.off", text)
         self.assertIn("available local backend", text)
 
+    def test_round_d_release_note_limits_device_claims(self):
+        text = (ROOT / "CHANGELOG.md").read_text().split("## [0.2.0]", 1)[0]
+        for phrase in ("rechecks the plugin slot", "user confirms the note",
+                       "opaque message IDs", "ID renewal", "observed stalls",
+                       "accepted, attempted or failed", "autotranscribe.off"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+        self.assertIn("source and fixture checks", text)
+        self.assertIn("Telebots Bar was not built or launched", text)
+        self.assertIn("real Mac and phone acceptance remain pending", text)
+
 
 if __name__ == "__main__":
     unittest.main()
