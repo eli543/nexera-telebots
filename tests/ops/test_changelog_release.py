@@ -44,6 +44,11 @@ class ChangelogReleaseTests(unittest.TestCase):
         self.assertIn("dashboards show observed stalls", text)
         self.assertIn("phone alerts are off", text)
 
+    def test_reconnect_log_status_is_distinct_from_reconnect_outcome(self):
+        text = (ROOT / "CHANGELOG.md").read_text().split("## [0.2.0]", 1)[0]
+        self.assertIn("accepted, attempted or failed", text)
+        self.assertIn("reconnect health", text)
+
 
 if __name__ == "__main__":
     unittest.main()

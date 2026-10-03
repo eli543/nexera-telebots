@@ -1503,9 +1503,17 @@ extension FleetModel {
         var reported: String?
         for line in text.split(separator: "\n").map(String.init) {
             if line.hasPrefix("=== "), line.contains("restart pid=") { ours = line.hasSuffix(marker); reported = nil }
-            if ours, line.contains("back-online ping sent") { reported = line.contains("Continue button attached") ? " with Continue button" : "" }
+            if ours, let markerRange = line.range(of: "back-online ping status=") {
+                let status = line[markerRange.upperBound...].split(separator: " ", maxSplits: 1).first.map(String.init)
+                if ["accepted", "attempted", "failed"].contains(status ?? "") { reported = status }
+            }
             if ours, line == "=== done (exit=0) ===", let reported {
-                return "engine reports \(BotChat.backAndReady) sent\(reported) (engine log; no Bot API receipt retained)"
+                switch reported {
+                case "accepted": return "engine log reports Telegram accepted \(BotChat.backAndReady) (message ID not retained)"
+                case "attempted": return "engine log reports \(BotChat.backAndReady) attempted without Telegram acceptance"
+                case "failed": return "engine log reports \(BotChat.backAndReady) failed to send"
+                default: return nil
+                }
             }
         }
         return nil
