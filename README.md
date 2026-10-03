@@ -77,6 +77,12 @@ The official Telegram plugin must be version 0.0.7 for the overlay. The installe
 
 The official install commands for the command-line prerequisites are `curl -fsSL https://bun.sh/install | bash` for Bun, `curl -LsSf https://astral.sh/uv/install.sh | sh` for uv, and `curl -fsSL https://claude.ai/install.sh | bash` for Claude Code. Review each linked provider guide before running its installer.
 
+## Developer checks
+
+Set `TELEBOTS_SANDBOX_BASE` to a disposable directory outside your home, then run `bash tests/run.sh --all`.
+The runner needs a pinned stock 0.0.7 `server.ts` and automatically finds it in the official marketplace clone or newest plugin cache; set `TELEBOTS_STOCK_SERVER_SOURCE` to a verified copy if neither is available.
+Use `--allow-missing-stock` to run the independent checks when no stock file is available; the poller checks and integration scenarios are reported as skipped.
+
 ## Telegram controls
 
 These are the 13 commands in the private-chat menu, in the order the poller registers them. `/key` also shows the tap and reaction meanings.

@@ -4,7 +4,10 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 sandbox="${TELEBOTS_SANDBOX_ROOT:?Run through tests/sandbox/sbenv}"
 stock="${TELEBOTS_STOCK_SERVER:?Set the pinned stock server input}"
-test -f "$stock"
+if [ ! -f "$stock" ]; then
+  printf 'Pinned stock server.ts is missing: %s (set TELEBOTS_STOCK_SERVER_SOURCE before tests/run.sh).\n' "$stock" >&2
+  exit 1
+fi
 test -f "$root/poller/node_modules/typescript/bin/tsc"
 stage="$sandbox/typecheck-overlay"
 mkdir -p "$stage/slot"
