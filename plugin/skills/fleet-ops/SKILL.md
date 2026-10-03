@@ -15,7 +15,7 @@ Do this from an attended local session, never by approving a pairing from Telegr
 2. Run `"$FLEET_HOME/bin/fleet-add-bot" <key> --name "<name>" --emoji "<emoji>"`, using a unique key matching `^[a-z0-9][a-z0-9-]{0,30}$`.
 3. You do this: paste the token into the hidden Mac dialog, or type it at the engine's hidden Terminal prompt. The engine validates it, checks for duplicates, writes its state at mode 600, and appends the config entry last. Never write a token with an assistant-authored shell command or paste it into /telegram:configure.
 4. Run `"$FLEET_HOME/bin/fleet-start" <key>`. You do this: accept the first-launch folder trust prompt in the new Terminal window, and the permissions warning if full stance was explicitly selected.
-5. You do this: DM the bot and read the six-character pairing code. Run `"$FLEET_HOME/bin/fleet-pair" <key> <code> --lock` locally. This updates that bot's allowlist and writes its .enrolled marker.
+5. You do this: DM the bot. `fleet-start` watches for the six-character code and opens a Pair/Ignore dialog on the Mac. Check that its code matches your phone, then click Pair. This updates that bot's allowlist and writes its .enrolled marker. If the dialog is unavailable, run `"$FLEET_HOME/bin/fleet-pair" <key> <code> --lock` locally while the code is valid.
 6. Send hi from the phone, run `"$FLEET_HOME/bin/fleet-checklist" <key>`, and complete its phone checks. An existing watchdog picks up the new bot only after enrollment. No changes to other bots are needed.
 
 BotFather can allow a few new bots and then ask you to wait. Finish one before making another; waits can be long and Telegram does not publish the throttle rule. Community references report 20 bots per account, or 40 with Premium. Treat a BotFather refusal as the current limit rather than trying to bypass it.
@@ -25,7 +25,7 @@ BotFather can allow a few new bots and then ask you to wait. Finish one before m
 - `"$FLEET_HOME/bin/fleet-doctor"` reports health and setup gaps.
 - `"$FLEET_HOME/bin/fleet-state" --json` reports the configured sessions.
 - `"$FLEET_HOME/bin/watchdog.sh" --dry-run` explains the next recovery decisions without restarting bots.
-- Watchdog logs live in `$FLEET_HOME/logs/`. Poller and per-bot engine logs live under the configured `<state_dir>/logs/`; look for poller-events.log, fresh.log, update.log, compact.log, esc.log, context.log and usage.log.
+- Fleet-level engine logs live in `$FLEET_HOME/logs/`; look for fresh.log, compact.log and watchdog.log. Poller and per-bot engine logs live in the configured `<state_dir>/logs/`; look for poller-events.log, update.log, esc.log, context.log and usage.log.
 - `$FLEET_HOME/overlay.status` records overlay health. A different official plugin version pauses extras safely. Do not force an old overlay onto it or restart repeatedly to try to fix version drift.
 
 The menu comes from `$FLEET_HOME/ux.json`: esc, fresh, update, key, inbox, opus, fable, model, effort, context, compact, usage, resume. It registers on poller start. For a stale menu, check the overlay and logs before requesting a restart; /fresh clears the conversation, while /update resumes it.
