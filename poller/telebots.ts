@@ -710,7 +710,7 @@ export class TelebotsModule implements Telebots {
       ...(voice?.meta ?? {}),
     } } })
   }
-  dispose(): void { this.disposed = true; for (const timer of this.timers) clearTimeout(timer); this.timers.clear() }
+  dispose(): void { this.disposed = true; this.email.dispose(); for (const timer of this.timers) clearTimeout(timer); this.timers.clear() }
   async drain(): Promise<void> {
     while (this.chains.size || this.tasks.size) await Promise.all([...this.chains.values(), ...this.tasks])
   }
