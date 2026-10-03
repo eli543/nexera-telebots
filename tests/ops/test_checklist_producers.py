@@ -179,6 +179,10 @@ class ChecklistProducerTests(unittest.TestCase):
         self.assertEqual(row(), "Needs your action")
         poller.write_text(poller.read_text() + f"{stamp} EMAIL-REPLY id={consent_id} read={read_id} status=sent\n")
         self.assertEqual(row(), "Passed")
+        receipt.write_text(json.dumps({"id": "7", "full": True, "truncated": True,
+                                       "from": "sender@example.test", "reply_to": "reply@example.test",
+                                       "to": "user@example.test", "cc": "observer@example.test"}))
+        self.assertEqual(row(), "Needs your action")
         (self.state / "consents.json").write_text(json.dumps({consent_id: {
             "phase": "consumed", "email": {"to": ["wrong@example.test"], "cc": ["observer@example.test"],
                                               "bcc": [], "subject": "Re: Request", "body": "Offline fixture"}}}))

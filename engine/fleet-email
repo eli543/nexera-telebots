@@ -370,7 +370,8 @@ def builtin(op, req, c):
             if state:
                 receipt = secrets.token_hex(12)
                 atomic_json(state / "mail-reads" / (receipt + ".json"), {
-                    "id": message["id"], "at": time.time(), "full": True,
+                    "id": message["id"], "at": time.time(),
+                    "full": not message["truncated"], "truncated": message["truncated"],
                     "message_id_sha256": hashlib.sha256(message["message_id"].encode()).hexdigest(),
                     "from": message["from"], "reply_to": message["reply_to"],
                     "to": message["to"], "cc": message["cc"],

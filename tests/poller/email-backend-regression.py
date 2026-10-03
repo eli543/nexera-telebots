@@ -124,6 +124,20 @@ class EmailBackendRegression(unittest.TestCase):
         with self.assertRaises(ValueError):
             email_backend.builtin("read", {"id": "1"}, self.config)
 
+    def test_truncated_read_receipt_is_not_full(self):
+        state = self.home / "state"
+        state.mkdir()
+        email_backend.atomic_json(self.home / "fleet.json", {"version": 2, "bots": [
+            {"key": "main", "state_dir": str(state)}]})
+        raw = b"From: sender@example.test\r\n\r\n" + b"x" * (email_backend.MAX_BODY_CHARS + 1)
+        patch.object(email_backend, "imap_client", return_value=FakeIMAP(raw)).start()
+        with patch.dict(os.environ, {"TELEGRAM_STATE_DIR": str(state)}):
+            message = email_backend.builtin("read", {"id": "1"}, self.config)
+        self.assertTrue(message["truncated"])
+        record = email_backend.load_json(state / "mail-reads" / (message["read_receipt"] + ".json"), {})
+        self.assertFalse(record["full"])
+        self.assertTrue(record["truncated"])
+
     def test_direct_send_refuses_a_forged_consumed_audit_record(self):
         state = self.home / "state"
         state.mkdir()

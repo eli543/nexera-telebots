@@ -481,7 +481,8 @@ def phone_row(code, state, notes, fleet_size, email_enabled, crash_test, started
                 consent = read_json(state / "consents.json", {}).get(consent_id, {})
                 own = read_json(ROOT / "email.json", {}).get("from", "")
                 full_read = (receipt.stat().st_mtime >= started and receipt.stat().st_mode & 0o777 == 0o600
-                             and read_record.get("full") is True and reply_recipients_match(read_record, consent, own))
+                             and read_record.get("full") is True and read_record.get("truncated") is not True
+                             and reply_recipients_match(read_record, consent, own))
             except OSError:
                 full_read = False
             if full_read and event_seen(lines, "EMAIL-CONFIRM", id=consent_id) and event_seen(lines, "EMAIL-SEND", id=consent_id, status="sent"):
