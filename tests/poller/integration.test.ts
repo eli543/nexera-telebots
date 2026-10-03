@@ -376,8 +376,10 @@ describe('stock seam and mock Telegram with a fake MCP owner', () => {
     const expiredId = Object.keys(records).find(key => records[key].message === expiring.message_id)!
     records[expiredId].expires = Date.now() - 1
     writeFileSync(join(f.state, 'consents.json'), JSON.stringify(records), { mode: 0o600 })
-    const expiredPress = f.mock.callback(owner, expiring.message_id, `mail:${expiredId}:prepare`)
-    await f.mock.waitFor(() => f.mock.calls.some(call => call.method === 'answerCallbackQuery' && call.data.callback_query_id === expiredPress && call.data.text === 'This email confirmation is unavailable. Request a fresh preview.'), 'expired email refusal')
+    // Audit records are no longer authorization state. A forged disk expiry
+    // cannot change a fresh in-memory preview or skip the second tap.
+    const preparePress = f.mock.callback(owner, expiring.message_id, `mail:${expiredId}:prepare`)
+    await f.mock.waitFor(() => f.mock.calls.some(call => call.method === 'answerCallbackQuery' && call.data.callback_query_id === preparePress && call.data.text === 'Review the email, then confirm send.'), 'email prepare despite forged audit expiry')
     expect((await f.client.callTool('email_send', { chat_id: String(owner), consent_id: expiredId, email })).isError).toBe(true)
     expect(f.calls().filter(call => call.engine === 'fleet-email')).toHaveLength(1)
   })
