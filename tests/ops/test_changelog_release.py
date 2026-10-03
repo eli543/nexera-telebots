@@ -34,6 +34,11 @@ class ChangelogReleaseTests(unittest.TestCase):
         self.assertIn("opaque message IDs", text)
         self.assertIn("numeric UIDs", text)
 
+    def test_edited_handoff_requires_a_new_id_and_preview(self):
+        text = (ROOT / "CHANGELOG.md").read_text().split("## [0.2.0]", 1)[0]
+        self.assertIn("ID renewal and a fresh preview", text)
+        self.assertIn("old ID is cancelled", text)
+
 
 if __name__ == "__main__":
     unittest.main()

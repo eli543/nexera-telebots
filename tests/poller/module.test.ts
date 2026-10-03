@@ -267,6 +267,52 @@ describe('commands and pickers', () => {
 })
 
 describe('handoff and resume', () => {
+  test('editing a handoff note renews its delivery ID and kills the old ID', async () => {
+    let clock = 1_791_000_000_000
+    const f = fixture({ now: () => clock })
+    const id = 'b'.repeat(24), path = join(f.fleet, 'handoffs', `${id}.md`)
+    mkdirSync(join(f.fleet, 'handoffs'))
+    writeFileSync(path,
+      `HANDOFF from Main to Second - Saturday, October 3, 2026\nTITLE: Offline fixture\nNOTE-ID: ${id}\nSOURCE-KEY: main\nTARGET-KEY: second\nOriginal note.\n`, { mode: 0o600 })
+    const issued = await f.tb.callTool('handoff_receipt', { note_id: id, phase: 'issue' })
+    if (issued?.content[0]?.type !== 'text') throw Error('Issue receipt missing text')
+    const oldId = /Delivery ID: ([a-f0-9]{24})/.exec(issued.content[0].text)?.[1]!
+    writeFileSync(path, readFileSync(path, 'utf8').replace('Original note.', 'Edited note.'))
+    const editedWithOldId = readFileSync(path, 'utf8')
+    expect((await f.tb.callTool('handoff_receipt', { note_id: id, phase: 'sent', delivery_id: oldId }))?.isError).toBe(true)
+    const renewed = await f.tb.callTool('handoff_receipt', { note_id: id, phase: 'renew', delivery_id: oldId })
+    expect(renewed?.isError).not.toBe(true)
+    if (renewed?.content[0]?.type !== 'text') throw Error('Renewed receipt missing text')
+    const newId = /Delivery ID: ([a-f0-9]{24})/.exec(renewed.content[0].text)?.[1]!
+    expect(newId).toMatch(/^[a-f0-9]{24}$/)
+    expect(newId).not.toBe(oldId)
+    expect(readFileSync(path, 'utf8')).toContain(`DELIVERY-ID: ${newId}`)
+    expect(readFileSync(path, 'utf8')).not.toContain(`DELIVERY-ID: ${oldId}`)
+    expect(JSON.parse(readFileSync(join(f.fleet, 'handoffs', 'deliveries', `${oldId}.json`), 'utf8')).phase).toBe('cancelled')
+    const renewedNote = readFileSync(path, 'utf8')
+    writeFileSync(path, editedWithOldId)
+    expect((await f.tb.callTool('handoff_receipt', { note_id: id, phase: 'sent', delivery_id: oldId }))?.isError).toBe(true)
+    writeFileSync(path, renewedNote)
+    expect((await f.tb.callTool('handoff_receipt', { note_id: id, phase: 'sent', delivery_id: newId }))?.isError).not.toBe(true)
+  })
+  test('an expired unsent handoff ID can be renewed once', async () => {
+    let clock = 1_791_000_000_000
+    const f = fixture({ now: () => clock })
+    const id = 'c'.repeat(24), path = join(f.fleet, 'handoffs', `${id}.md`)
+    mkdirSync(join(f.fleet, 'handoffs'))
+    writeFileSync(path,
+      `HANDOFF from Main to Second - Saturday, October 3, 2026\nTITLE: Offline fixture\nNOTE-ID: ${id}\nSOURCE-KEY: main\nTARGET-KEY: second\nUnchanged note.\n`, { mode: 0o600 })
+    const issued = await f.tb.callTool('handoff_receipt', { note_id: id, phase: 'issue' })
+    if (issued?.content[0]?.type !== 'text') throw Error('Issue receipt missing text')
+    const oldId = /Delivery ID: ([a-f0-9]{24})/.exec(issued.content[0].text)?.[1]!
+    clock += 60 * 60 * 1000 + 1
+    expect((await f.tb.callTool('handoff_receipt', { note_id: id, phase: 'sent', delivery_id: oldId }))?.isError).toBe(true)
+    const renewed = await f.tb.callTool('handoff_receipt', { note_id: id, phase: 'renew', delivery_id: oldId })
+    expect(renewed?.isError).not.toBe(true)
+    if (renewed?.content[0]?.type !== 'text') throw Error('Renewed receipt missing text')
+    const newId = /Delivery ID: ([a-f0-9]{24})/.exec(renewed.content[0].text)?.[1]!
+    expect((await f.tb.callTool('handoff_receipt', { note_id: id, phase: 'sent', delivery_id: newId }))?.isError).not.toBe(true)
+  })
   test('source and receiving pollers record one linked handoff note without logging its body', async () => {
     const f = fixture()
     const id = 'a'.repeat(24)
