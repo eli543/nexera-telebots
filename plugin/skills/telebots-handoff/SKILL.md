@@ -12,14 +12,17 @@ The target has none of this chat. Give it a self-contained note and keep every e
 1. Read `$FLEET_HOME/fleet.json` and run `"$FLEET_HOME/bin/fleet-state" --json`. Resolve this bot by `TELEGRAM_STATE_DIR`, and resolve the target by its configured key and name. Never send to yourself. If names are duplicated, ask for the unique key. If no other bot exists, say so and keep working here.
 2. A `Hand off to <Name>` button has already chosen the target. For an unspecified target, reply with `Hand off` and `Keep going` bubbles so the poller opens its current bot picker. Do not maintain a hard-coded bot list.
 3. Keep the target's current conversation. If the user explicitly asks to clear it first, explain that its context will be lost and use `"$FLEET_HOME/bin/fleet-handoff" fresh <key>` only with that authority. A busy target does not imply permission to force a restart. Run the engine's `--help` for any additional refusal details; never invent a force option.
-4. Write a note under `$FLEET_HOME/handoffs/`, using a unique file name with source and target keys. Create the directory if missing. Notes and their small pending-state files use mode 600. No credentials, tokens, passwords, session cookies, or secret-bearing command output may enter the note. Refer only to the configured credential service or the user's approved secret location.
+4. Generate a random 24-character lowercase hex note ID. Write the note as `$FLEET_HOME/handoffs/<note-id>.md`. Create the directory if missing. Notes and their small pending-state files use mode 600. No credentials, tokens, passwords, session cookies, or secret-bearing command output may enter the note. Refer only to the configured credential service or the user's approved secret location.
 
-The first three lines are:
+Start the note with these lines:
 
 ```text
 HANDOFF from <Source> to <Target> - <full weekday, month, day, year, time and local zone>
 TITLE: <one-line task>
 RECOMMENDED EFFORT: <low|medium|high|xhigh|max>
+NOTE-ID: <note-id>
+SOURCE-KEY: <source-key>
+TARGET-KEY: <target-key>
 ```
 
 Keep the note around 1,500 words or fewer. Include the user's actual request and corrections, the goal, work already done and its evidence, decisions, open questions, relevant file links, remaining steps with a completion check for each, binding constraints and outstanding approvals, and the result the user expects. Distinguish verified facts from assumptions. Include quoted instructions only when they help preserve the task; never copy secrets or unrelated private material. Do not ask the target to expose internal reasoning.
@@ -34,13 +37,13 @@ Deliver only on a `Confirm send` event with `via="button"`, from this chat and a
 
 Run ListAgents and match the exact stable session name `telebots-<target-key>`. Never use a worktree prefix, another bot's row, a Telegram API message, or a file drop as a substitute for delivery. If the match is missing or ambiguous, keep the note pending and tell the user. A uniform fleet permission stance and Claude Code 2.1.224 or newer are required; a terminal approval hold is a pending delivery, not success.
 
-Call SendMessage with the matched session name, the complete note starting with `HANDOFF from`, and the title as summary. After confirmed delivery, mark the pending record delivered, tell the user which bot received which task, and stop performing that task here. Update its task entry to record the handoff; do not claim its underlying work is finished.
+Call SendMessage with the matched session name, the complete note starting with `HANDOFF from`, and the title as summary. After SendMessage confirms delivery, call this bot's `handoff_receipt` tool with the note ID and `phase="sent"`. Mark the pending record delivered, tell the user which bot received which task, and stop performing that task here. Update its task entry to record the handoff; do not claim its underlying work is finished. A sent receipt alone does not prove pickup.
 
 On a definitely failed send or missing target, keep the note and retry once after 20 seconds. Report a second failure as pending. On an uncertain result or approval hold, do not resend until delivery state can be checked: a duplicate note can duplicate work. Never launch or reset the target as a delivery workaround.
 
 ## Receive a handoff
 
-Only an actual cross-session message beginning `HANDOFF from` is a transfer. Read it fully and inspect the relevant linked files. Reply to the user through this bot's Telegram reply tool: `Picked up "<title>" from <Source>.` Start at the remaining steps and preserve all outstanding approvals. The recommended effort is advice, not permission to change the model or settings. If this is a duplicate transfer, acknowledge its existing state without starting the work twice. Do not pass received work onward without asking the user.
+Only an actual cross-session message beginning `HANDOFF from` is a transfer. Read it fully and inspect the relevant linked files. Check that the note ID, source key and this bot's target key match the local note. Call this bot's `handoff_receipt` tool with that note ID and `phase="received"`; its poller records `HANDOFF-RECEIVED`. Reply to the user through this bot's Telegram reply tool: `Picked up "<title>" from <Source>.` Start at the remaining steps and preserve all outstanding approvals. The recommended effort is advice, not permission to change the model or settings. If this is a duplicate transfer, acknowledge its existing state without starting the work twice. Do not pass received work onward without asking the user.
 
 ## Questions, replies and status
 

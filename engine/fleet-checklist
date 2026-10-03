@@ -4,6 +4,7 @@
 import argparse
 from datetime import datetime
 import hashlib
+from email.utils import getaddresses
 import importlib.util
 import json
 import os
@@ -45,8 +46,8 @@ ROWS = (
     ("P10", "Context and usage", "INTERCEPT events; context.log; usage.log"),
     ("P11", "Compact", "fleet-home compact.log delivered or Not enough messages"),
     ("P12", "Context nudge and Keep going", "guardian.log GUARDIAN reason=8 pct= threshold= ok=true; TAP"),
-    ("P13", "Completed handoff", "second bot receipt required; needs two bots"),
-    ("P14", "Full inbox reply", "linked inbox read and SMTP receipt required; fake IMAP/SMTP suite"),
+    ("P13", "Completed handoff", "source send and receiving poller receipt with one note ID; needs two bots"),
+    ("P14", "Full inbox reply", "linked full read, two-tap confirmation and SMTP receipt"),
     ("P15", "Watchdog recovery", "fleet-home watchdog.log result; quiet restart ledger; 30-minute resume boundary"),
     ("P17", "Model switch keeps history", "model-state and model.log; same session id; restart ledger"),
     ("P18", "Resume reopens chat", "PICK kind=resume; changed session id; restart ledger"),
@@ -164,6 +165,40 @@ def event_seen(lines, name, **fields):
         if all(values.get(key) == str(value) for key, value in fields.items()):
             return True
     return False
+
+
+def matching_events(lines, name):
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == name:
+            yield dict(part.split("=", 1) for part in parts[2:] if "=" in part)
+
+
+def reply_recipients_match(read_receipt, consent, own_address):
+    """Check the latest message's reply recipients, excluding this account."""
+    if not isinstance(read_receipt, dict) or not isinstance(consent, dict):
+        return False
+    outgoing = consent.get("email")
+    if not isinstance(outgoing, dict) or consent.get("phase") != "consumed":
+        return False
+    def addresses(value):
+        if not isinstance(value, str):
+            return []
+        return [address.casefold() for _, address in getaddresses([value]) if address]
+    own = set(addresses(own_address))
+    direct = addresses(read_receipt.get("reply_to") or read_receipt.get("from"))
+    if not direct or any(address in own for address in direct):
+        return False
+    copied = addresses(read_receipt.get("to")) + addresses(read_receipt.get("cc"))
+    expected_to = set(direct)
+    expected_cc = {address for address in copied if address not in own | expected_to}
+    actual_to, actual_cc, actual_bcc = (outgoing.get(key) for key in ("to", "cc", "bcc"))
+    if not all(isinstance(value, list) and all(isinstance(item, str) for item in value)
+               for value in (actual_to, actual_cc, actual_bcc)):
+        return False
+    return (set(address.casefold() for address in actual_to) == expected_to
+            and set(address.casefold() for address in actual_cc) == expected_cc
+            and not actual_bcc)
 
 
 def log_has(path, pattern):
@@ -406,10 +441,38 @@ def phone_row(code, state, notes, fleet_size, email_enabled, crash_test, started
     elif code == "P12": ok = guardian_sent(log_lines_since(logs / "guardian.log", started)) and event_seen(lines, "TAP", family="qr")
     elif code == "P13":
         if fleet_size < 2: return result("Not configured", "needs two bots")
-        return result("Needs your action", "Completed handoff untested: confirm the note arrived and the second bot acknowledged it on the phone; no destination receipt is recorded")
+        source = bot_record(state)
+        fleet = read_json(ROOT / "fleet.json", {})
+        for sent in matching_events(lines, "HANDOFF-SENT"):
+            note_id, target = sent.get("id", ""), sent.get("target", "")
+            if not source or sent.get("source") != source.get("key") or not re.fullmatch(r"[a-f0-9]{24}", note_id):
+                continue
+            peer = next((item for item in fleet.get("bots", []) if item.get("key") == target and target != source.get("key")), None)
+            if not peer:
+                continue
+            target_state = Path(peer.get("state_dir", "")).expanduser()
+            received = log_lines_since(target_state / "logs/poller-events.log", started)
+            if event_seen(received, "HANDOFF-RECEIVED", id=note_id, source=source["key"], target=target):
+                return result("Passed", "sending and receiving pollers recorded the same note ID; check the acknowledgement in the second chat")
+        return result("Needs your action", "complete the handoff; the second bot has not recorded a matching HANDOFF-RECEIVED receipt")
     elif code == "P14":
         if not email_enabled: return result("Not configured", "email is optional")
-        return result("Needs your action", "Full inbox reply untested: confirm the card, complete message, recipients, two taps and SMTP acceptance; current logs do not link the inbox read to the send")
+        for reply in matching_events(lines, "EMAIL-REPLY"):
+            consent_id, read_id = reply.get("id", ""), reply.get("read", "")
+            if reply.get("status") != "sent" or not re.fullmatch(r"[a-f0-9]{24}", consent_id) or not re.fullmatch(r"[a-f0-9]{24}", read_id):
+                continue
+            receipt = state / "mail-reads" / (read_id + ".json")
+            try:
+                read_record = read_json(receipt, {})
+                consent = read_json(state / "consents.json", {}).get(consent_id, {})
+                own = read_json(ROOT / "email.json", {}).get("from", "")
+                full_read = (receipt.stat().st_mtime >= started and receipt.stat().st_mode & 0o777 == 0o600
+                             and read_record.get("full") is True and reply_recipients_match(read_record, consent, own))
+            except OSError:
+                full_read = False
+            if full_read and event_seen(lines, "EMAIL-CONFIRM", id=consent_id) and event_seen(lines, "EMAIL-SEND", id=consent_id, status="sent"):
+                return result("Passed", "full inbox read linked to two-tap confirmation and SMTP acceptance; check the reply in the mail account")
+        return result("Needs your action", "complete a full inbox reply; no matching read, confirmation and SMTP receipt is recorded")
     elif code == "P15":
         if not crash_test:
             return result("Needs your action", "Recovery untested; run the optional exact-PID test with a person at the Mac. A chat active within 30 minutes resumes; an older chat restarts blank. Reboot still untested")
@@ -628,7 +691,7 @@ def main():
                         if not approved:
                             values[code] = result("Needs your action", detail)
                     if code != "P15" or approved:
-                        deadline = started + (0 if code in ("P13", "P14") else max(0, args.wait))
+                        deadline = started + max(0, args.wait)
                         while True:
                             values[code] = phone_row(code, state, notes, len(fleet.get("bots", [])),
                                                      read_json(ROOT / "email.json", {}).get("enabled", False),

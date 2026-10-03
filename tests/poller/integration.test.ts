@@ -138,7 +138,7 @@ describe('stock seam and mock Telegram with a fake MCP owner', () => {
     const tools = await f.client.listTools()
     expect(f.mock.commands).toEqual(ux.commands)
     expect(f.mock.allowedUpdates).toEqual(['message', 'callback_query', 'message_reaction'])
-    expect(tools.tools.map(tool => tool.name)).toEqual(['reply', 'react', 'download_attachment', 'edit_message', 'email_preview', 'email_send'])
+    expect(tools.tools.map(tool => tool.name)).toEqual(['reply', 'react', 'download_attachment', 'edit_message', 'email_preview', 'email_send', 'handoff_receipt'])
     expect(f.client.initialized!.instructions!.length).toBeLessThanOrEqual(2000)
     for (const tool of tools.tools) expect(tool.description!.length).toBeLessThanOrEqual(2000)
     await f.mock.waitFor(() => Number(readFileSync(join(f.state, 'poller.heartbeat'), 'utf8')) > 0, 'heartbeat')
@@ -286,6 +286,13 @@ describe('stock seam and mock Telegram with a fake MCP owner', () => {
     await f.mock.waitFor(() => f.mock.sent(owner).some(message => message.reply_markup?.inline_keyboard.some(row => row.some(cell => cell.callback_data === 'ho:research-lab'))), 'second peer button')
     f.mock.callback(owner, f.mock.sent(owner).at(-1)!.message_id, 'ho:research-lab'); await f.waitNotifications(1)
     expect(f.channel()[0]!.params.content).toBe('Hand off to Research Lab')
+    const noteId = 'a'.repeat(24)
+    mkdirSync(join(f.fleetHome, 'handoffs'))
+    writeFileSync(join(f.fleetHome, 'handoffs', `${noteId}.md`),
+      `HANDOFF from Main to Research Lab - Friday, October 2, 2026\nTITLE: Offline handoff\nRECOMMENDED EFFORT: low\nNOTE-ID: ${noteId}\nSOURCE-KEY: main\nTARGET-KEY: research-lab\n`, { mode: 0o600 })
+    expect((await f.client.callTool('handoff_receipt', { note_id: noteId, phase: 'received' })).isError).toBe(true)
+    expect((await f.client.callTool('handoff_receipt', { note_id: noteId, phase: 'sent' })).isError).not.toBe(true)
+    expect(f.events()).toContain(`HANDOFF-SENT id=${noteId} source=main target=research-lab`)
   })
 
   test('F2.13 spawns every intercept with exact argv and supports resume refresh/close/open', async () => {
@@ -344,7 +351,10 @@ describe('stock seam and mock Telegram with a fake MCP owner', () => {
     const f = fixture(); await f.start()
     writeFileSync(join(f.fleetHome, 'email.json'), JSON.stringify({ enabled: true, backend: 'builtin' }))
     const email = { to: ['recipient@example.test'], cc: ['copy@example.test'], bcc: ['blind@example.test'], subject: 'Sandbox email', body: 'Fixture body only.' }
-    const result = await f.client.callTool('email_preview', { chat_id: String(owner), email })
+    const readId = 'b'.repeat(24)
+    mkdirSync(join(f.state, 'mail-reads'))
+    writeFileSync(join(f.state, 'mail-reads', `${readId}.json`), JSON.stringify({ id: '7', at: Date.now() / 1000, full: true }), { mode: 0o600 })
+    const result = await f.client.callTool('email_preview', { chat_id: String(owner), email, read_receipt: readId })
     expect(result.isError).not.toBe(true)
     const preview = f.mock.sent(owner).at(-1)!, id = preview.message_id
     const consentId = Object.keys(JSON.parse(readFileSync(join(f.state, 'consents.json'), 'utf8')))[0]!
@@ -360,6 +370,7 @@ describe('stock seam and mock Telegram with a fake MCP owner', () => {
     expect(f.channel()[0]!.params.meta.consent_id).toBe(consentId)
     expect((await f.client.callTool('email_send', { chat_id: String(owner), consent_id: consentId, email: { ...email, to: ['changed@example.test'] } })).isError).toBe(true)
     expect((await f.client.callTool('email_send', { chat_id: String(owner), consent_id: consentId, email })).isError).not.toBe(true)
+    expect(f.events()).toContain(`EMAIL-REPLY id=${consentId} read=${readId} status=sent`)
     expect((await f.client.callTool('email_send', { chat_id: String(owner), consent_id: consentId, email })).isError).toBe(true)
     expect(f.calls().filter(call => call.engine === 'fleet-email')).toHaveLength(1)
     expect(statSync(join(f.state, 'consents.json')).mode & 0o777).toBe(0o600)
