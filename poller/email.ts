@@ -220,8 +220,8 @@ const emailSchema = {
 export const emailTools: Tool[] = [
   {
     name: 'email_preview',
-    description: 'Show the complete exact To, Cc, Bcc, subject and plain text body in a private chat. Creates no provider draft and sends no email. Wait for the owner to tap Send it, then Confirm send. Consent expires after 10 minutes; any edit or controller restart cancels it and requires a fresh preview and both taps. Omitted Cc and Bcc mean empty lists. Preview limit: 3900 characters including headers.',
-    inputSchema: { type: 'object', additionalProperties: false, properties: { chat_id: { type: 'string' }, email: emailSchema }, required: ['chat_id', 'email'] },
+    description: 'Show the complete exact To, Cc, Bcc, subject and plain text body in a private chat. Creates no provider draft and sends no email. For an inbox reply, pass the read_receipt from fleet-email read to link checklist evidence. Wait for the owner to tap Send it, then Confirm send. Consent expires after 10 minutes; any edit or controller restart cancels it and requires a fresh preview and both taps. Omitted Cc and Bcc mean empty lists. Preview limit: 3900 characters including headers.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: { chat_id: { type: 'string' }, email: emailSchema, read_receipt: { type: 'string' } }, required: ['chat_id', 'email'] },
   },
   {
     name: 'email_send',
@@ -258,6 +258,7 @@ export class EmailService {
   readonly consents: ConsentStore
   private readonly busy = new Set<string>()
   private readonly pending = new Map<string, { id: string; chat: string; message: number; digest: string; expires: number }>()
+  private readonly replyReads = new Map<string, string>()
   private readonly authority: Server
   private readonly authorityReady: Promise<number>
 
@@ -304,7 +305,21 @@ export class EmailService {
     })
   }
 
-  dispose(): void { this.pending.clear(); this.authority.close() }
+  dispose(): void { this.pending.clear(); this.replyReads.clear(); this.authority.close() }
+
+  private checkedReadReceipt(value: unknown): string | undefined {
+    if (value === undefined) return undefined
+    if (typeof value !== 'string' || !ID.test(value)) throw Error('A valid inbox read receipt is required.')
+    const path = join(this.options.stateDir, 'mail-reads', `${value}.json`)
+    const info = lstatSync(path)
+    if (!info.isFile() || (info.mode & 0o777) !== 0o600 || info.size > 4096) throw Error('A valid inbox read receipt is required.')
+    const receipt: unknown = JSON.parse(readFileSync(path, 'utf8'))
+    if (!plainObject(receipt) || receipt.full !== true || typeof receipt.id !== 'string' || !/^\d+$/.test(receipt.id) ||
+        typeof receipt.at !== 'number' || receipt.at > Date.now() / 1000 + 60 || receipt.at < Date.now() / 1000 - 86_400) {
+      throw Error('A valid inbox read receipt is required.')
+    }
+    return value
+  }
 
   private event(event: string, fields: Record<string, string | number>): void {
     try { this.options.logEvent(event, fields) } catch { /* Evidence failure cannot turn a send into a retry. */ }
@@ -417,6 +432,7 @@ export class EmailService {
       const executable = this.backendPath()
       if (!executable) throw Error('Inbox is not connected. On your Mac run: fleet-email setup')
       if (name === 'email_preview') {
+        const readReceipt = this.checkedReadReceipt(args.read_receipt)
         const text = emailText(email)
         const message = await this.options.bot.api.sendMessage(chat, text, { reply_markup: { inline_keyboard: [] } })
         let record: ConsentRecord | undefined
@@ -433,6 +449,7 @@ export class EmailService {
           throw Error('The complete email preview could not be prepared. No email was sent.')
         }
         this.event('EMAIL-PREVIEW', { id: record.id })
+        if (readReceipt) this.replyReads.set(record.id, readReceipt)
         return { content: [{ type: 'text', text: `Exact email shown. Wait for the owner's two taps. Consent ID: ${record.id}` }] }
       }
       const bot = this.options.botKey()
@@ -454,12 +471,15 @@ export class EmailService {
           { consent_id: record.id, bot, email: record.email, nonce, chat, message: record.message, digest: record.digest })
         if (!plainObject(result) || result.ok !== true) throw Error(BACKEND_UNCERTAIN)
         this.event('EMAIL-SEND', { id: record.id, status: 'sent' })
+        const readReceipt = this.replyReads.get(record.id)
+        if (readReceipt) this.event('EMAIL-REPLY', { id: record.id, read: readReceipt, status: 'sent' })
         return { content: [{ type: 'text', text: 'The email backend confirmed the send. Consent has been used.' }] }
       } catch {
         this.event('EMAIL-SEND', { id: record.id, status: 'uncertain' })
         throw Error(BACKEND_UNCERTAIN)
       } finally {
         this.pending.delete(nonce)
+        this.replyReads.delete(record.id)
       }
     } catch (error) {
       // Never forward adapter stderr/stdout, message text, paths or secrets.

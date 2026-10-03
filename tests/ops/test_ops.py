@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import secrets
 import socket
 import socketserver
 import subprocess
@@ -92,6 +93,22 @@ class SMTP(socketserver.StreamRequestHandler):
             self.wfile.flush()
 
 
+class EmailAuthority(socketserver.StreamRequestHandler):
+    issued = {}
+    accepted = 0
+
+    def handle(self):
+        try:
+            proof = json.loads(self.rfile.readline(2049))
+            expected = type(self).issued.pop(proof.get("nonce"), None)
+            allowed = expected == proof
+        except (ValueError, TypeError, AttributeError):
+            allowed = False
+        type(self).accepted += int(allowed)
+        self.wfile.write(json.dumps({"ok": allowed}).encode() + b"\n")
+        self.wfile.flush()
+
+
 class OfflineOps(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=SANDBOX)
@@ -131,6 +148,20 @@ class OfflineOps(unittest.TestCase):
         threading.Thread(target=serve, daemon=True).start()
         return client
 
+    def authorize_once(self, consent_id, email, chat="123", message=42):
+        if not hasattr(self, "authority_port"):
+            EmailAuthority.issued = {}
+            EmailAuthority.accepted = 0
+            self.authority_port = self.start_server(EmailAuthority)
+        nonce = secrets.token_hex(32)
+        request = {"bot": "main", "consent_id": consent_id, "email": email,
+                   "chat": chat, "message": message, "digest": self.email.digest(email),
+                   "nonce": nonce}
+        EmailAuthority.issued[nonce] = {key: request[key] for key in
+                                         ("consent_id", "chat", "message", "digest", "nonce")}
+        os.environ["TELEBOTS_EMAIL_AUTHORITY_PORT"] = str(self.authority_port)
+        return request
+
     def test_email_against_local_imap_and_smtp(self):
         imap_port = self.start_server(IMAP)
         smtp_port = self.start_server(SMTP)
@@ -161,7 +192,11 @@ class OfflineOps(unittest.TestCase):
                 "id": consent_id, "chat": "123", "message": 42,
                 "phase": "consumed", "expires": int(time.time() * 1000) + 600000,
                 "email": value, "digest": self.email.digest(value)}})
-            request = {"bot": "main", "consent_id": consent_id, "email": value}
+            disk_only = {"bot": "main", "consent_id": consent_id, "email": value}
+            with self.assertRaises(ValueError):
+                self.email.builtin("send", disk_only, c)
+            self.assertEqual(SMTP.sent, 0)
+            request = self.authorize_once(consent_id, value)
             answer = self.email.builtin("send", request, c)
             self.assertEqual(answer["status"], "smtp-accepted")
             self.assertIs(answer["ok"], True)
@@ -196,12 +231,14 @@ class OfflineOps(unittest.TestCase):
         with patch.dict(os.environ, {"TELEGRAM_STATE_DIR": str(state)}), \
              patch.object(self.email, "password", return_value="fake-only"):
             message = self.email.builtin("read", {"id": "1"}, c)
-            if not {"body", "to", "cc"}.issubset(message):
-                self.skipTest("full IMAP body and recipient fields await the email package")
             self.assertEqual(message["body"], body)
             self.assertEqual(message["reply_to"], "reply@example.test")
             self.assertIn("user@example.test", message["to"])
             self.assertIn("observer@example.test", message["cc"])
+            self.assertRegex(message["read_receipt"], r"^[a-f0-9]{24}$")
+            read_record = json.loads((state / "mail-reads" / (message["read_receipt"] + ".json")).read_text())
+            self.assertEqual(read_record["reply_to"], "reply@example.test")
+            self.assertEqual(read_record["cc"], "observer@example.test")
             reply = {"to": [message["reply_to"]], "cc": ["observer@example.test"],
                      "bcc": [], "subject": "Re: " + message["subject"],
                      "body": "I read the complete message."}
@@ -211,8 +248,8 @@ class OfflineOps(unittest.TestCase):
                 "expires": int(time.time() * 1000) + 600000,
                 "email": reply, "digest": self.email.digest(reply)}})
             SMTP.sent = 0
-            answer = self.email.builtin("send", {"bot": "main", "consent_id": consent_id,
-                                                  "email": reply}, c)
+            request = self.authorize_once(consent_id, reply)
+            answer = self.email.builtin("send", request, c)
             self.assertEqual(answer["status"], "smtp-accepted")
             self.assertEqual(SMTP.sent, 1)
 
@@ -234,26 +271,34 @@ class OfflineOps(unittest.TestCase):
                   "expires": int(time.time() * 1000) + 600000,
                   "email": self.email.canonical_email(email), "digest": self.email.digest(email)}
         path = state / "consents.json"
-        request = {"bot": "main", "consent_id": consent_id, "email": email}
+        disk_only = {"bot": "main", "consent_id": consent_id, "email": email}
         with patch.dict(os.environ, {"TELEGRAM_STATE_DIR": str(state)}):
             self.email.atomic_json(path, {consent_id: record})
-            self.assertEqual(self.email.checked_send(request)[0], self.email.canonical_email(email))
+            with self.assertRaises(ValueError):
+                self.email.checked_send(disk_only)
             for change in ({"id": "c" * 24}, {"chat": "124"}, {"message": 0},
                            {"expires": int(time.time() * 1000)}, {"phase": "authorized"}):
                 self.email.atomic_json(path, {consent_id: dict(record, **change)})
                 with self.assertRaises(ValueError):
-                    self.email.checked_send(request)
+                    self.email.checked_send(disk_only)
             self.email.atomic_json(path, {consent_id: record})
-            path.chmod(0o644)
+            forged = dict(disk_only, chat="123", message=42, digest=self.email.digest(email), nonce="f" * 64)
+            with self.assertRaises(ValueError):
+                self.email.checked_send(forged)
+            request = self.authorize_once(consent_id, email)
+            self.assertEqual(self.email.checked_send(request)[0], self.email.canonical_email(email))
             with self.assertRaises(ValueError):
                 self.email.checked_send(request)
-            path.chmod(0o600)
+            changed = self.authorize_once(consent_id, email)
+            changed["email"] = dict(email, subject="Changed")
+            with self.assertRaises(ValueError):
+                self.email.checked_send(changed)
             self.email.atomic_json(state / "access.json", {"dmPolicy": "allowlist", "allowFrom": []})
             with self.assertRaises(ValueError):
-                self.email.checked_send(request)
+                self.email.checked_send(self.authorize_once(consent_id, email))
         with patch.dict(os.environ, {"TELEGRAM_STATE_DIR": str(self.home)}):
             with self.assertRaises(ValueError):
-                self.email.checked_send(request)
+                self.email.checked_send(self.authorize_once(consent_id, email))
 
     def test_custom_adapter_claims_its_own_attempt(self):
         state = self.fleet / "bot-main"
@@ -276,7 +321,11 @@ class OfflineOps(unittest.TestCase):
                            "os.close(fd)\nprint(json.dumps({'ok': True}))\n")
         adapter.chmod(0o700)
         self.email.atomic_json(self.email.CONFIG, {"enabled": True, "backend": str(adapter)})
-        request = {"bot": "main", "consent_id": consent_id, "email": value}
+        disk_only = {"bot": "main", "consent_id": consent_id, "email": value}
+        with patch.dict(os.environ, {"TELEGRAM_STATE_DIR": str(state)}):
+            with self.assertRaises(ValueError):
+                self.email.checked_send(disk_only)
+        request = self.authorize_once(consent_id, value)
         with patch.dict(os.environ, {"TELEGRAM_STATE_DIR": str(state)}), \
              patch.object(self.email.sys, "stdin", io.StringIO(json.dumps(request))):
             output = io.StringIO()
