@@ -14,7 +14,7 @@ Changes are grouped by release. This project follows [Keep a Changelog](https://
 - `fleet-fresh` signals nothing until Terminal answers. It waits up to five minutes, says so once and then refuses, leaving the old session running. It opens the new window as its own osascript under a 40-second outside limit, activates Terminal afterwards in the background, retries a failed open for up to eight minutes after checking for a session a late open started, and sends a notice when a restart does not come back, unless quiet.
 - `fleet-restore` opens each window before it activates Terminal, and the activation runs in the background.
 - No engine relies on an AppleScript `with timeout` as a bound: a frozen Terminal held osascript well past one.
-- Known limit: the TIOCSTI paths need the engine to run inside the bot's own terminal session. The poller starts engines in a new session, so until that changes `/esc` uses its keystroke path and `/compact` asks for `/esc` when a leftover menu is open.
+- The poller starts `fleet-esc` and `fleet-compact` without `detached`, so they inherit the bot's session and its terminal and the lone Esc can go in; the kernel allows TIOCSTI only on the caller's own controlling terminal. They keep the same arguments, ignored stdio and nohup. Every other engine still starts in its own session.
 
 ## [0.3.0] - Pending release
 

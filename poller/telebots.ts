@@ -147,9 +147,19 @@ function execOutput(file: string, args: string[], options: ExecOptions): Promise
   })
 }
 
+// fleet-esc and fleet-compact press a lone Esc with the TIOCSTI ioctl, which the kernel allows
+// only on the caller's own controlling terminal. They start without `detached`, so they inherit
+// this poller's session and the bot's terminal; nohup and the shell's & still keep them running
+// on their own. Every other engine starts in its own session, as before.
+export const IN_SESSION_ENGINES = /^fleet-(?:esc|compact)$/
+
+export function engineSpawnOptions(file: string): { detached: boolean; stdio: 'ignore' } {
+  return { detached: !IN_SESSION_ENGINES.test(basename(file)), stdio: 'ignore' }
+}
+
 function spawnEngine(file: string, args: string[], logFile: string): void {
   const command = `nohup ${[file, ...args].map(shq).join(' ')} </dev/null >>${shq(logFile)} 2>&1 &`
-  const child = spawn('/bin/sh', ['-c', command], { detached: true, stdio: 'ignore' })
+  const child = spawn('/bin/sh', ['-c', command], engineSpawnOptions(file))
   child.on('error', () => {})
   child.unref()
 }

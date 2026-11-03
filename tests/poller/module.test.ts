@@ -4,7 +4,7 @@ import type { Message, Update, UserFromGetMe } from 'grammy/types'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, join, resolve, sep } from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { DEFAULT_UX, TelebotsModule, addedReactionEmoji, formatVoiceDuration, init, keyText, replyButtons, shq, validatedApiRoot, voiceBody } from '../../poller/telebots.ts'
+import { DEFAULT_UX, IN_SESSION_ENGINES, TelebotsModule, addedReactionEmoji, engineSpawnOptions, formatVoiceDuration, init, keyText, replyButtons, shq, validatedApiRoot, voiceBody } from '../../poller/telebots.ts'
 import type { AttachmentMeta, ExecOptions, TelebotsDependencies } from '../../poller/contracts.ts'
 import ux from '../../poller/ux.json'
 
@@ -206,6 +206,20 @@ describe('callback safety and replies', () => {
 })
 
 describe('commands and pickers', () => {
+  test('only fleet-esc and fleet-compact keep the bot session; every other engine starts detached', () => {
+    // The lone Esc goes in by TIOCSTI, which the kernel allows only on the caller's own terminal.
+    for (const name of ['fleet-esc', 'fleet-compact']) {
+      expect(IN_SESSION_ENGINES.test(name)).toBe(true)
+      expect(engineSpawnOptions(join('/fleet', 'bin', name))).toEqual({ detached: false, stdio: 'ignore' })
+    }
+    const detached = ['fleet-fresh', 'fleet-model', 'fleet-update', 'fleet-context', 'fleet-usage', 'fleet-resume-open',
+      'fleet-esc.sh', 'fleet-escape', 'fleet-compact-old', 'old-fleet-esc', 'FLEET-ESC', 'fleet-esc ']
+    for (const name of detached) {
+      expect(IN_SESSION_ENGINES.test(name)).toBe(false)
+      expect(engineSpawnOptions(join('/fleet', 'bin', name))).toEqual({ detached: true, stdio: 'ignore' })
+    }
+    expect(engineSpawnOptions('/fleet/fleet-esc/bin/fleet-fresh').detached).toBe(true)
+  })
   test('all intercepted commands use the C6 arguments and bounded compact focus', async () => {
     const f = fixture()
     const inputs = ['/fresh', '/Model opus low', '/opus', '/FABLE', '/effort HIGH', '/esc', '/update', '/context', '/usage', '/COMPACT keep\n  the\u0000 notes']
