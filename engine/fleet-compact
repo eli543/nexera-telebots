@@ -3,13 +3,38 @@
 # Compact one bot in its Terminal tab after checking the live input frame.
 # CC_COMPACT_DRYRUN=1 classifies a recorded frame and takes no Terminal action.
 # Exit codes: 0 started, 1 missing args, 2 unknown workdir, 3-6 target refusal,
-# 7 lock busy, 8 busy timeout, 9 picker, 10 no proof, 11 unsent text,
-# 12 unreadable frame, 13 duplicate run, 14 not enough messages,
-# 15 session changed, 16 command queued behind a turn.
+# 7 already compacting, 8 busy timeout, 9 a menu or question stayed open,
+# 10 no proof, 11 unsent text that could not be moved safely, 12 Terminal
+# unreachable or an unknown screen stayed up, 13 duplicate run, 14 not enough
+# messages, 15 session changed, 16 command queued behind a turn.
+#
+# One look at the screen never decides anything. A window raised during the
+# lookup, a half-drawn repaint, a footer hint such as "Press Ctrl-C again to
+# exit" and a Terminal that stalls for a few seconds all clear on their own, so
+# settled_state looks again before a picker, typed text or an unreadable frame
+# is believed. A frame that stays unreadable gets a second opinion from Claude
+# Code's session registry (<config dir>/sessions/<pid>.json: status and
+# waitingFor). Every window lookup takes one snapshot of the window ids and
+# walks those: a walk by z-order index skips a window raised mid-walk.
+#
+# What it does instead of refusing:
+#   - Text stranded in the input box is cleared with ONE ctrl-c and quoted back
+#     in chat (a second ctrl-c within a couple of seconds quits Claude Code). It
+#     still refuses a paste placeholder, a box taller than BOX_READBACK_ROWS
+#     (its top may be hidden) and text that keeps changing (someone is typing).
+#   - A leftover menu gets one lone Esc through the TIOCSTI ioctl, and only when
+#     the registry says idle or shell, or waiting with waitingFor exactly
+#     "dialog open". A Terminal `do script` cannot do this: it always appends a
+#     Return, and Esc plus Return on the /model picker rewrites the default
+#     model. The kernel allows the ioctl only on the engine's own controlling
+#     terminal. Any other waiting reason is the bot asking something, so the
+#     user is asked to tap /esc instead.
+#   - A menu or an unknown screen is waited on for MODAL_WAIT, and a Terminal
+#     that does not answer for STALL_WAIT, before the run gives up.
 
 set -uo pipefail
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
-  sed -n '2,8p' "$0" | sed 's/^# *//'
+  sed -n '2,9p' "$0" | sed 's/^# *//'
   exit 0
 fi
 FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
@@ -38,6 +63,14 @@ BOTLOCK_STALE=2100
 PROOF_WAIT=10
 SETTLE_WAIT=3
 RETURN_TRIES=3
+RELOOK_QUICK=3         # seconds a picker or typed text must hold before it is believed
+RELOOK_UNREADABLE=20   # seconds an unreadable frame is looked at again
+LOOSE_AFTER=5          # seconds a frame stays unreadable before the session registry is asked
+MODAL_WAIT=600         # seconds to wait for a menu or an unknown screen to be closed
+MODAL_POLL=3
+STALL_WAIT=120         # seconds a Terminal that does not answer gets to come back
+BOX_READBACK_ROWS=16   # a taller box may hide its top; keep equal to BOX_MAX_ROWS below
+KEYSTROKE_LIMIT=30     # hard outside limit on the keystroke fallback's osascript
 
 if [ -f "$LOG" ]; then
   _logsz=$(stat -f %z "$LOG" 2>/dev/null || echo 0)
@@ -162,8 +195,21 @@ except Exception:
   fi
   echo "session=$SID transcript=${TRANSCRIPT:-none} pct=${PCT:-unknown}"
 
+  # Claude Code's own record of this session, which no change to the renderer can touch.
+  REGISTRY_FILE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions/$TARGET_PID.json"
+  # An unreadable frame is saved here, mode 0600, with how the read went. A dry run writes nothing.
+  DIAG_FILE=""
+  [ "$DRYRUN" = "1" ] || DIAG_FILE="$STATE_DIR/compact-last-unreadable.txt"
+
+  # One look prints TEN lines about the same frame, always ten, because callers read them by
+  # line number: 1 the classifier's word (BUSY, IDLE, PICKER, TYPING:<text> or UNREADABLE),
+  # 2 the compaction marker is on the frame, 3 "Not enough messages" hangs under this
+  # delivery's echo, 4 a compaction line hangs under it, 5 the echo is on the frame, 6 how the
+  # read went (ok, no-tab, blank, osa-error or timeout), 7 the last line of ink, 8 an empty
+  # prompt row sits at column 0 near the tail, 9 everything in the input box, 10 how many rows
+  # the box spans. All off one frame, so the answers cannot straddle a change.
   frame_probe() {
-    SCREEN_TTY="$DEVTTY" PROBE_TEXT="${TEXT:-}" "$PY" - <<'PY' 2>/dev/null
+    SCREEN_TTY="$DEVTTY" PROBE_TEXT="${TEXT:-}" DIAG_FILE="$DIAG_FILE" "$PY" - <<'PY' 2>/dev/null
 import os, subprocess, sys
 
 import re as _re
@@ -201,12 +247,18 @@ BLOCK_GLYPHS = "⎿⏺✻✽✳✶※!"
 NOT_ENOUGH = "Not enough messages to compact."
 COMPACTING = ("Compacting conversation", "Compacted (ctrl+o")
 
+# Claude Code's first-run hint in an empty box, Try "write a test for <filepath>". Matched
+# whole, so typed text that merely starts with the word still counts as text.
+PLACEHOLDER_HINT = _re.compile(r'^Try ".*"$')
+
 TAIL_LINES = 15       # how far up a picker's highlighted row is still quoted back
 PICKER_TAIL_INK = 2   # a picker OWNS the bottom of the frame: its footer or border sits on the
 FOOTER_GAP = 3        # how far above the footer the box's closing rule may sit
 BOX_MAX_ROWS = 16     # how many wrapped rows a normal box holds
 BOX_SCAN_ROWS = 60    # how far up the opening rule is still looked for, so a box wrapped over
 OVER_QUOTE = 60
+BARE_PROMPT_INK = 25  # how far up from the tail an empty prompt row still counts: a task list
+                      # or agent panel can hang under the box
 
 
 def _last_ink(lines):
@@ -330,6 +382,8 @@ def box_text(lines, box):
     for ph in PLACEHOLDERS:
         if text.startswith(ph):
             return ""
+    if PLACEHOLDER_HINT.match(text):
+        return ""
     return text
 
 
@@ -402,6 +456,13 @@ def echo_present(lines, text, box):
     return False
 
 
+def bare_prompt(lines):
+    """True when an empty ❯ row sits at column 0 among the last ink lines: an input box with
+    nothing in it, whatever its footer shows right now. A picker's ❯ row carries a label, and
+    a frame printed into the conversation is indented, so neither passes."""
+    return any(lines[i].rstrip() == PROMPT for i in _ink_tail(lines, BARE_PROMPT_INK))
+
+
 def classify(screen):
     if not screen or not screen.strip():
         return "UNREADABLE"
@@ -423,44 +484,79 @@ def classify(screen):
         return "PICKER"
     return "UNREADABLE"
 
+# By window id, from one snapshot of the ids, so nothing can shift during the walk. Each
+# window has its own try: a tabless window fails on its tabs.
+NO_TAB = "__TELEBOTS_NO_TAB__"
 OSA = '''on run argv
   set targetTty to item 1 of argv
   tell application "Terminal"
-    repeat with w in windows
-      repeat with tb in tabs of w
-        try
-          if tty of tb is targetTty then return history of tb
-        end try
-      end repeat
+    set windowIds to id of every window
+    repeat with i from 1 to count of windowIds
+      try
+        set w to window id (item i of windowIds)
+        repeat with oneTab in tabs of w
+          if tty of oneTab is targetTty then return history of oneTab
+        end repeat
+      end try
     end repeat
   end tell
-  return ""
+  return "''' + NO_TAB + '''"
 end run'''
 
+kind = "ok"
+detail = ""
+screen = ""
 try:
     if os.environ.get("TELEBOTS_TEST") == "1" and os.environ.get("CC_COMPACT_FRAME_FILE"):
         screen = open(os.environ["CC_COMPACT_FRAME_FILE"], encoding="utf-8").read()
+        if not screen.strip():
+            kind = "blank"
     else:
         run = subprocess.run(
             ["/usr/bin/osascript", "-", os.environ["SCREEN_TTY"]],
             input=OSA, capture_output=True, text=True, timeout=8,
         )
-        screen = run.stdout
-except Exception:
-    print("UNREADABLE")
-    print(0)
-    print(0)
-    print(0)
-    print(0)
-    sys.exit(0)
+        if run.returncode != 0:
+            kind = "osa-error"
+            detail = run.stderr.strip()[:300]
+        elif run.stdout.strip() == NO_TAB:
+            kind = "no-tab"
+        elif not run.stdout.strip():
+            kind = "blank"
+        else:
+            screen = run.stdout
+except subprocess.TimeoutExpired:
+    kind = "timeout"
+except Exception as exc:
+    kind = "osa-error"
+    detail = repr(exc)[:300]
 
-print(classify(screen))
-print(1 if any(m in screen for m in COMPACTING) else 0)
+_word = classify(screen)
 _lines = screen.splitlines()
 _text = os.environ.get("PROBE_TEXT", "")
+_box = find_box(_lines)
+_ink = _last_ink(_lines)
+
+print(_word)
+print(1 if any(m in screen for m in COMPACTING) else 0)
 print(1 if answer_under_echo(_lines, _text, (NOT_ENOUGH,)) else 0)
 print(1 if answer_under_echo(_lines, _text, COMPACTING) else 0)
-print(1 if echo_present(_lines, _text, find_box(_lines)) else 0)
+print(1 if echo_present(_lines, _text, _box) else 0)
+print(kind)
+print(" ".join(_lines[_ink].split())[:100] if _ink >= 0 else "")
+print(1 if bare_prompt(_lines) else 0)
+print(box_text(_lines, _box) if _box else "")
+print(_box[1] - _box[0] - 1 if _box else 0)
+
+# Evidence for the next unreadable frame: what was on it and how the read went.
+if _word == "UNREADABLE" and os.environ.get("DIAG_FILE"):
+    try:
+        fd = os.open(os.environ["DIAG_FILE"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("read=%s detail=%s\n---\n%s" % (kind, detail, screen))
+    except Exception:
+        pass
 PY
   }
 
@@ -468,8 +564,108 @@ PY
   frame_marker() { frame_probe | /usr/bin/sed -n '2p'; }
   frame_notenough() { frame_probe | /usr/bin/sed -n '3p'; }
 
+  # One string field of the session registry, or nothing if it cannot be read.
+  registry_field() {
+    "$PY" -c '
+import json, sys
+try:
+    value = json.load(open(sys.argv[1])).get(sys.argv[2])
+    print(value if isinstance(value, str) else "")
+except Exception:
+    print("")
+' "$REGISTRY_FILE" "$1" 2>/dev/null
+  }
+  # busy | shell | idle | waiting, or nothing.
+  registry_status() {
+    local status
+    status=$(registry_field status)
+    case "$status" in busy|shell|idle|waiting) printf '%s\n' "$status" ;; esac
+  }
+  # What a waiting session waits on. "dialog open" is a local menu such as /model that
+  # nobody waits on an answer from; "input needed" is a question; "permission prompt",
+  # "sandbox request", "worker request" and "goal proposal" are permissions.
+  registry_waiting_for() { registry_field waitingFor; }
+
+  # Look until the frame says something worth acting on. $1 is how long an unreadable frame
+  # is looked at again. Call it as a plain command, never inside $(...), because it reports
+  # through variables:
+  #   SETTLED           the classifier's word, after the registry's second opinion
+  #   SETTLED_KIND      how the last read went: ok | no-tab | blank | osa-error | timeout
+  #   SETTLED_INK       the last line of ink on the frame
+  #   SETTLED_BOX       everything in the input box
+  #   SETTLED_ROWS      how many rows the box spans
+  #   SETTLED_UNSTABLE  1 if the box text was still changing when the time ran out
+  # IDLE and BUSY are believed at once. A picker or typed text has to hold for RELOOK_QUICK
+  # seconds, and an unreadable frame is looked at again for up to $1 seconds.
+  settled_state() {
+    local limit="$1" probe t0 elapsed reg bare held_since prev_box now
+    t0=$(date +%s)
+    held_since=$t0
+    prev_box=""
+    SETTLED_UNSTABLE=0
+    while : ; do
+      probe=$(frame_probe)
+      SETTLED=$(printf '%s\n' "$probe" | /usr/bin/sed -n '1p')
+      SETTLED_KIND=$(printf '%s\n' "$probe" | /usr/bin/sed -n '6p')
+      SETTLED_INK=$(printf '%s\n' "$probe" | /usr/bin/sed -n '7p')
+      bare=$(printf '%s\n' "$probe" | /usr/bin/sed -n '8p')
+      SETTLED_BOX=$(printf '%s\n' "$probe" | /usr/bin/sed -n '9p')
+      SETTLED_ROWS=$(printf '%s\n' "$probe" | /usr/bin/sed -n '10p')
+      [ -n "$SETTLED" ] || SETTLED="UNREADABLE"
+      [ -n "$SETTLED_KIND" ] || SETTLED_KIND="osa-error"
+      now=$(date +%s)
+      elapsed=$((now - t0))
+      case "$SETTLED" in
+        IDLE|BUSY) return 0 ;;
+        TYPING:*)
+          # Text this engine's own ctrl-c could not remove is Claude Code's, not typing.
+          if [ -n "${GHOST_BOX:-}" ] && [ "$SETTLED_BOX" = "$GHOST_BOX" ]; then
+            SETTLED="IDLE"
+            return 0
+          fi
+          # Text that is still changing is somebody typing, so the clock starts over.
+          if [ "$SETTLED_BOX" != "$prev_box" ]; then
+            prev_box="$SETTLED_BOX"
+            held_since=$now
+          fi
+          if [ $((now - held_since)) -ge "$RELOOK_QUICK" ]; then
+            return 0
+          fi
+          if [ "$elapsed" -ge "$RELOOK_UNREADABLE" ]; then
+            SETTLED_UNSTABLE=1
+            return 0
+          fi
+          ;;
+        PICKER)
+          [ "$elapsed" -ge "$RELOOK_QUICK" ] && return 0
+          ;;
+        *)
+          reg=$(registry_status)
+          echo "look: UNREADABLE read=$SETTLED_KIND registry=${reg:-unknown} bare_prompt=${bare:-0} after ${elapsed}s, last ink: $SETTLED_INK"
+          if [ "$SETTLED_KIND" = "ok" ] && [ "$elapsed" -ge "$LOOSE_AFTER" ]; then
+            case "$reg" in
+              busy)    SETTLED="BUSY";   return 0 ;;
+              waiting) SETTLED="PICKER"; return 0 ;;
+              idle|shell)
+                # "shell" can outlive its turn, so it says nothing about the box on its own.
+                if [ "${bare:-0}" = "1" ]; then
+                  echo "no footer this engine knows, but the registry says $reg and the prompt row is empty - reading it as IDLE"
+                  SETTLED="IDLE"
+                  return 0
+                fi
+                ;;
+            esac
+          fi
+          [ "$elapsed" -ge "$limit" ] && return 0
+          ;;
+      esac
+      sleep 1
+    done
+  }
+
   if [ "$DRYRUN" = "1" ]; then
-    STATE_NOW=$(screen_state)
+    settled_state "$RELOOK_QUICK"
+    STATE_NOW="$SETTLED"
     TEXT_PREVIEW="/compact"
     [ -n "$FOCUS" ] && TEXT_PREVIEW="/compact $FOCUS"
     echo "DRYRUN screen state on $DEVTTY: ${STATE_NOW:-UNREADABLE}"
@@ -487,9 +683,9 @@ PY
         echo "DRYRUN would then deliver, path A: Terminal 'do script' into the tab on $DEVTTY, with the ${#TEXT_PREVIEW}-character command travelling as item 2 of argv"
         echo "DRYRUN would then re-read the frame about a second later, and if Claude Code's paste handling left that text sitting in the box it would send lone Returns by pty write (no keystrokes, no focus change), ONE AT A TIME with a fresh look at the frame between them and at most ${RETURN_TRIES} of them - Claude Code 2.1.280 swallows the first CR-burst after a paste and takes the second"
         ;;
-      PICKER)     echo "DRYRUN would REFUSE before acking (exit 9), one message only: Can't compact $BOT: a picker is open in its terminal." ;;
-      TYPING:*)   echo "DRYRUN would REFUSE before acking (exit 11), one message only: Can't compact $BOT: there's unsent text typed in its terminal, and compacting would send it. Clear that line and try again." ;;
-      *)          echo "DRYRUN would REFUSE before acking (exit 12), one message only: Can't compact $BOT: couldn't read its terminal window." ;;
+      PICKER)     echo "DRYRUN would hold the ack, press one lone Esc if nobody is waiting on the menu (registry: $(registry_status) $(registry_waiting_for)), otherwise ask once for /esc and wait up to $((MODAL_WAIT / 60)) minutes, then compact" ;;
+      TYPING:*)   echo "DRYRUN would clear the input box with one ctrl-c, quote its text back in chat, then compact. In the box: ${STATE_NOW#TYPING:}" ;;
+      *)          echo "DRYRUN would keep looking for ${RELOOK_UNREADABLE}s (read=$SETTLED_KIND, last ink: $SETTLED_INK), then press one lone Esc if nobody is waiting, then wait and say so if the screen stays unrecognized" ;;
     esac
     echo "DRYRUN nothing was typed, nothing was sent, no file was written"
     echo "=== dryrun done ==="
@@ -521,9 +717,16 @@ PY
     [ -n "$started" ] || started=0
     age=$(( $(date +%s) - started ))
     if [ "$age" -ge 0 ] && [ "$age" -lt "$INFLIGHT_TTL" ]; then
-      echo "REFUSE in-flight marker is ${age}s old (<${INFLIGHT_TTL}s)"
-      tg "A compaction is already in flight for $BOT."
-      exit 7
+      # A compacting bot reads BUSY, and so does one with a /compact queued behind its turn.
+      # Any other screen means the last run failed or finished without its hook clearing the
+      # marker, which must not hold the next compaction back for INFLIGHT_TTL.
+      settled_state "$RELOOK_QUICK"
+      if [ "$SETTLED" = "BUSY" ]; then
+        echo "REFUSE in-flight marker is ${age}s old (<${INFLIGHT_TTL}s) and the bot is busy"
+        tg "A compaction is already in flight for $BOT."
+        exit 7
+      fi
+      echo "in-flight marker is only ${age}s old, but the bot is not busy, so nothing is compacting"
     fi
     echo "in-flight marker is stale (${age}s) - clearing it"
     rm -f "$INFLIGHT" 2>/dev/null || true
@@ -535,129 +738,305 @@ PY
   [ -f "$STARTED_FLAG" ] && STARTED_BEFORE=$(stat -f %m "$STARTED_FLAG" 2>/dev/null || echo 0)
   echo "compact-started watermark before the wait: $STARTED_BEFORE"
 
-  FIRST_LOOK="$(screen_state)"
-  echo "first look at $DEVTTY: ${FIRST_LOOK:-UNREADABLE}"
-  case "$FIRST_LOOK" in
-    IDLE|BUSY) ;;
-    PICKER)
-      echo "REFUSE (pre-ack) picker or modal open on $DEVTTY"
-      tg "Can't compact $BOT: a picker is open in its terminal."
-      exit 9
-      ;;
-    TYPING:*)
-      echo "REFUSE (pre-ack) unsent typed text in the input box: ${FIRST_LOOK#TYPING:}"
-      tg "Can't compact $BOT: there's unsent text typed in its terminal, and compacting would send it. Clear that line and try again."
-      exit 11
-      ;;
-    *)
-      echo "REFUSE (pre-ack) screen unreadable on $DEVTTY (got '${FIRST_LOOK:-}')"
-      tg "Can't compact $BOT: couldn't read its terminal window."
-      exit 12
-      ;;
-  esac
+  # The ack goes out once per run, within a couple of seconds of spawn in the normal case. A
+  # picker holds it back, because that run is not compacting yet: it goes out once the way is
+  # clear.
+  ACKED=0
+  ack_once() {
+    [ "$ACKED" = "1" ] && return 0
+    ACKED=1
+    if [ -n "$PCT" ]; then
+      if [ -n "$FOCUS" ]; then
+        tg "Compacting $BOT now (context ${PCT}%), focus: ${FOCUS}. I'll ping when it's done."
+      else
+        tg "Compacting $BOT now (context ${PCT}%). I'll ping when it's done."
+      fi
+    else
+      if [ -n "$FOCUS" ]; then
+        tg "Compacting $BOT now, focus: ${FOCUS}. I'll ping when it's done."
+      else
+        tg "Compacting $BOT now. I'll ping when it's done."
+      fi
+    fi
+  }
 
-  if [ -n "$PCT" ]; then
-    if [ -n "$FOCUS" ]; then
-      tg "Compacting $BOT now (context ${PCT}%), focus: ${FOCUS}. I'll ping when it's done."
-    else
-      tg "Compacting $BOT now (context ${PCT}%). I'll ping when it's done."
-    fi
-  else
-    if [ -n "$FOCUS" ]; then
-      tg "Compacting $BOT now, focus: ${FOCUS}. I'll ping when it's done."
-    else
-      tg "Compacting $BOT now. I'll ping when it's done."
-    fi
-  fi
+  settled_state "$RELOOK_QUICK"
+  echo "first look at $DEVTTY: $SETTLED (read=$SETTLED_KIND)"
+  case "$SETTLED" in
+    PICKER) ;;
+    *) ack_once ;;
+  esac
 
   waited=0
   told_busy=0
-  while : ; do
-    SCREEN="$(screen_state)"
-    case "$SCREEN" in
-      IDLE)
-        echo "screen IDLE after ${waited}s - delivering"
-        break
-        ;;
-      BUSY)
-        if [ "$told_busy" = "0" ]; then
-          echo "screen BUSY - notifying once, then polling every ${BUSY_POLL}s"
-          tg "$BOT is mid-task. I'll compact the moment this turn ends."
-          told_busy=1
+  told_modal=0
+  modal_since=0
+  stall_since=0
+  TYPED_MOVED=0
+  GHOST_BOX=""
+  LAST_NOTE=""
+  # BUSY_WAIT_MAX bounds the whole wait, menus included, so BOTLOCK_STALE stays longer than
+  # the longest legitimate run.
+  ENGINE_DEADLINE=$(( $(date +%s) + BUSY_WAIT_MAX ))
+
+  note_once() { [ "$1" = "$LAST_NOTE" ] || { LAST_NOTE="$1"; echo "$1"; }; }
+
+  # One lone Esc, by itself, on a menu or screen nobody is waiting on. Returns 0 when it went
+  # in. At most one try per run, and never on a question or a permission prompt.
+  ESC_TRIED=0
+  ESC_SENT=0
+  close_leftover_screen() {
+    local ret why
+    [ "$ESC_TRIED" = "0" ] || return 1
+    case "$(registry_status)" in
+      idle|shell) ;;
+      waiting)
+        why=$(registry_waiting_for)
+        if [ "$why" != "dialog open" ]; then
+          note_once "not pressing Esc: the bot is waiting on: ${why:-something unnamed}"
+          return 1
         fi
-        if [ "$waited" -ge "$BUSY_WAIT_MAX" ]; then
-          echo "GIVE UP: still busy after ${waited}s"
-          tg "Gave up waiting to compact $BOT: it has been mid-task for $((BUSY_WAIT_MAX / 60)) minutes. Nothing changed. Send /compact again when it's free."
-          rm -f "$INFLIGHT" 2>/dev/null || true
-          exit 8
-        fi
-        sleep "$BUSY_POLL"
-        waited=$((waited + BUSY_POLL))
-        ;;
-      PICKER)
-        echo "REFUSE picker or modal open on $DEVTTY"
-        tg "Can't compact $BOT: a picker is open in its terminal."
-        exit 9
-        ;;
-      TYPING:*)
-        echo "REFUSE unsent typed text in the input box: ${SCREEN#TYPING:}"
-        tg "Can't compact $BOT: there's unsent text typed in its terminal, and compacting would send it. Clear that line and try again."
-        exit 11
         ;;
       *)
-        echo "REFUSE screen unreadable on $DEVTTY (got '${SCREEN:-}')"
-        tg "Can't compact $BOT: couldn't read its terminal window."
-        exit 12
+        note_once "not pressing Esc: the session registry does not say the bot is idle"
+        return 1
         ;;
     esac
-  done
+    ESC_TRIED=1
+    ret=$("$PY" - "$DEVTTY" <<'PY' 2>&1 | tail -1
+import fcntl, os, signal, sys, termios
+signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_NOCTTY)
+fcntl.ioctl(fd, termios.TIOCSTI, b"\x1b")
+print("OK")
+PY
+)
+    echo "$(date '+%F %T') lone Esc by ioctl on $DEVTTY, to close what is on the screen (last ink: ${SETTLED_INK:-none}): ${ret:-no answer}"
+    [ "${ret:-}" = "OK" ] || return 1
+    ESC_SENT=1
+    sleep 2
+    return 0
+  }
 
-  STARTED_NOW=0
-  [ -f "$STARTED_FLAG" ] && STARTED_NOW=$(stat -f %m "$STARTED_FLAG" 2>/dev/null || echo 0)
-  if [ "${STARTED_NOW:-0}" -gt "${STARTED_BEFORE:-0}" ]; then
-    echo "STAND DOWN: compact-started moved from $STARTED_BEFORE to $STARTED_NOW during the ${waited}s wait - the bot compacted itself"
-    tg "A compaction just ran on $BOT by itself, so I'm standing down."
-    rm -f "$INFLIGHT" 2>/dev/null || true
-    exit 0
-  fi
-
-  revalidate_failed=""
-  if ! kill -0 "$TARGET_PID" 2>/dev/null; then
-    revalidate_failed="pid $TARGET_PID is gone"
-  else
-    cmd2=$(ps -p "$TARGET_PID" -o comm= 2>/dev/null | tr -d '[:space:]')
-    cwd2=$(lsof -a -p "$TARGET_PID" -d cwd 2>/dev/null | awk 'NR>1 {print $NF}')
-    tty2=$(ps -p "$TARGET_PID" -o tty= 2>/dev/null | tr -d '[:space:]')
-    if [[ "$cmd2" != *"claude"* ]]; then
-      revalidate_failed="pid $TARGET_PID is no longer a claude (comm=$cmd2)"
-    elif [ "$cwd2" != "$TARGET_CWD" ]; then
-      revalidate_failed="its cwd is now '$cwd2', not '$TARGET_CWD'"
-    elif [[ ! "$tty2" =~ ^ttys[0-9]+$ ]]; then
-      revalidate_failed="its tty is now implausible ('$tty2')"
-    elif [ "$tty2" != "$TTY" ]; then
-      echo "re-validate: tty moved from $TTY to $tty2 during the wait - re-resolving"
-      TTY="$tty2"
-      DEVTTY="/dev/$tty2"
+  # Something the user can close from the phone is in the way: ask once and keep looking.
+  hold_for_modal() {
+    local what="$1" code="$2" now reason=""
+    now=$(date +%s)
+    [ "$modal_since" != "0" ] || modal_since=$now
+    if [ "$told_modal" = "0" ]; then
+      told_modal=1
+      echo "HOLD $what"
+      if [ "$ESC_SENT" = "1" ]; then
+        tg "$what I pressed Esc once and it stayed up, so it needs closing at the Mac. I'll compact right after, and I'll keep watching for $((MODAL_WAIT / 60)) minutes."
+      else
+        tg "$what Tap /esc to close it and I'll compact right after. I'll keep watching for $((MODAL_WAIT / 60)) minutes."
+      fi
     fi
-  fi
-  if [ -n "$revalidate_failed" ]; then
-    echo "REFUSE re-validation failed after a ${waited}s wait: $revalidate_failed"
-    tg "Can't compact $BOT: its session changed while I was waiting for it to be free, so I didn't type anything. Send /compact again."
-    rm -f "$INFLIGHT" 2>/dev/null || true
-    exit 15
-  fi
-  echo "re-validated after ${waited}s: pid=$TARGET_PID tty=$TTY cwd=$TARGET_CWD"
+    if [ $((now - modal_since)) -ge "$MODAL_WAIT" ]; then
+      reason="that screen stayed open for $((MODAL_WAIT / 60)) minutes"
+    elif [ "$now" -ge "$ENGINE_DEADLINE" ]; then
+      reason="it has been $((BUSY_WAIT_MAX / 60)) minutes since the /compact and that screen is still open"
+    fi
+    if [ -n "$reason" ]; then
+      echo "GIVE UP: $reason"
+      tg "Gave up compacting $BOT: ${reason}. Nothing changed. Tap /esc, then send /compact again."
+      rm -f "$INFLIGHT" 2>/dev/null || true
+      exit "$code"
+    fi
+    sleep "$MODAL_POLL"
+  }
 
-  RECHECK="$(screen_state)"
-  if [ "$RECHECK" != "IDLE" ]; then
-    echo "REFUSE the screen stopped being IDLE between the wait and delivery (got '${RECHECK:-}')"
-    case "$RECHECK" in
-      PICKER)   tg "Can't compact $BOT: a picker opened in its terminal just before I typed. Nothing changed." ; rm -f "$INFLIGHT" 2>/dev/null || true; exit 9 ;;
-      TYPING:*) tg "Can't compact $BOT: text appeared in its terminal just before I typed, and compacting would send it. Nothing changed." ; rm -f "$INFLIGHT" 2>/dev/null || true; exit 11 ;;
-      BUSY)     tg "Can't compact $BOT: it picked up new work just before I typed. Nothing changed. Send /compact again when it's free." ; rm -f "$INFLIGHT" 2>/dev/null || true; exit 8 ;;
-      *)        tg "Can't compact $BOT: couldn't read its terminal window. Nothing changed." ; rm -f "$INFLIGHT" 2>/dev/null || true; exit 12 ;;
+  # Text stranded in the box must not block a compaction from the phone, and must not be lost.
+  # One ctrl-c empties the box whatever its length; the text is saved to compact-cleared-box.txt
+  # (mode 0600) first and quoted back in chat. ONLY ONE CTRL-C PER RUN: a second within a
+  # couple of seconds quits Claude Code. Text still there afterwards was never typed: it is
+  # Claude Code's own placeholder, read as an empty box from then on, and nothing is said.
+  move_typed_text() {
+    local text="$SETTLED_BOX" rows="${SETTLED_ROWS:-0}" ret quote
+    [ -n "$text" ] || text="${SETTLED#TYPING:}"
+    if [ "$SETTLED_UNSTABLE" = "1" ] || [ "$TYPED_MOVED" = "1" ]; then
+      echo "REFUSE the box text keeps changing, or came back after it was cleared: $text"
+      tg "Can't compact $BOT: someone is typing in its terminal right now, so I left it alone. Nothing changed. Send /compact again when they're done."
+      rm -f "$INFLIGHT" 2>/dev/null || true
+      exit 11
+    fi
+    case "$text" in
+      *"[Pasted text"*|*"[Image #"*|*"[Pasted image"*) rows=999 ;;
     esac
-  fi
+    [[ "$rows" =~ ^[0-9]+$ ]] || rows=999
+    if [ "$rows" -gt "$BOX_READBACK_ROWS" ]; then
+      echo "REFUSE the box holds more than can be read back whole (rows=$rows): $text"
+      tg "Can't compact $BOT: its input box holds a paste or a long text I can't read back whole, so clearing it could lose it. Nothing changed. That line has to be sent or cleared at the Mac."
+      rm -f "$INFLIGHT" 2>/dev/null || true
+      exit 11
+    fi
+    TYPED_MOVED=1
+    (umask 077; rm -f "$STATE_DIR/compact-cleared-box.txt"; printf '%s\n' "$text" > "$STATE_DIR/compact-cleared-box.txt") 2>/dev/null || true
+    ret=$(/usr/bin/osascript - "$DEVTTY" <<'OSA' 2>&1
+on run argv
+  set targetTty to item 1 of argv
+  tell application "Terminal"
+    set windowIds to id of every window
+    repeat with i from 1 to count of windowIds
+      try
+        set w to window id (item i of windowIds)
+        repeat with oneTab in tabs of w
+          if tty of oneTab is targetTty then
+            do script (ASCII character 3) in oneTab
+            return "OK"
+          end if
+        end repeat
+      end try
+    end repeat
+  end tell
+  return "NOWINDOW"
+end run
+OSA
+)
+    echo "$(date '+%F %T') ctrl-c into the box: ${ret:-OSAERROR}"
+    if [ "${ret:-}" != "OK" ]; then
+      tg "Can't compact $BOT: there's unsent text in its input box and I couldn't clear it from here. A copy is saved on the Mac in its state folder, in compact-cleared-box.txt."
+      rm -f "$INFLIGHT" 2>/dev/null || true
+      exit 11
+    fi
+    sleep 1
+    settled_state "$RELOOK_UNREADABLE"
+    case "$SETTLED" in
+      TYPING:*)
+        if [ "$SETTLED_BOX" = "$text" ]; then
+          echo "the box still reads the same after ctrl-c, so it is Claude Code's placeholder, not typing: $text"
+          GHOST_BOX="$text"
+          SETTLED="IDLE"
+          return 0
+        fi
+        ;;
+    esac
+    echo "cleared the box, it held: $text"
+    quote=$(TEXT_IN="$text" "$PY" -c '
+import os, sys
+t = os.environ.get("TEXT_IN", "")
+if len(t) > 3500:
+    t = t[:3500] + " ... (cut short here; the whole text is in compact-cleared-box.txt on the Mac)"
+sys.stdout.write(t)
+' 2>/dev/null)
+    [ -n "$quote" ] || quote="$text"
+    tg "I cleared unsent text from ${BOT}'s input box so the compact can run. Here it is, so nothing's lost:
+
+$quote"
+  }
+
+  wait_until_free() {
+    while : ; do
+      settled_state "$RELOOK_UNREADABLE"
+      # Any answer from Terminal ends a stall, so a later stall gets its own STALL_WAIT.
+      case "$SETTLED_KIND" in osa-error|timeout) ;; *) stall_since=0 ;; esac
+      case "$SETTLED" in
+        IDLE)
+          modal_since=0
+          echo "screen IDLE after ${waited}s - delivering"
+          return 0
+          ;;
+        BUSY)
+          modal_since=0
+          if [ "$told_busy" = "0" ]; then
+            echo "screen BUSY - notifying once, then polling every ${BUSY_POLL}s"
+            tg "$BOT is mid-task. I'll compact the moment this turn ends."
+            told_busy=1
+          fi
+          if [ "$(date +%s)" -ge "$ENGINE_DEADLINE" ]; then
+            echo "GIVE UP: still busy after ${waited}s"
+            tg "Gave up waiting to compact $BOT: it has been mid-task for $((BUSY_WAIT_MAX / 60)) minutes. Nothing changed. Send /compact again when it's free."
+            rm -f "$INFLIGHT" 2>/dev/null || true
+            exit 8
+          fi
+          sleep "$BUSY_POLL"
+          waited=$((waited + BUSY_POLL))
+          ;;
+        PICKER)
+          close_leftover_screen && continue
+          hold_for_modal "$BOT has a menu or question open in its terminal, and typing now would answer it." 9
+          ;;
+        TYPING:*)
+          move_typed_text
+          ;;
+        *)
+          case "$SETTLED_KIND" in
+            ok|blank)
+              close_leftover_screen && continue
+              hold_for_modal "${BOT}'s terminal is showing a screen I don't recognize, so I'm not typing into it blind. The last line on it: ${SETTLED_INK:-(blank)}." 12
+              ;;
+            no-tab)
+              echo "REFUSE no Terminal tab carries $DEVTTY"
+              tg "Can't compact $BOT: its session is running, but I can't find a Terminal window for it to type into. Nothing changed."
+              rm -f "$INFLIGHT" 2>/dev/null || true
+              exit 12
+              ;;
+            *)
+              # A stalled Terminal comes back: a read can time out once and the next be fine.
+              [ "$stall_since" != "0" ] || stall_since=$(date +%s)
+              if [ $(( $(date +%s) - stall_since )) -lt "$STALL_WAIT" ]; then
+                note_once "Terminal is not answering ($SETTLED_KIND) - waiting up to ${STALL_WAIT}s for it"
+                sleep "$BUSY_POLL"
+                continue
+              fi
+              echo "REFUSE Terminal has not answered for ${STALL_WAIT}s ($SETTLED_KIND)"
+              tg "Can't compact $BOT: Terminal on the Mac hasn't answered for $((STALL_WAIT / 60)) minutes, so I can't reach its window. Nothing changed. Try again in a minute."
+              rm -f "$INFLIGHT" 2>/dev/null || true
+              exit 12
+              ;;
+          esac
+          ;;
+      esac
+    done
+  }
+
+  while : ; do
+    wait_until_free
+
+    STARTED_NOW=0
+    [ -f "$STARTED_FLAG" ] && STARTED_NOW=$(stat -f %m "$STARTED_FLAG" 2>/dev/null || echo 0)
+    if [ "${STARTED_NOW:-0}" -gt "${STARTED_BEFORE:-0}" ]; then
+      echo "STAND DOWN: compact-started moved from $STARTED_BEFORE to $STARTED_NOW during the ${waited}s wait - the bot compacted itself"
+      tg "A compaction just ran on $BOT by itself, so I'm standing down."
+      rm -f "$INFLIGHT" 2>/dev/null || true
+      exit 0
+    fi
+
+    revalidate_failed=""
+    if ! kill -0 "$TARGET_PID" 2>/dev/null; then
+      revalidate_failed="pid $TARGET_PID is gone"
+    else
+      cmd2=$(ps -p "$TARGET_PID" -o comm= 2>/dev/null | tr -d '[:space:]')
+      cwd2=$(lsof -a -p "$TARGET_PID" -d cwd 2>/dev/null | awk 'NR>1 {print $NF}')
+      tty2=$(ps -p "$TARGET_PID" -o tty= 2>/dev/null | tr -d '[:space:]')
+      if [[ "$cmd2" != *"claude"* ]]; then
+        revalidate_failed="pid $TARGET_PID is no longer a claude (comm=$cmd2)"
+      elif [ "$cwd2" != "$TARGET_CWD" ]; then
+        revalidate_failed="its cwd is now '$cwd2', not '$TARGET_CWD'"
+      elif [[ ! "$tty2" =~ ^ttys[0-9]+$ ]]; then
+        revalidate_failed="its tty is now implausible ('$tty2')"
+      elif [ "$tty2" != "$TTY" ]; then
+        echo "re-validate: tty moved from $TTY to $tty2 during the wait - re-resolving"
+        TTY="$tty2"
+        DEVTTY="/dev/$tty2"
+      fi
+    fi
+    if [ -n "$revalidate_failed" ]; then
+      echo "REFUSE re-validation failed after a ${waited}s wait: $revalidate_failed"
+      tg "Can't compact $BOT: its session changed while I was waiting for it to be free, so I didn't type anything. Send /compact again."
+      rm -f "$INFLIGHT" 2>/dev/null || true
+      exit 15
+    fi
+    echo "re-validated after ${waited}s: pid=$TARGET_PID tty=$TTY cwd=$TARGET_CWD"
+
+    # The frame decided on is a few seconds old by now, so the box has to read empty again.
+    # Anything else goes round again: every state has its own answer above, and none of them
+    # is a reason to drop the compaction.
+    settled_state "$RELOOK_UNREADABLE"
+    [ "$SETTLED" = "IDLE" ] && break
+    echo "the screen moved off IDLE just before delivery (got '$SETTLED') - going round again"
+  done
+  ack_once
 
   TEXT="/compact"
   [ -n "$FOCUS" ] && TEXT="/compact $FOCUS"
@@ -757,15 +1136,17 @@ sys.exit(0 if b and b == t else 1)
 on run argv
   set targetTty to item 1 of argv
   tell application "Terminal"
-    repeat with w in windows
-      repeat with tb in tabs of w
-        try
-          if tty of tb is targetTty then
-            do script "" in tb
+    set windowIds to id of every window
+    repeat with i from 1 to count of windowIds
+      try
+        set w to window id (item i of windowIds)
+        repeat with oneTab in tabs of w
+          if tty of oneTab is targetTty then
+            do script "" in oneTab
             return "OK"
           end if
-        end try
-      end repeat
+        end repeat
+      end try
     end repeat
   end tell
   return "NOWINDOW"
@@ -803,22 +1184,26 @@ on run argv
     set killer to killer & (ASCII character 21)
   end repeat
   tell application "Terminal"
-    repeat with w in windows
-      repeat with tb in tabs of w
-        try
-          if tty of tb is targetTty then
-            do script killer in tb
+    set windowIds to id of every window
+    repeat with i from 1 to count of windowIds
+      try
+        set w to window id (item i of windowIds)
+        repeat with oneTab in tabs of w
+          if tty of oneTab is targetTty then
+            do script killer in oneTab
             return "OK"
           end if
-        end try
-      end repeat
+        end repeat
+      end try
     end repeat
   end tell
   return "NOWINDOW"
 end run
 OSA
     sleep 1
-    case "$(screen_state)" in
+    # Success means the box reads empty, and nothing else.
+    settled_state "$RELOOK_QUICK"
+    case "$SETTLED" in
       IDLE) return 0 ;;
       *)    return 1 ;;
     esac
@@ -826,7 +1211,8 @@ OSA
 
   report_failure() {
     local reason="$1" state tail
-    state="$(screen_state)"
+    settled_state "$RELOOK_QUICK"
+    state="$SETTLED"
     case "$state" in
       TYPING:*)
         if box_is_ours "${state#TYPING:}"; then
@@ -848,6 +1234,22 @@ OSA
     rm -f "$INFLIGHT" 2>/dev/null || true
   }
 
+  # One osascript under a hard limit from outside, script on stdin. Prints what osascript
+  # printed, or TIMEOUT (status 124) once the limit hits and the osascript is killed.
+  osa_limited() {   # osa_limited <seconds> <argv...>
+    "$PY" -c '
+import subprocess, sys
+try:
+    run = subprocess.run(["/usr/bin/osascript", "-"] + sys.argv[2:], stdin=sys.stdin,
+                         capture_output=True, timeout=float(sys.argv[1]))
+except subprocess.TimeoutExpired:
+    print("TIMEOUT")
+    sys.exit(124)
+sys.stdout.write((run.stdout + run.stderr).decode("utf-8", "replace"))
+sys.exit(run.returncode)
+' "$@"
+  }
+
   say_queued() {
     echo "=== done (the /compact is queued behind the turn $BOT was already in) ==="
     tg "$BOT was mid-task when the command went in, so it's queued behind that work and will compact when it finishes. I'll ping when it's done."
@@ -866,15 +1268,17 @@ on run argv
   set targetTty to item 1 of argv
   set theText to item 2 of argv
   tell application "Terminal"
-    repeat with w in windows
-      repeat with tb in tabs of w
-        try
-          if tty of tb is targetTty then
-            do script theText in tb
+    set windowIds to id of every window
+    repeat with i from 1 to count of windowIds
+      try
+        set w to window id (item i of windowIds)
+        repeat with oneTab in tabs of w
+          if tty of oneTab is targetTty then
+            do script theText in oneTab
             return "OK"
           end if
-        end try
-      end repeat
+        end repeat
+      end try
     end repeat
   end tell
   return "NOWINDOW"
@@ -953,7 +1357,8 @@ OSA
 
   echo "path A did not run (${RESULT_A:-OSAERROR}) - nothing was typed, falling back to path B (keystrokes)"
 
-  PRE_B="$(screen_state)"
+  settled_state "$RELOOK_UNREADABLE"
+  PRE_B="$SETTLED"
   echo "frame before path B: ${PRE_B:-UNREADABLE}"
   if [ "$PRE_B" != "IDLE" ]; then
     echo "REFUSE path B: the input box is not empty (got '${PRE_B:-}')"
@@ -983,23 +1388,32 @@ OSA
   FRONT=$(/usr/bin/osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true' 2>/dev/null)
   echo "frontmost before path B: ${FRONT:-unknown}"
 
-  RESULT_B=$(/usr/bin/osascript - "$DEVTTY" "$TEXT" <<'OSA' 2>&1
+  # The whole keystroke script runs under KEYSTROKE_LIMIT from outside. The AppleScript
+  # timeout around activate keeps a slow activation from stopping the script, but it is not a
+  # bound: on a frozen app osascript was measured sitting 124 seconds past one.
+  RESULT_B=$(osa_limited "$KEYSTROKE_LIMIT" "$DEVTTY" "$TEXT" <<'OSA' 2>&1
 on run argv
   set targetTty to item 1 of argv
   set theText to item 2 of argv
   set found to false
   tell application "Terminal"
-    activate
-    repeat with w in windows
-      repeat with tb in tabs of w
-        try
-          if tty of tb is targetTty then
+    try
+      with timeout of 5 seconds
+        activate
+      end timeout
+    end try
+    set windowIds to id of every window
+    repeat with i from 1 to count of windowIds
+      try
+        set w to window id (item i of windowIds)
+        repeat with oneTab in tabs of w
+          if tty of oneTab is targetTty then
             set frontmost of w to true
-            set selected tab of w to tb
+            set selected tab of w to oneTab
             set found to true
           end if
-        end try
-      end repeat
+        end repeat
+      end try
     end repeat
   end tell
   if not found then return "NOWINDOW"
@@ -1062,6 +1476,7 @@ OSA
   fi
 
   case "${RESULT_B:-OSAERROR}" in
+    TIMEOUT)    REASON="Terminal stopped answering partway through the keystrokes, so they may not have gone in." ;;
     NOWINDOW)   REASON="no Terminal window is carrying this bot's tty." ;;
     NOTFRONT:*) REASON="the Mac wouldn't bring the bot's window forward (screen locked?)." ;;
     WRONGTAB:*) REASON="the wrong tab came forward, so nothing was typed." ;;

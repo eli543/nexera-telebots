@@ -42,15 +42,27 @@
 #        looked), the caller's plan is stale and the run exits 7 without
 #        signaling or launching anything; otherwise the bot is down and a new
 #        session is spawned. A pid that was not running here is never signaled.
-#   4. SIGTERM, wait up to 8s, SIGKILL only if it lingers. Right before each
+#   4. Before anything is signaled, Terminal has to answer an Apple event, because
+#      a stopped session needs Terminal to open its replacement. While Terminal
+#      does not answer, the old session keeps working: the run says so once
+#      (unless quiet), waits up to TERMINAL_WAIT, and then refuses with exit 8.
+#      SIGTERM, wait up to 8s, SIGKILL only if it lingers. Right before each
 #      signal the recorded identity is read again; a pid whose start time or
 #      command line changed (its number was reused) is not signaled, and an
 #      identity that cannot be read exits 8.
 #   5. Opens a new Terminal window running fleet-launch (the command line is
 #      single-quoted for the shell and handed to osascript as an argument, never
-#      written into the AppleScript text), then waits for the new poller: bot.pid
-#      written since the launch and naming a live process, and a heartbeat since
-#      the launch. Install heartbeat patch 03 before using these engines.
+#      written into the AppleScript text). The `do script` runs as its own
+#      osascript under OPEN_TIMEOUT, enforced from outside, because an AppleScript
+#      timeout does not bound a frozen app; `activate` runs after it in the
+#      background and nothing waits on it. A failed open is retried until
+#      OPEN_WAIT runs out. Apple events run in order, so once Terminal answers
+#      again a `do script` that timed out has run or never will: each retry first
+#      looks for the session it may have started, because fleet-launch has no
+#      double-launch guard. Then it waits for the new poller: bot.pid written
+#      since the launch and naming a live process, and a heartbeat since the
+#      launch. A restart that does not come back sends one notice (unless quiet).
+#      Install heartbeat patch 03 before using these engines.
 #   6. Closes the old window only on proof, the menu bar app's standard: every
 #      process still on the old tty is one of the recorded host processes (same
 #      pid and start time) and none is claude, and Terminal's own inspection
@@ -67,12 +79,14 @@
 #   3  target pid is not a claude process
 #   4  target pid's cwd is not the bot's workdir (sibling protection)
 #   5  launcher missing
-#   6  spawned, but the poller never came up inside POLLER_WAIT seconds
+#   6  the old session stopped, but the new window never opened or its poller
+#      never came up inside POLLER_WAIT seconds
 #   7  skipped, nothing signaled and nothing launched: another restart of this bot
 #      is in flight, or the target is not running and the bot is already up as
 #      another session. A skip is not a restart; never report it as one.
 #   8  refused: the target's probes timed out or came back empty while it was
-#      alive, or its identity could not be read again right before a signal.
+#      alive, its identity could not be read again right before a signal, or
+#      Terminal did not answer for TERMINAL_WAIT before anything was signaled.
 #      Nothing (more) was signaled and no window was opened.
 #
 # Process discovery is ps -axo plus lsof or the TELEGRAM_STATE_DIR environment
@@ -84,7 +98,7 @@
 set -uo pipefail
 
 usage() {
-  sed -n '2,79p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,93p' "$0" | sed 's/^# \{0,1\}//'
 }
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
@@ -122,6 +136,9 @@ mkdir -p "$LOG_DIR" 2>/dev/null || true
 OLD_TTY=""
 LOCK_STALE=180       # seconds: a restart lock that records NO pid and is older than this belonged to a crashed run (a lock whose pid is alive is never taken over)
 POLLER_WAIT=60       # seconds to wait for the new session's poller before calling it a failure
+TERMINAL_WAIT=300    # seconds a working session is left alone while Terminal does not answer, before the restart is refused
+OPEN_WAIT=480        # seconds to keep trying to open the new window once the old session is gone
+OPEN_TIMEOUT=40      # seconds one try at opening it gets, enforced from outside; a normal one takes under a second
 RC=0
 # Locks live under /tmp (cleared at boot, so a lock can never outlive a restart),
 # named for this fleet so parallel fleets or a test run never collide.
@@ -442,6 +459,30 @@ printable() { printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-160; }
 # zsh all read it back byte for byte).
 shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
+# terminal_answers <seconds>: does Terminal answer an Apple event right now? One
+# cheap event under a hard limit from outside, because osascript itself can sit
+# for minutes on a frozen app whatever an AppleScript timeout says. Its output is
+# not needed, only whether it answered.
+terminal_answers() {
+  run_with_timeout "${1:-5}" TA_OUT /usr/bin/osascript -e 'tell application "Terminal" to count windows'
+}
+
+# find_new_session: sets NEW_PID to a running session of this bot other than the
+# target, found by its --channels command line and its cwd; 0 when one is up.
+# ps -axo, never pgrep -f.
+find_new_session() {
+  local p _rest pcwd
+  NEW_PID=""
+  # shellcheck disable=SC2009
+  while read -r p _rest; do
+    [ -z "$p" ] && continue
+    [ "$p" = "$TARGET_PID" ] && continue
+    pcwd=$(lsof -a -p "$p" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
+    if [ "$pcwd" = "$TARGET_CWD" ]; then NEW_PID="$p"; return 0; fi
+  done < <(ps -axo pid=,command= 2>/dev/null | grep -F -- "--channels plugin:telegram@claude-plugins-official" | grep -v grep)
+  return 1
+}
+
 # ident_of <pid> [seconds]: the pid's start time, program name and command line as
 # ps prints them, time-boxed, into IDENT_OUT (empty when the pid is gone or the
 # probe failed). A pid plus its start time names one process for good.
@@ -634,21 +675,24 @@ on run argv
     set matchCount to 0
     set wid to missing value
     set tabCount to 0
-    repeat with w in windows
-      set tabList to tabs of w
-      repeat with t in tabList
-        set tabTTY to ""
-        try
-          set tabTTY to tty of t
-        on error errText
-          return "left all windows open: a tab tty could not be read (" & errText & ")"
-        end try
-        if tabTTY is wanted then
-          set matchCount to matchCount + 1
-          set wid to id of w
-          set tabCount to count of tabList
-        end if
-      end repeat
+    set windowIds to id of every window
+    repeat with i from 1 to count of windowIds
+      try
+        set w to window id (item i of windowIds)
+        repeat with oneTab in tabs of w
+          set tabTTY to ""
+          try
+            set tabTTY to tty of oneTab
+          on error errText
+            return "left all windows open: a tab tty could not be read (" & errText & ")"
+          end try
+          if tabTTY is wanted then
+            set matchCount to matchCount + 1
+            set wid to id of w
+            set tabCount to count of tabs of w
+          end if
+        end repeat
+      end try
     end repeat
     if matchCount is 0 then return "no tab on " & wanted & ", nothing to close"
     if matchCount is not 1 then return "left it alone: " & matchCount & " tabs report " & wanted
@@ -703,6 +747,8 @@ OSA
   fi
   WORKDIR="$(fc bot "$KEY" workdir 2>/dev/null || true)"
   STATE_DIR="$(fc bot "$KEY" state_dir 2>/dev/null || true)"
+  BOT_LABEL="$(fc bot "$KEY" name 2>/dev/null || true)"
+  [ -n "$BOT_LABEL" ] || BOT_LABEL="$KEY"
   [ "${#WORKDIR}" -gt 1 ] && WORKDIR="${WORKDIR%/}"   # lsof reports a cwd with no trailing slash
   if [[ "$WORKDIR" != /* || "$STATE_DIR" != /* || "$WORKDIR" == *[[:cntrl:]]* || "$STATE_DIR" == *[[:cntrl:]]* ]]; then
     echo "REFUSE fleet.json gives $KEY an unusable workdir or state dir (it must be an absolute path with no control characters)"
@@ -862,6 +908,28 @@ OSA
     echo "WARN target $TARGET_PID not running and no other $KEY session is up; will spawn a fresh one in $TARGET_CWD (pid $TARGET_PID is never signaled)"
   fi
 
+  # Never stop a session unless Terminal can open its replacement: a frozen Terminal
+  # once left a bot stopped with no new window and no alert. The old session keeps
+  # working while this waits.
+  if [ "$TARGET_PRESENT" = "1" ] && ! terminal_answers 5; then
+    echo "$(date '+%F %T') Terminal is not answering Apple events - leaving $TARGET_PID alone for up to ${TERMINAL_WAIT}s"
+    if [ "$QUIET" = "quiet" ]; then
+      echo "$(date '+%F %T') Terminal notice suppressed (quiet mode)"
+    else
+      tg_notice "Terminal on the Mac isn't answering, so ${BOT_LABEL} stays up as it is for now. I'll restart it as soon as Terminal responds."
+    fi
+    terminal_deadline=$(( $(date +%s) + TERMINAL_WAIT ))
+    until terminal_answers 5; do
+      if [ "$(date +%s)" -ge "$terminal_deadline" ]; then
+        echo "$(date '+%F %T') REFUSE Terminal did not answer for ${TERMINAL_WAIT}s - nothing signaled, nothing launched"
+        [ "$QUIET" = "quiet" ] || tg_notice "Couldn't restart ${BOT_LABEL}: Terminal on the Mac hasn't answered for $((TERMINAL_WAIT / 60)) minutes. ${BOT_LABEL} is still running as it was. Nothing changed."
+        exit 8
+      fi
+      sleep 2
+    done
+    echo "$(date '+%F %T') Terminal answered again - carrying on"
+  fi
+
   # Let the calling hook exit cleanly before its parent dies.
   sleep 2
 
@@ -941,16 +1009,43 @@ OSA
   # makes the liveness check below immune to the previous poller's leftover files.
   LAUNCH_EPOCH=$(date +%s)
 
-  /usr/bin/osascript - "$LAUNCH_CMD" <<'OSA'
-on run argv
-  tell application "Terminal"
-    activate
-    do script (item 1 of argv)
-  end tell
-end run
-OSA
-  rc=$?
-  echo "$(date '+%F %T') osascript exit=$rc"
+  # The new window first, as its own osascript under OPEN_TIMEOUT from outside, and
+  # `activate` after it in the background with nothing waiting on it: coming
+  # forward is a courtesy, it once hung for 2 minutes, and an AppleScript timeout
+  # did not bound it. A failed try is retried until OPEN_WAIT runs out, but only
+  # after looking for the session that try may have started late.
+  OPEN_DEADLINE=$(( $(date +%s) + OPEN_WAIT ))
+  while : ; do
+    OPEN_OUT=""
+    run_with_timeout "$OPEN_TIMEOUT" OPEN_OUT /usr/bin/osascript \
+      -e 'on run argv' \
+      -e 'tell application "Terminal" to do script (item 1 of argv)' \
+      -e 'end run' \
+      -- "$LAUNCH_CMD"
+    rc=$?
+    echo "$(date '+%F %T') osascript exit=$rc ${OPEN_OUT}"
+    if [ "$rc" -eq 0 ]; then
+      /usr/bin/osascript -e 'tell application "Terminal" to activate' >/dev/null 2>&1 &
+      disown $! 2>/dev/null || true
+      break
+    fi
+    # Events run in order, so once Terminal answers a later one, the `do script` that
+    # failed has either run or never will. Look for its session before opening another.
+    until terminal_answers 5; do
+      [ "$(date +%s)" -ge "$OPEN_DEADLINE" ] && break
+      sleep 2
+    done
+    sleep 5
+    if find_new_session; then
+      echo "$(date '+%F %T') the open that failed ran after all (session pid $NEW_PID) - not opening a second window"
+      break
+    fi
+    if [ "$(date +%s)" -ge "$OPEN_DEADLINE" ]; then
+      echo "$(date '+%F %T') gave up opening the new window after ${OPEN_WAIT}s"
+      break
+    fi
+    echo "$(date '+%F %T') the new window did not open - trying again"
+  done
 
   # Wait for the freshly launched session to come up. It carries the
   # '--channels plugin:telegram' signature; match on that + its cwd via lsof and
@@ -958,14 +1053,7 @@ OSA
   NEW_PID=""
   for _ in $(seq 1 45); do
     sleep 1
-    # shellcheck disable=SC2009
-    while read -r p _rest; do
-      [ -z "$p" ] && continue
-      [ "$p" = "$TARGET_PID" ] && continue
-      pcwd=$(lsof -a -p "$p" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
-      if [ "$pcwd" = "$TARGET_CWD" ]; then NEW_PID="$p"; break; fi
-    done < <(ps -axo pid=,command= 2>/dev/null | grep -F -- "--channels plugin:telegram@claude-plugins-official" | grep -v grep)
-    [ -n "$NEW_PID" ] && break
+    find_new_session && break
   done
 
   # With overlay OK, a Claude pid alone is insufficient: require bot.pid and a
@@ -1034,9 +1122,11 @@ OSA
     fi
   elif [ -n "$NEW_PID" ]; then
     echo "$(date '+%F %T') *** POLLER DID NOT COME UP within ${POLLER_WAIT}s (claude pid=$NEW_PID is running but its telegram poller is not) - NO ping sent, exiting 6 ***"
+    [ "$QUIET" = "quiet" ] || tg_notice "${BOT_LABEL}'s restart didn't finish: the new session started, but its Telegram connection didn't come up. If the watchdog is on, it should sort this out within a few minutes. If this chat stays quiet, it needs a look at the Mac."
     RC=6
   else
     echo "$(date '+%F %T') *** POLLER DID NOT COME UP within ${POLLER_WAIT}s (no new claude session was detected at all) - NO ping sent, exiting 6 ***"
+    [ "$QUIET" = "quiet" ] || tg_notice "${BOT_LABEL}'s restart didn't finish: its old session stopped, but Terminal never opened the new window. If the watchdog is on, it should bring the bot back within a few minutes. Otherwise it needs starting again at the Mac."
     RC=6
   fi
 

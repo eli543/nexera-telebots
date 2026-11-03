@@ -4,7 +4,17 @@ Changes are grouped by release. This project follows [Keep a Changelog](https://
 
 ## [Unreleased]
 
-No entries yet.
+### Fixed
+
+- Terminal window lookups in `fleet-compact`, `fleet-esc` and `fleet-fresh` walk one snapshot of window ids. Walking the windows by z-order index skipped a window raised during the walk, which read as a blank screen or a missing window.
+- `fleet-compact` no longer ends a compaction on one bad look at the screen. It looks again before it believes a picker, typed text or an unreadable frame, asks Claude Code's session registry (`status` and `waitingFor`) about a frame it cannot read, and gives a stalled Terminal up to two minutes. An unreadable frame is saved to `compact-last-unreadable.txt` at mode 0600.
+- `fleet-compact` waits for a menu or question to close instead of refusing. A leftover menu gets one lone Esc through the TIOCSTI ioctl, and only when the registry shows the bot idle or waiting on `dialog open`; for any other waiting reason it asks for `/esc` and never presses Esc itself. The acknowledgement is held until the way is clear.
+- Unsent text in the input box is cleared with one ctrl-c, saved to `compact-cleared-box.txt` at mode 0600 and quoted back in the chat. A paste placeholder, a box taller than 16 rows and text that keeps changing are left alone. Claude Code's `Try "..."` hint reads as an empty box. The in-flight guard now refuses only while the bot is busy.
+- `/esc` first injects a lone Esc with TIOCSTI, which needs no focus change and no keystroke permission, then falls back to the keystroke path. The keystroke osascript runs under an outside time limit and looks every 0.2 seconds, for up to two seconds, for Terminal to come forward.
+- `fleet-fresh` signals nothing until Terminal answers. It waits up to five minutes, says so once and then refuses, leaving the old session running. It opens the new window as its own osascript under a 40-second outside limit, activates Terminal afterwards in the background, retries a failed open for up to eight minutes after checking for a session a late open started, and sends a notice when a restart does not come back, unless quiet.
+- `fleet-restore` opens each window before it activates Terminal, and the activation runs in the background.
+- No engine relies on an AppleScript `with timeout` as a bound: a frozen Terminal held osascript well past one.
+- Known limit: the TIOCSTI paths need the engine to run inside the bot's own terminal session. The poller starts engines in a new session, so until that changes `/esc` uses its keystroke path and `/compact` asks for `/esc` when a leftover menu is open.
 
 ## [0.3.0] - Pending release
 

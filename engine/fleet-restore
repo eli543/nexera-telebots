@@ -570,7 +570,6 @@ for line in ${validated_rows[@]+"${validated_rows[@]}"}; do
   osa_err=$(/usr/bin/osascript - "$cmd" 2>&1 >/dev/null <<'OSA'
 on run argv
   tell application "Terminal"
-    activate
     do script (item 1 of argv)
   end tell
 end run
@@ -583,6 +582,11 @@ OSA
     note_problem "$key did not launch"
     continue
   fi
+  # The window first. Coming forward is a courtesy, so it runs on its own in the
+  # background and nothing waits on it: activate once hung for 2 minutes, and an
+  # AppleScript timeout did not bound it.
+  /usr/bin/osascript -e 'tell application "Terminal" to activate' >/dev/null 2>&1 &
+  disown $! 2>/dev/null || true
   launched=$((launched+1))
   l_key+=("$key"); l_sdir+=("$sdir")
   sleep 3   # stagger so windows come up one at a time

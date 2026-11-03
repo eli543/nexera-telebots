@@ -655,7 +655,9 @@ class OfflineOps(unittest.TestCase):
                    PATH=str(shims) + ":/usr/bin:/bin:/usr/sbin:/sbin")
         env.pop("TELEGRAM_BOT_TOKEN", None)
         original = (REPO / "engine/fleet-restore").read_text()
-        self.assertEqual(original.count("/usr/bin/osascript"), 1)
+        # The open, then Terminal's activate in the background only after a successful open.
+        self.assertEqual(original.count("/usr/bin/osascript"), 2)
+        self.assertEqual(original.count("/usr/bin/osascript -e 'tell application \"Terminal\" to activate' >/dev/null 2>&1 &"), 1)
         safe_restore = self.root / "fleet-restore-sandbox"
         safe_restore.write_text(original.replace("/usr/bin/osascript", str(osascript)))
         safe_restore.chmod(0o700)

@@ -1,20 +1,31 @@
 #!/bin/bash
-# fleet-esc - interrupt one fleet bot's CURRENT turn by sending a real Escape
-# keystroke to its Terminal window - the same key you would press by hand - so a
-# message queued while the bot was working gets read immediately. Does NOT
-# restart the session and does NOT lose context (unlike fleet-fresh and
-# fleet-model). Sends exactly ONE Esc: two in quick succession would open Claude
-# Code's Esc-Esc rewind menu instead of interrupting.
+# fleet-esc - interrupt one fleet bot's CURRENT turn by sending one Escape to its
+# terminal - the same key you would press by hand - so a message queued while the
+# bot was working gets read immediately. Does NOT restart the session and does
+# NOT lose context (unlike fleet-fresh and fleet-model). Sends exactly ONE Esc:
+# two in quick succession would open Claude Code's Esc-Esc rewind menu instead of
+# interrupting.
 #
-# The design constraint that shapes this whole script: macOS delivers keystrokes
-# to the frontmost APPLICATION, not to a window. Fronting the right Terminal
-# window is not enough - if another app holds focus, the Esc silently lands
-# there. So the engine activates Terminal, fronts the tty-matched window, then
-# VERIFIES (frontmost app is Terminal AND the selected tab's tty is the target)
-# immediately before firing key code 53 - all inside ONE atomic osascript. Do
-# not simplify the activate-and-verify away. On any delivery failure it tells
-# the user honestly via the bot's own token, because the poller's ack fires
-# BEFORE delivery and a silent miss would otherwise read as success.
+# Two paths, tried in this order:
+#   1. A lone Esc injected straight into the bot's own terminal with the TIOCSTI
+#      ioctl: no Return, no focus change, no keystroke permission, and nothing
+#      for macOS to refuse. The kernel allows the ioctl only on the caller's own
+#      controlling terminal, so it works when the engine runs inside the bot's
+#      session and can never reach a sibling bot. A Terminal `do script` cannot
+#      do this job: it always appends a Return, and Esc plus Return on the
+#      /model picker rewrites the default model in settings.json.
+#   2. When the kernel refuses (the engine was started outside the session), a
+#      real Escape keystroke. macOS delivers keystrokes to the frontmost
+#      APPLICATION, not to a window, so the engine activates Terminal, fronts
+#      the tty-matched window, looks every 0.2s for up to 2s for Terminal to
+#      come forward, then VERIFIES (frontmost app is Terminal AND the selected
+#      tab's tty is the target) immediately before key code 53, all inside ONE
+#      osascript. The window lookup walks one snapshot of the window ids, because
+#      a walk by z-order index skips a window raised mid-walk. That osascript
+#      runs under KEYSTROKE_LIMIT from outside: an AppleScript timeout does not
+#      bound a frozen Terminal. On any delivery failure it tells the user
+#      honestly via the bot's own token, because the poller's ack fires BEFORE
+#      delivery and a silent miss would otherwise read as success.
 #
 # Args:
 #   $1  PID of the claude session to interrupt
@@ -27,15 +38,15 @@
 #   - refuses unless the PID is a claude process whose lsof cwd == that workdir,
 #     so a sibling bot's window is never touched (exit 3/4/5/6)
 #   - per-tty 3s debounce (a double-tap cannot become Esc-Esc), plus one global
-#     keystroke lock serializing concurrent /esc across bots - two engines
-#     activating different windows at once could cross-deliver. Both live in
-#     /tmp on purpose: keyboard focus is a machine-global resource
-#   - saves and restores the previously frontmost app, names passed via argv
-#     (never interpolated into AppleScript source)
+#     keystroke lock serializing concurrent keystroke fallbacks across bots - two
+#     engines activating different windows at once could cross-deliver. Both
+#     live in /tmp on purpose: keyboard focus is a machine-global resource
+#   - the keystroke path saves and restores the previously frontmost app, names
+#     passed via argv (never interpolated into AppleScript source)
 #
-# macOS only (osascript / Terminal.app / System Events). Sending a keystroke via
-# System Events needs Automation + Accessibility consent; macOS prompts on first
-# use, and until granted the engine reports the miss instead of pretending.
+# macOS only (TIOCSTI / osascript / Terminal.app / System Events). The keystroke
+# path needs Automation + Accessibility consent; macOS prompts on first use, and
+# until granted the engine reports the miss instead of pretending.
 # Env: CC_ESC_DRYRUN=1 resolves and prints the intended action, sends nothing.
 # Logs to $FLEET_HOME/logs/esc.log.
 # Exit codes: 0 interrupted/dry run, 1 missing args, 2 unknown bot,
@@ -44,7 +55,7 @@
 
 set -uo pipefail
 
-usage() { sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,54p' "$0" | sed 's/^# \{0,1\}//'; }
 case "${1:-}" in -h|--help) usage; exit 0 ;; esac
 
 FLEET_HOME="${FLEET_HOME:-$HOME/.claude/telegram-fleet}"
@@ -63,6 +74,26 @@ CHAT_ID="${3:-}"
 LOG_DIR="$FLEET_HOME/logs"
 LOG="$LOG_DIR/esc.log"
 mkdir -p "$LOG_DIR" 2>/dev/null || true
+KEYSTROKE_LIMIT=8   # seconds; a hard outside limit on the keystroke osascript
+
+# One osascript under a hard limit from outside, script on stdin. Prints what
+# osascript printed, or TIMEOUT (status 124) once the limit hits and the
+# osascript is killed. On a frozen app osascript was measured sitting 124
+# seconds past an AppleScript `with timeout of 2 seconds`.
+osa_limited() {   # osa_limited <seconds> <argv...>
+  python3 -c '
+import subprocess, sys
+try:
+    run = subprocess.run(["/usr/bin/osascript", "-"] + sys.argv[2:], stdin=sys.stdin,
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         timeout=float(sys.argv[1]))
+except subprocess.TimeoutExpired:
+    print("TIMEOUT")
+    sys.exit(124)
+sys.stdout.write(run.stdout.decode("utf-8", "replace"))
+sys.exit(run.returncode)
+' "$@"
+}
 
 # first allowlisted chat id from a bot's access.json (the bot's own chat)
 chat_id_of_state() {
@@ -136,7 +167,7 @@ PY
   DEVTTY="/dev/$TTY"
 
   if [ "${CC_ESC_DRYRUN:-0}" = "1" ]; then
-    echo "DRYRUN would: serialize on global lock, activate Terminal, front+verify window on $DEVTTY, send key code 53 (Esc) once, restore focus"
+    echo "DRYRUN would: inject one lone Esc into $DEVTTY by ioctl; if the kernel refuses (engine started outside the session), serialize on global lock, activate Terminal, front+verify window on $DEVTTY, send key code 53 (Esc) once, restore focus"
     echo "=== dryrun done ==="
     exit 0
   fi
@@ -152,10 +183,27 @@ PY
   fi
   echo "$now" > "$STAMP"
 
+  # Path 1, the lone Esc by ioctl. When it goes in nothing else is needed: no lock,
+  # because no window moves, and no message, because the poller already acked.
+  INJECT=$(python3 - "$DEVTTY" <<'PY' 2>&1 | tail -1
+import fcntl, os, signal, sys, termios
+signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_NOCTTY)
+fcntl.ioctl(fd, termios.TIOCSTI, b"\x1b")
+print("OK")
+PY
+)
+  echo "$(date '+%F %T') lone Esc by ioctl: ${INJECT:-no answer}"
+  if [ "${INJECT:-}" = "OK" ]; then
+    echo "=== done (sent Esc to $DEVTTY) ==="
+    exit 0
+  fi
+  echo "the ioctl did not go in - falling back to the keystroke path"
+
   # Global keystroke lock: serialize concurrent /esc across DIFFERENT bots (two
   # engines activating different windows at once could deliver into the wrong
-  # one). Held only for the ~2s keystroke section; stale takeover after 10s
-  # covers a crashed holder.
+  # one). Held for the short keystroke section; KEYSTROKE_LIMIT keeps its
+  # osascript under the 10s stale takeover that covers a crashed holder.
   GLOCK="/tmp/fleet-esc-global.lock"
   waited=0
   while ! mkdir "$GLOCK" 2>/dev/null; do
@@ -181,30 +229,46 @@ PY
   # Atomic activate + front + VERIFY + keystroke. The verification (frontmost app
   # is Terminal AND the selected tab of the front window is our target tty) runs
   # immediately before the key event, so the Esc can only ever land in the right
-  # window. Returns a status token.
-  RESULT=$(/usr/bin/osascript - "$DEVTTY" <<'OSA' 2>/dev/null
+  # window. Returns a status token, or TIMEOUT when KEYSTROKE_LIMIT ran out. The
+  # AppleScript timeouts keep one slow activation from stopping the script; they
+  # are not a bound, which is why the limit sits outside.
+  RESULT=$(osa_limited "$KEYSTROKE_LIMIT" "$DEVTTY" <<'OSA' 2>/dev/null
 on run argv
   set targetTty to item 1 of argv
   set found to false
   tell application "Terminal"
-    activate
-    repeat with w in windows
-      repeat with tb in tabs of w
-        try
-          if tty of tb is targetTty then
+    try
+      with timeout of 5 seconds
+        activate
+      end timeout
+    end try
+    set windowIds to id of every window
+    repeat with i from 1 to count of windowIds
+      try
+        set w to window id (item i of windowIds)
+        repeat with oneTab in tabs of w
+          if tty of oneTab is targetTty then
             set frontmost of w to true
-            set selected tab of w to tb
+            set selected tab of w to oneTab
             set found to true
           end if
-        end try
-      end repeat
+        end repeat
+      end try
     end repeat
   end tell
   if not found then return "NOWINDOW"
-  delay 0.35
-  tell application "System Events"
-    set frontApp to name of first application process whose frontmost is true
-  end tell
+  repeat 10 times
+    delay 0.2
+    tell application "System Events"
+      set frontApp to name of first application process whose frontmost is true
+    end tell
+    if frontApp is "Terminal" then exit repeat
+    try
+      with timeout of 2 seconds
+        tell application "Terminal" to activate
+      end timeout
+    end try
+  end repeat
   if frontApp is not "Terminal" then return "NOTFRONT:" & frontApp
   set seltty to ""
   tell application "Terminal"
@@ -241,6 +305,11 @@ OSA
       tg_fail "The interrupt didn't land - the Mac wouldn't bring the bot's window forward (screen may be locked, or Automation consent is missing). Your message will be read when the current task finishes."
       echo "=== done (${RESULT}) ==="
       exit 9
+      ;;
+    TIMEOUT)
+      tg_fail "The interrupt didn't land - Terminal on the Mac isn't answering. Your message will be read when the current task finishes."
+      echo "=== done (TIMEOUT after ${KEYSTROKE_LIMIT}s) ==="
+      exit 10
       ;;
     *)
       tg_fail "The interrupt didn't land (window targeting failed). Your message will be read when the current task finishes."
